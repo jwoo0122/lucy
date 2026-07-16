@@ -18,6 +18,10 @@ const GENERATED_CONFIG: &str = r#"system_prompt = "You can access computer resou
 base_url = "https://openrouter.ai/api/v1"
 model = ""
 api_key_env = "OPENROUTER_API_KEY"
+# Optional reasoning effort sent as the OpenAI Chat Completions "reasoning_effort"
+# field, e.g. "low", "medium", "high". Omit or leave unset to send no effort.
+# Use a value your provider and model support; an unsupported value fails at runtime.
+# effort = "medium"
 "#;
 
 #[derive(Debug)]
@@ -59,6 +63,8 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -66,6 +72,8 @@ pub struct LlmSettings {
     pub base_url: String,
     pub model: String,
     pub api_key_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl Default for Config {
@@ -83,6 +91,7 @@ impl Default for LlmConfig {
             base_url: DEFAULT_BASE_URL.to_owned(),
             model: String::new(),
             api_key_env: None,
+            effort: None,
         }
     }
 }
@@ -157,10 +166,13 @@ impl Config {
             return Err(ConfigError::new("llm.api_key_env must not be empty"));
         }
 
+        let effort = self.llm.effort.as_deref().map(str::trim).map(str::to_owned);
+
         Ok(LlmSettings {
             base_url,
             model: self.llm.model.trim().to_owned(),
             api_key_env,
+            effort,
         })
     }
 }
@@ -342,11 +354,42 @@ mod tests {
                 base_url: "http://localhost".to_owned(),
                 model: "model".to_owned(),
                 api_key_env: None,
+                effort: None,
             },
         };
         assert_eq!(
             config.resolved_llm().expect("settings").api_key_env,
             DEFAULT_API_KEY_ENV
+        );
+    }
+
+    #[test]
+    fn resolved_effort_passes_through_and_trims() {
+        let config = |effort: Option<&str>| Config {
+            system_prompt: "prompt".to_owned(),
+            llm: LlmConfig {
+                base_url: "http://localhost".to_owned(),
+                model: "model".to_owned(),
+                api_key_env: Some("LUCY_KEY".to_owned()),
+                effort: effort.map(str::to_owned),
+            },
+        };
+        assert_eq!(config(None).resolved_llm().expect("none").effort, None);
+        assert_eq!(
+            config(Some("high"))
+                .resolved_llm()
+                .expect("set")
+                .effort
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            config(Some("  medium  "))
+                .resolved_llm()
+                .expect("trim")
+                .effort
+                .as_deref(),
+            Some("medium")
         );
     }
 }
