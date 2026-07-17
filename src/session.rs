@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use serde_json::Value;
 use crate::config::{
     ensure_not_symlink, ensure_private_dir, ensure_private_file, lucy_dir, LlmSettings,
 };
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, ChatToolCall};
 use crate::redaction::{conflicts_with_protected_literal, redact_secret};
 
 #[cfg(unix)]
@@ -59,6 +60,61 @@ enum SessionRecord {
         timestamp: u64,
         message: ChatMessage,
     },
+    #[serde(rename = "interruption")]
+    Interruption {
+        timestamp: u64,
+        reason: String,
+        phase: String,
+        #[serde(default)]
+        assistant_text: String,
+        #[serde(default)]
+        tool_calls: Vec<ChatToolCall>,
+        #[serde(default)]
+        tool_results: Vec<SessionToolResult>,
+    },
+}
+
+/// A bounded, secret-safe observation retained for a canceled tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionToolResult {
+    pub id: String,
+    pub name: String,
+    pub result: Value,
+}
+
+/// The safe observations written when a user stops an active turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptionRecord {
+    #[serde(default)]
+    pub timestamp: u64,
+    pub reason: String,
+    pub phase: String,
+    #[serde(default)]
+    pub assistant_text: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(default)]
+    pub tool_results: Vec<SessionToolResult>,
+}
+
+/// The ordered, replayable records after a session header.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "record")]
+pub enum SessionHistoryRecord {
+    #[serde(rename = "message")]
+    Message {
+        timestamp: u64,
+        message: ChatMessage,
+    },
+    #[serde(rename = "interruption")]
+    Interruption {
+        timestamp: u64,
+        reason: String,
+        phase: String,
+        assistant_text: String,
+        tool_calls: Vec<ChatToolCall>,
+        tool_results: Vec<SessionToolResult>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +127,7 @@ pub struct Session {
     pub created_at: u64,
     pub updated_at: u64,
     pub messages: Vec<ChatMessage>,
+    pub history: Vec<SessionHistoryRecord>,
     secret: Option<String>,
 }
 
@@ -153,6 +210,7 @@ impl Session {
                         created_at,
                         updated_at: created_at,
                         messages: Vec::new(),
+                        history: Vec::new(),
                         secret: secret.map(str::to_owned),
                     });
                 }
@@ -194,6 +252,7 @@ impl Session {
         let reader = BufReader::new(raw.as_slice());
         let mut header = None;
         let mut messages = Vec::new();
+        let mut history = Vec::new();
         let mut updated_at = None;
 
         for (line_number, line) in reader.lines().enumerate() {
@@ -250,7 +309,35 @@ impl Session {
                         ));
                     }
                     updated_at = Some(timestamp);
+                    history.push(SessionHistoryRecord::Message {
+                        timestamp,
+                        message: message.clone(),
+                    });
                     messages.push(message);
+                }
+                SessionRecord::Interruption {
+                    timestamp,
+                    reason,
+                    phase,
+                    assistant_text,
+                    tool_calls,
+                    tool_results,
+                } => {
+                    if header.is_none() {
+                        return Err(session_error(
+                            "session interruption precedes header",
+                            active_secret.as_deref(),
+                        ));
+                    }
+                    updated_at = Some(timestamp);
+                    history.push(SessionHistoryRecord::Interruption {
+                        timestamp,
+                        reason,
+                        phase,
+                        assistant_text,
+                        tool_calls,
+                        tool_results,
+                    });
                 }
             }
         }
@@ -271,6 +358,7 @@ impl Session {
             created_at,
             updated_at: updated_at.unwrap_or(created_at),
             messages,
+            history,
             secret: active_secret,
         })
     }
@@ -288,15 +376,103 @@ impl Session {
         }
         let mut file = open_session_for_append(&self.path)?;
         write_record(&mut file, &record)?;
-        self.messages.push(message);
+        self.messages.push(message.clone());
+        self.history
+            .push(SessionHistoryRecord::Message { timestamp, message });
+        self.updated_at = timestamp;
+        Ok(())
+    }
+
+    pub fn append_interruption(
+        &mut self,
+        mut interruption: InterruptionRecord,
+    ) -> Result<(), SessionError> {
+        let timestamp = now();
+        interruption.timestamp = timestamp;
+        let record = SessionRecord::Interruption {
+            timestamp,
+            reason: interruption.reason.clone(),
+            phase: interruption.phase.clone(),
+            assistant_text: interruption.assistant_text.clone(),
+            tool_calls: interruption.tool_calls.clone(),
+            tool_results: interruption.tool_results.clone(),
+        };
+        if let Some(secret) = self.secret.as_deref() {
+            if record_contains_secret(&record, secret) {
+                return Err(session_record_rejected(secret));
+            }
+        }
+        let mut file = open_session_for_append(&self.path)?;
+        write_record(&mut file, &record)?;
+        self.history.push(SessionHistoryRecord::Interruption {
+            timestamp,
+            reason: interruption.reason,
+            phase: interruption.phase,
+            assistant_text: interruption.assistant_text,
+            tool_calls: interruption.tool_calls,
+            tool_results: interruption.tool_results,
+        });
         self.updated_at = timestamp;
         Ok(())
     }
 
     pub fn provider_messages(&self) -> Vec<ChatMessage> {
-        let mut messages = Vec::with_capacity(self.messages.len() + 1);
+        let interruption_results = self
+            .history
+            .iter()
+            .filter_map(|record| match record {
+                SessionHistoryRecord::Interruption {
+                    phase,
+                    tool_results,
+                    ..
+                } if phase == "cmd" => Some(tool_results),
+                _ => None,
+            })
+            .flatten()
+            .count();
+        let mut messages = Vec::with_capacity(self.messages.len() + 1 + interruption_results);
+        let mut declared_tool_calls = HashSet::new();
+        let mut completed_tool_calls = HashSet::new();
         messages.push(ChatMessage::system(self.boot_system_prompt.clone()));
-        messages.extend(self.messages.clone());
+        for record in &self.history {
+            match record {
+                SessionHistoryRecord::Message { message, .. } => {
+                    if message.role == "assistant" {
+                        declared_tool_calls
+                            .extend(message.tool_calls.iter().map(|call| call.id.clone()));
+                    }
+                    if message.role == "tool" {
+                        if let Some(id) = message.tool_call_id.as_deref() {
+                            completed_tool_calls.insert(id.to_owned());
+                        }
+                    }
+                    messages.push(message.clone());
+                }
+                SessionHistoryRecord::Interruption {
+                    phase,
+                    tool_results,
+                    ..
+                } if phase == "cmd" => {
+                    for observation in tool_results {
+                        if !declared_tool_calls.contains(&observation.id)
+                            || completed_tool_calls.contains(&observation.id)
+                        {
+                            continue;
+                        }
+                        let Ok(content) = serde_json::to_string(&observation.result) else {
+                            continue;
+                        };
+                        messages.push(ChatMessage::tool(
+                            observation.id.clone(),
+                            observation.name.clone(),
+                            content,
+                        ));
+                        completed_tool_calls.insert(observation.id.clone());
+                    }
+                }
+                SessionHistoryRecord::Interruption { .. } => {}
+            }
+        }
         messages
     }
 
@@ -521,6 +697,29 @@ fn record_contains_secret(record: &SessionRecord, secret: &str) -> bool {
         }
         SessionRecord::Message { timestamp, message } => {
             timestamp.to_string().contains(secret) || message_contains_secret(message, secret)
+        }
+        SessionRecord::Interruption {
+            timestamp,
+            reason,
+            phase,
+            assistant_text,
+            tool_calls,
+            tool_results,
+        } => {
+            timestamp.to_string().contains(secret)
+                || reason.contains(secret)
+                || phase.contains(secret)
+                || assistant_text.contains(secret)
+                || tool_calls.iter().any(|call| {
+                    call.id.contains(secret)
+                        || call.name.contains(secret)
+                        || call.arguments.contains(secret)
+                })
+                || tool_results.iter().any(|observation| {
+                    observation.id.contains(secret)
+                        || observation.name.contains(secret)
+                        || json_value_contains_secret(&observation.result, secret)
+                })
         }
     }
 }
@@ -886,6 +1085,89 @@ mod tests {
         let file = fs::read_to_string(resumed.path).expect("session file");
         assert!(file.lines().count() >= 3);
         assert!(!file.contains("TEST_KEY_VALUE"));
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_NO_SESSION_KEY".to_owned(),
+        };
+        let mut session = Session::create_with_secret(&home, &cwd, "prompt".to_owned(), llm, None)
+            .expect("create");
+        session
+            .append_message(ChatMessage::user("hello".to_owned()))
+            .expect("user");
+        session
+            .append_interruption(InterruptionRecord {
+                timestamp: 0,
+                reason: "user_cancelled".to_owned(),
+                phase: "provider_stream".to_owned(),
+                assistant_text: "partial answer".to_owned(),
+                tool_calls: vec![ChatToolCall {
+                    id: "partial-call".to_owned(),
+                    name: "cmd".to_owned(),
+                    arguments: "{\"command\":".to_owned(),
+                }],
+                tool_results: Vec::new(),
+            })
+            .expect("interruption");
+
+        session
+            .append_message(ChatMessage::assistant(
+                String::new(),
+                vec![ChatToolCall {
+                    id: "call-1".to_owned(),
+                    name: "cmd".to_owned(),
+                    arguments: r#"{"command":"sleep 1"}"#.to_owned(),
+                }],
+            ))
+            .expect("assistant tool call");
+        session
+            .append_interruption(InterruptionRecord {
+                timestamp: 0,
+                reason: "user_cancelled".to_owned(),
+                phase: "cmd".to_owned(),
+                assistant_text: String::new(),
+                tool_calls: Vec::new(),
+                tool_results: vec![SessionToolResult {
+                    id: "call-1".to_owned(),
+                    name: "cmd".to_owned(),
+                    result: serde_json::json!({"canceled": true}),
+                }],
+            })
+            .expect("command interruption");
+
+        let raw = fs::read_to_string(&session.path).expect("session JSONL");
+        for line in raw.lines() {
+            serde_json::from_str::<Value>(line).expect("valid JSONL record");
+        }
+        let resumed = Session::resume(&home, &session.id).expect("resume");
+        assert_eq!(resumed.history.len(), 4);
+        assert!(matches!(
+            resumed.history[0],
+            SessionHistoryRecord::Message { .. }
+        ));
+        assert!(matches!(
+            resumed.history[1],
+            SessionHistoryRecord::Interruption { .. }
+        ));
+        assert_eq!(resumed.messages.len(), 2);
+        let provider_messages = resumed.provider_messages();
+        assert_eq!(provider_messages.len(), 4);
+        assert!(provider_messages.iter().any(|message| {
+            message.role == "tool" && message.tool_call_id.as_deref() == Some("call-1")
+        }));
+        assert!(!resumed.provider_messages().iter().any(|message| {
+            message
+                .tool_calls
+                .iter()
+                .any(|call| call.id == "partial-call")
+        }));
         fs::remove_dir_all(home).expect("remove temp home");
     }
 }

@@ -1,11 +1,13 @@
 const LEGACY_MARKER: &str = "[REDACTED]";
 const PRINTABLE_ASCII_START: u32 = 0x21;
 const PRINTABLE_ASCII_END: u32 = 0x7e;
+const TUI_PROTECTED_CHARACTERS: &[char] = &['>', '─', '│', '┌', '┐', '└', '┘'];
 
 const STRUCTURAL_KEYS: &[&str] = &[
     "additionalProperties",
     "api_key_env",
     "arguments",
+    "assistant_text",
     "base_url",
     "boot_system_prompt",
     "command",
@@ -27,6 +29,8 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "name",
     "parameters",
     "properties",
+    "phase",
+    "reason",
     "record",
     "required",
     "resumed",
@@ -42,8 +46,10 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "text",
     "timestamp",
     "timed_out",
+    "canceled",
     "tool_call_id",
     "tool_calls",
+    "tool_results",
     "tools",
     "type",
     "updated_at",
@@ -64,10 +70,12 @@ const PROTECTED_LITERALS: &[&str] = &[
     "error",
     "false",
     "function",
+    "interruption",
     "message",
     "null",
     "object",
     "provider",
+    "provider_stream",
     "session",
     "session_metadata",
     "string",
@@ -77,7 +85,9 @@ const PROTECTED_LITERALS: &[&str] = &[
     "tool_result",
     "true",
     "turn_end",
+    "turn_interrupted",
     "user",
+    "user_cancelled",
 ];
 
 pub(crate) fn redact_secret(text: &str, secret: Option<&str>) -> String {
@@ -141,6 +151,12 @@ pub(crate) fn is_structural_key(key: &str) -> bool {
     STRUCTURAL_KEYS.contains(&key)
 }
 
+pub(crate) fn conflicts_with_tui_literal(secret: &str) -> bool {
+    secret
+        .chars()
+        .any(|character| TUI_PROTECTED_CHARACTERS.contains(&character))
+}
+
 pub(crate) fn conflicts_with_protected_literal(secret: &str) -> bool {
     if secret.is_empty() {
         return false;
@@ -184,6 +200,13 @@ mod tests {
         }
         assert!(!conflicts_with_protected_literal("provider-secret"));
         assert!(!conflicts_with_protected_literal("long-command-marker"));
+    }
+
+    #[test]
+    fn rejects_terminal_ui_literal_collisions() {
+        for secret in [">", "─", "> ", "┌─"] {
+            assert!(conflicts_with_tui_literal(secret), "secret: {secret}");
+        }
     }
 
     #[test]

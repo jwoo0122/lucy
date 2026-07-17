@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 use serde_json::Value;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum ProtocolEvent {
     #[serde(rename = "session")]
@@ -24,8 +24,15 @@ pub enum ProtocolEvent {
     },
     #[serde(rename = "turn_end")]
     TurnEnd,
+    #[serde(rename = "turn_interrupted")]
+    TurnInterrupted { reason: String, phase: String },
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+/// The normalized event boundary shared by the machine protocol and the TUI.
+pub trait EventSink {
+    fn emit_event(&mut self, event: &ProtocolEvent) -> io::Result<()>;
 }
 
 pub struct ProtocolWriter<W> {
@@ -84,10 +91,23 @@ impl<W: Write> ProtocolWriter<W> {
         self.emit(&ProtocolEvent::TurnEnd)
     }
 
+    pub fn turn_interrupted(&mut self, reason: &str, phase: &str) -> io::Result<()> {
+        self.emit(&ProtocolEvent::TurnInterrupted {
+            reason: reason.to_owned(),
+            phase: phase.to_owned(),
+        })
+    }
+
     pub fn error(&mut self, message: &str) -> io::Result<()> {
         self.emit(&ProtocolEvent::Error {
             message: message.to_owned(),
         })
+    }
+}
+
+impl<W: Write> EventSink for ProtocolWriter<W> {
+    fn emit_event(&mut self, event: &ProtocolEvent) -> io::Result<()> {
+        self.emit(event)
     }
 }
 
@@ -115,5 +135,20 @@ mod tests {
             serde_json::from_str::<Value>(line).expect("JSONL record");
         }
         assert!(!text.contains("choices"));
+    }
+
+    #[test]
+    fn interruption_event_is_a_normalized_json_record() {
+        let event = ProtocolEvent::TurnInterrupted {
+            reason: "user_cancelled".to_owned(),
+            phase: "provider_stream".to_owned(),
+        };
+        let value = serde_json::to_value(event).expect("event JSON");
+        assert_eq!(value["type"], "turn_interrupted");
+        assert_eq!(value["reason"], "user_cancelled");
+        assert_eq!(value["phase"], "provider_stream");
+        assert!(!serde_json::to_string(&value)
+            .expect("serialized event")
+            .contains("choices"));
     }
 }
