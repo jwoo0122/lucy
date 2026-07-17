@@ -14,6 +14,8 @@ use std::os::fd::AsRawFd;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cancellation::CancellationToken;
+
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const COMMAND_OUTPUT_CAP: usize = 64 * 1024;
 const CAPTURE_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
@@ -27,6 +29,8 @@ pub struct CmdResult {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub canceled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -41,9 +45,28 @@ impl CmdResult {
             stderr: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            canceled: false,
             error: Some(message.into()),
         }
     }
+
+    pub(crate) fn canceled(command: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            exit_code: None,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            canceled: true,
+            error: Some(message.into()),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug)]
@@ -53,40 +76,43 @@ struct CapturedOutput {
 }
 
 pub fn execute(arguments: &str, cwd: &Path, api_key_env: &str, secret: Option<&str>) -> CmdResult {
+    execute_with_cancellation(arguments, cwd, api_key_env, secret, None)
+}
+
+pub(crate) fn execute_with_cancellation(
+    arguments: &str,
+    cwd: &Path,
+    api_key_env: &str,
+    secret: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+) -> CmdResult {
     let value: Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
-        Err(_) => {
-            return CmdResult::error(
-                &safe_argument_display(arguments, secret),
-                "cmd arguments must be a JSON object",
-            )
-        }
+        Err(_) => return CmdResult::error("{}", "cmd arguments must be a JSON object"),
     };
     let Some(object) = value.as_object() else {
-        return CmdResult::error(
-            &safe_argument_display(arguments, secret),
-            "cmd arguments must be a JSON object",
-        );
+        return CmdResult::error("{}", "cmd arguments must be a JSON object");
     };
     if object.len() != 1 || !object.contains_key("command") {
-        return CmdResult::error(
-            &safe_argument_display(arguments, secret),
-            "cmd arguments must contain only command",
-        );
+        return CmdResult::error("{}", "cmd arguments must contain only command");
     }
     let Some(command) = object.get("command").and_then(Value::as_str) else {
-        return CmdResult::error(
-            &safe_argument_display(arguments, secret),
-            "cmd command must be a string",
-        );
+        return CmdResult::error("{}", "cmd command must be a string");
     };
-    execute_command(
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        return CmdResult::canceled(
+            redact_secret(command, secret),
+            "command canceled before execution",
+        );
+    }
+    execute_command_with_cancellation(
         command,
         cwd,
         api_key_env,
         secret,
         COMMAND_TIMEOUT,
         COMMAND_OUTPUT_CAP,
+        cancellation,
     )
 }
 
@@ -98,6 +124,25 @@ pub fn execute_command(
     timeout: Duration,
     output_cap: usize,
 ) -> CmdResult {
+    execute_command_with_cancellation(command, cwd, api_key_env, secret, timeout, output_cap, None)
+}
+
+pub(crate) fn execute_command_with_cancellation(
+    command: &str,
+    cwd: &Path,
+    api_key_env: &str,
+    secret: Option<&str>,
+    timeout: Duration,
+    output_cap: usize,
+    cancellation: Option<&CancellationToken>,
+) -> CmdResult {
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        return CmdResult::canceled(
+            redact_secret(command, secret),
+            "command canceled before execution",
+        );
+    }
+
     let mut process = Command::new("/bin/sh");
     process
         .arg("-lc")
@@ -135,6 +180,7 @@ pub fn execute_command(
                 stderr: String::new(),
                 stdout_truncated: false,
                 stderr_truncated: false,
+                canceled: false,
                 error: Some("unable to start command".to_owned()),
             }
         }
@@ -153,9 +199,21 @@ pub fn execute_command(
     let child_id = child.id();
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut canceled = false;
     let status = loop {
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            canceled = true;
+            kill_process_group(child_id);
+            let _ = child.kill();
+            break child.wait().ok();
+        }
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                if cancellation.is_some_and(|token| token.is_cancelled()) {
+                    canceled = true;
+                }
+                break Some(status);
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     timed_out = true;
@@ -166,6 +224,7 @@ pub fn execute_command(
                 thread::sleep(Duration::from_millis(10));
             }
             Err(_) => {
+                canceled = cancellation.is_some_and(|token| token.is_cancelled());
                 kill_process_group(child_id);
                 let _ = child.kill();
                 break child.wait().ok();
@@ -187,13 +246,16 @@ pub fn execute_command(
 
     CmdResult {
         command: redact_secret(command, secret),
-        exit_code: status.and_then(|status| status.code()),
+        exit_code: (!canceled)
+            .then(|| status.and_then(|status| status.code()))
+            .flatten(),
         timed_out,
         stdout,
         stderr,
         stdout_truncated,
         stderr_truncated,
-        error: None,
+        canceled,
+        error: canceled.then_some("command canceled".to_owned()),
     }
 }
 
@@ -329,11 +391,20 @@ pub fn redact_secret(text: &str, secret: Option<&str>) -> String {
     crate::redaction::redact_secret(text, secret)
 }
 
-fn safe_argument_display(arguments: &str, secret: Option<&str>) -> String {
-    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
-        return arguments.to_owned();
-    };
-    crate::redaction::redaction_marker(secret).unwrap_or_default()
+pub(crate) fn canceled_result(arguments: &str, secret: &str) -> CmdResult {
+    let command = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .filter(|object| object.len() == 1)
+                .and_then(|object| object.get("command"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .map(|command| redact_secret(&command, Some(secret)))
+        .unwrap_or_else(|| "{}".to_owned());
+    CmdResult::canceled(command, "command canceled before execution")
 }
 
 #[cfg(test)]
@@ -432,6 +503,33 @@ mod tests {
         );
         assert!(result.timed_out);
         assert!(result.exit_code.is_none() || result.exit_code != Some(0));
+        fs::remove_dir_all(cwd).expect("remove temp directory");
+    }
+
+    #[test]
+    fn cancellation_kills_a_running_command_group() {
+        let cwd = temporary_directory();
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let worker_cwd = cwd.clone();
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            execute_command_with_cancellation(
+                "sleep 30",
+                &worker_cwd,
+                "LUCY_API_KEY",
+                None,
+                Duration::from_secs(30),
+                COMMAND_OUTPUT_CAP,
+                Some(&worker_token),
+            )
+        });
+        thread::sleep(Duration::from_millis(80));
+        token.cancel();
+        let result = worker.join().expect("command worker");
+        assert!(result.canceled);
+        assert_eq!(result.error.as_deref(), Some("command canceled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
         fs::remove_dir_all(cwd).expect("remove temp directory");
     }
 

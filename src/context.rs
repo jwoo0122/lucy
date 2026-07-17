@@ -54,7 +54,8 @@ pub struct BootContext {
     pub skills: Vec<SkillEntry>,
 }
 
-pub fn resolve_boot_context(
+#[cfg(test)]
+fn resolve_boot_context(
     home: &Path,
     cwd: &Path,
     configured_prompt: &str,

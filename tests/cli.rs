@@ -1154,6 +1154,17 @@ fn total_cmd_call_budget_rejects_overflow_before_emitting_or_executing() {
             .count(),
         64
     );
+    let first_result = records
+        .iter()
+        .position(|record| record["type"] == "tool_result")
+        .expect("first tool result");
+    assert_eq!(
+        records[..first_result]
+            .iter()
+            .filter(|record| record["type"] == "tool_call")
+            .count(),
+        64
+    );
     assert!(!records.iter().any(|record| record["type"] == "turn_end"));
     assert!(!marker.exists(), "overflow command was executed");
 
@@ -1436,6 +1447,39 @@ fn malformed_config_diagnostic_does_not_echo_source_or_api_key() {
     );
     assert!(!stderr.contains("system_prompt"), "stderr: {stderr}");
     assert!(output.stdout.is_empty());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn forced_tui_fails_clearly_without_terminal_stdio() {
+    let (home, project) = temporary_tree("forced-tui-non-terminal");
+    let output = run_lucy(&home, &project, &["--tui"], "");
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "!: --tui requires a terminal on stdin and stdout\n"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!home.join(".lucy").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn forced_jsonl_keeps_the_machine_protocol() {
+    let server = MockServer::start(vec![normal_response("forced")]);
+    let (home, project) = temporary_tree("forced-jsonl");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+    let output = run_lucy(
+        &home,
+        &project,
+        &["--jsonl"],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    let records = parse_lines(&output.stdout);
+    assert_eq!(records[0]["type"], "session");
+    assert!(records.iter().any(|record| record["type"] == "turn_end"));
+    assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(home).expect("cleanup");
 }
 
