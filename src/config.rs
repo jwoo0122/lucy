@@ -149,6 +149,40 @@ impl Config {
             .map_err(|_| ConfigError::new("unable to parse config.toml: invalid TOML"))
     }
 
+    /// Update only the user-selected fields while preserving other TOML content.
+    pub fn save_selection(
+        home: &Path,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        let path = config_path(home);
+        let source = fs::read_to_string(&path)
+            .map_err(|_| ConfigError::new("unable to read config.toml"))?;
+        let mut document: toml::Value = toml::from_str(&source)
+            .map_err(|_| ConfigError::new("unable to parse config.toml: invalid TOML"))?;
+        let llm = document
+            .as_table_mut()
+            .and_then(|root| root.get_mut("llm"))
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| ConfigError::new("config.toml is missing [llm]"))?;
+        llm.insert("model".to_owned(), toml::Value::String(model.to_owned()));
+        match effort.filter(|value| !value.trim().is_empty()) {
+            Some(value) => {
+                llm.insert(
+                    "effort".to_owned(),
+                    toml::Value::String(value.trim().to_owned()),
+                );
+            }
+            None => {
+                llm.remove("effort");
+            }
+        }
+        let rendered = toml::to_string_pretty(&document)
+            .map_err(|_| ConfigError::new("unable to write config.toml"))?;
+        fs::write(&path, rendered).map_err(|_| ConfigError::new("unable to write config.toml"))?;
+        ensure_private_file(&path).map_err(|_| ConfigError::new("unable to secure config.toml"))
+    }
+
     pub fn resolved_llm(&self) -> Result<LlmSettings, ConfigError> {
         let base_url = self.llm.base_url.trim().to_owned();
         if base_url.is_empty() {

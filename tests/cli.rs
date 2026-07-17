@@ -1201,17 +1201,18 @@ fn incomplete_tool_finish_reasons_do_not_execute_or_continue() {
 }
 
 #[test]
-fn tool_loop_budget_stops_before_a_thirty_third_provider_request() {
-    let responses = (0..32)
+fn tool_loop_has_no_round_limit() {
+    let mut responses = (0..33)
         .map(|index| {
             tool_response_with_arguments(
                 json!({"command": "true"}).to_string(),
                 &format!("call-{index}"),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    responses.push(normal_response("finished"));
     let server = MockServer::start(responses);
-    let (home, project) = temporary_tree("tool-loop-budget");
+    let (home, project) = temporary_tree("tool-loop-unbounded");
     write_config(&home, &server.base_url, "base prompt", "mock-model");
 
     let output = run_lucy(
@@ -1222,33 +1223,21 @@ fn tool_loop_budget_stops_before_a_thirty_third_provider_request() {
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     let records = parse_lines(&output.stdout);
-    let error = records
-        .iter()
-        .find(|record| record["type"] == "error")
-        .expect("budget error event");
-    assert!(error["message"]
-        .as_str()
-        .expect("error message")
-        .contains("tool loop exceeded"));
-    assert!(!records.iter().any(|record| record["type"] == "turn_end"));
+    assert!(!records.iter().any(|record| record["type"] == "error"));
+    assert!(records.iter().any(|record| record["type"] == "turn_end"));
 
     let requests = server.join();
-    assert_eq!(requests.len(), 32);
+    assert_eq!(requests.len(), 34);
     fs::remove_dir_all(home).expect("cleanup");
 }
 
 #[test]
-fn total_cmd_call_budget_rejects_overflow_before_emitting_or_executing() {
-    let (home, project) = temporary_tree("tool-call-budget");
-    let marker = project.join("overflow-marker");
-    let overflow_command = format!("touch {}", marker.display());
+fn provider_and_message_tool_calls_have_no_count_limit() {
     let server = MockServer::start(vec![
-        tool_response_with_calls(64),
-        tool_response_with_arguments(
-            json!({"command": overflow_command}).to_string(),
-            "call-overflow",
-        ),
+        tool_response_with_calls(65),
+        normal_response("finished"),
     ]);
+    let (home, project) = temporary_tree("tool-call-unbounded");
     write_config(&home, &server.base_url, "base prompt", "mock-model");
 
     let output = run_lucy(
@@ -1259,34 +1248,22 @@ fn total_cmd_call_budget_rejects_overflow_before_emitting_or_executing() {
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     let records = parse_lines(&output.stdout);
-    let error = records
-        .iter()
-        .find(|record| record["type"] == "error")
-        .expect("budget error event");
-    assert!(error["message"]
-        .as_str()
-        .expect("error message")
-        .contains("tool call budget exceeded"));
+    assert!(!records.iter().any(|record| record["type"] == "error"));
     assert_eq!(
         records
             .iter()
             .filter(|record| record["type"] == "tool_call")
             .count(),
-        64
+        65
     );
-    let first_result = records
-        .iter()
-        .position(|record| record["type"] == "tool_result")
-        .expect("first tool result");
     assert_eq!(
-        records[..first_result]
+        records
             .iter()
-            .filter(|record| record["type"] == "tool_call")
+            .filter(|record| record["type"] == "tool_result")
             .count(),
-        64
+        65
     );
-    assert!(!records.iter().any(|record| record["type"] == "turn_end"));
-    assert!(!marker.exists(), "overflow command was executed");
+    assert!(records.iter().any(|record| record["type"] == "turn_end"));
 
     let requests = server.join();
     assert_eq!(requests.len(), 2);
@@ -1740,7 +1717,7 @@ fn effort_containing_the_active_key_is_rejected_as_a_session_header() {
 }
 
 #[test]
-fn effort_is_persisted_and_applied_on_resume() {
+fn resume_reloads_model_and_effort_from_config() {
     let server = MockServer::start(vec![normal_response("first"), normal_response("resumed")]);
     let (home, project) = temporary_tree("effort-resume");
     write_config_with_effort(
@@ -1764,7 +1741,7 @@ fn effort_is_persisted_and_applied_on_resume() {
         .expect("session id")
         .to_owned();
 
-    // Change config (no effort, different model) to prove resume uses the snapshot.
+    // Change config to prove resume reloads the current source of truth.
     write_config(&home, &server.base_url, "changed prompt", "changed-model");
 
     let resumed = run_lucy(
@@ -1778,16 +1755,15 @@ fn effort_is_persisted_and_applied_on_resume() {
     let requests = server.join();
     assert_eq!(requests.len(), 2);
     let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
-    assert_eq!(resumed_request["reasoning_effort"], "high");
-    assert_eq!(resumed_request["model"], "original-model");
-    assert_ne!(resumed_request["model"], "changed-model");
+    assert!(resumed_request.get("reasoning_effort").is_none());
+    assert_eq!(resumed_request["model"], "changed-model");
 
     fs::remove_dir_all(home).expect("cleanup");
 }
 
 #[test]
-fn resume_uses_the_persisted_snapshot_and_list_outputs_metadata() {
-    let server = MockServer::start(vec![normal_response("first"), normal_response("resumed")]);
+fn resume_rejects_malformed_current_config_without_leaking_secrets() {
+    let server = MockServer::start(vec![normal_response("first")]);
     let (home, project) = temporary_tree("resume");
     write_config(&home, &server.base_url, "original prompt", "original-model");
     fs::write(project.join("AGENTS.md"), "original instructions").expect("instructions");
@@ -1817,13 +1793,8 @@ fn resume_uses_the_persisted_snapshot_and_list_outputs_metadata() {
         &["--session", &session_id],
         "{\"type\":\"message\",\"text\":\"second message\"}\n",
     );
-    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+    assert!(!resumed.status.success());
     assert!(!String::from_utf8_lossy(&resumed.stderr).contains("provider-secret"));
-    let resumed_records = parse_lines(&resumed.stdout);
-    assert_eq!(resumed_records[0]["resumed"], true);
-    assert!(resumed_records
-        .iter()
-        .any(|record| record["type"] == "turn_end"));
 
     let list = run_lucy(&home, &project, &["--list-sessions"], "");
     assert!(list.status.success(), "stderr: {:?}", list.stderr);
@@ -1838,13 +1809,10 @@ fn resume_uses_the_persisted_snapshot_and_list_outputs_metadata() {
         .contains("first message"));
 
     let requests = server.join();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].contains("original prompt"));
-    assert!(!requests[1].contains("changed prompt"));
-    assert!(requests[1].contains("original instructions"));
-    assert!(!requests[1].contains("changed instructions"));
-    assert!(requests[1].contains("original-model"));
-    assert!(!requests[1].contains("changed-model"));
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("original prompt"));
+    assert!(requests[0].contains("original instructions"));
+    assert!(requests[0].contains("original-model"));
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -1994,5 +1962,70 @@ fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
     assert!(requests[1].contains("original instructions"));
     assert!(!requests[1].contains("changed instructions"));
 
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn spawn_subagent_queues_immediately_and_automatically_delivers_completion() {
+    let arguments =
+        json!({"task": "inspect only this task", "model": "worker-model", "effort": "high"})
+            .to_string();
+    let tool = json!({"id":"provider-id","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"delegate-1","type":"function","function":{"name":"spawn_subagent","arguments":arguments}}]},"finish_reason":"tool_calls"}]});
+    let response = format!("data: {tool}\n\ndata: [DONE]\n\n");
+    let server = MockServer::start(vec![
+        response,
+        normal_response("parent continued without waiting"),
+        normal_response("worker result"),
+        normal_response("completion acknowledged"),
+    ]);
+    let (home, project) = temporary_tree("queued-subagent");
+    write_config(&home, &server.base_url, "base prompt", "parent-model");
+    let output = run_lucy(
+        &home,
+        &project,
+        &["--jsonl"],
+        "{\"type\":\"message\",\"text\":\"delegate this\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    let records = parse_lines(&output.stdout);
+    let queued = records
+        .iter()
+        .find(|record| record["type"] == "tool_result" && record["name"] == "spawn_subagent")
+        .expect("queued result");
+    assert_eq!(queued["result"]["status"], "queued");
+    assert!(queued["result"]["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("subagent-"));
+    assert!(records
+        .iter()
+        .any(|record| record["type"] == "assistant_delta"
+            && record["text"] == "completion acknowledged"));
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 4);
+    let worker: Value = requests
+        .iter()
+        .map(|request| serde_json::from_str(request).expect("request JSON"))
+        .find(|request: &Value| request["model"] == "worker-model")
+        .expect("worker request");
+    assert_eq!(worker["reasoning_effort"], "high");
+    assert_eq!(
+        worker["messages"]
+            .as_array()
+            .expect("worker messages")
+            .len(),
+        2
+    );
+    assert_eq!(worker["messages"][1]["content"], "inspect only this task");
+    assert!(worker["tools"]
+        .as_array()
+        .expect("worker tools")
+        .iter()
+        .all(|tool| tool["function"]["name"] != "spawn_subagent"));
+    assert!(requests
+        .iter()
+        .any(|request| request.contains("Background subagent subagent-")
+            && request.contains("worker result")));
     fs::remove_dir_all(home).expect("cleanup");
 }

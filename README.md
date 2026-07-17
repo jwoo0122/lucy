@@ -2,7 +2,7 @@
 
 ## Project purpose
 
-Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects one OpenAI-compatible Chat Completions provider and a model-facing `cmd` tool, with both an interactive TUI and a JSONL interface for automation powered by the same turn engine.
+Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects one OpenAI-compatible Chat Completions provider and model-facing `cmd` and `spawn_subagent` tools, with both an interactive TUI and a JSONL interface for automation powered by the same turn engine.
 
 ## Installation
 
@@ -50,14 +50,15 @@ lucy --session <session-id>
 lucy --list-sessions
 ```
 
-In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc to cancel the active turn. Enter `/<name> [args]` to attach the saved `SKILL.md` snapshot for that skill to the next model request.
+In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc to cancel the active turn. Enter or Tab selects a focused skill in the slash picker; then enter `/<name> [args]` to attach the saved `SKILL.md` snapshot for that skill to the next model request. The same slash picker includes the Lucy-owned `/settings [ignored args]` and `/exit` commands.
 
 ## Features
 
 - **TUI and JSONL:** Supports terminal chat and line-delimited JSON automation.
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
 - **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification for completion, cancellation, or error when the terminal supports it; JSONL output is unchanged.
-- **Safe local command execution:** Exposes only `cmd` to the model and runs shell commands from the session's starting directory with time and output limits.
+- **Safe local command execution:** Runs trusted finite `cmd` shell commands from the session's starting directory with time and output limits.
+- **Background sub-agents:** `spawn_subagent` immediately returns a queued task ID while up to four isolated workers run in parallel. Workers inherit only boot context and cwd, may use `cmd`, cannot recursively delegate, and can override model or reasoning effort. Completion automatically starts a follow-up main-agent turn; `check_subagent` reports the in-process status or result. The TUI accepts additional user messages while a turn is active and serializes them for processing.
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
 - **Context and skills:** Collects `AGENTS.md`/`CLAUDE.md` instructions and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
 - **Automatic context compaction:** At 95% estimated context usage, safely summarizes older complete turns with the configured model, retains recent context, and resumes the active turn without rewriting session history.

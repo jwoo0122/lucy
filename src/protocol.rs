@@ -40,6 +40,12 @@ pub trait EventSink {
         Ok(())
     }
 
+    /// Notify interactive frontends after the provider's reasoning metadata
+    /// has ended. This is intentionally not part of the public protocol.
+    fn reasoning_completed(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Notify interactive frontends after an explicit skill invocation was
     /// expanded from the immutable session snapshot. This is not a public
     /// JSONL protocol event.

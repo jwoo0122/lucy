@@ -34,9 +34,11 @@ The generated prompt MUST be minimal and editable:
 
 The generated config SHOULD use OpenRouter's OpenAI-compatible endpoint as its example/default base URL, while all compatible endpoints remain configurable. The generated model value MUST be empty so Lucy does not guess a time-sensitive provider model; starting a session without a model MUST fail with a clear configuration error. API credentials MUST be read from the configured environment variable and MUST NOT be stored in config, session files, protocol events, or diagnostics. A credential containing JSON syntax/control characters, only decimal digits, or a complete fixed protocol/storage literal MUST be rejected before it can enter serialized output; these values cannot be safely redacted while preserving the schema. Newly created session headers MUST also reject any cwd or LLM setting containing the active credential. The generated OpenRouter example uses `OPENROUTER_API_KEY`; the runtime default credential variable is `OPENAI_API_KEY` when `api_key_env` is omitted.
 
-When `effort` is set to a non-empty value, Lucy MUST send it verbatim as the OpenAI Chat Completions `reasoning_effort` request field; when it is unset or omitted, Lucy MUST NOT send the field. Lucy MUST NOT validate `effort` against a fixed enum — compatibility is the user's responsibility, and a value the configured provider or model rejects is a runtime provider error, not a boot failure. An empty or whitespace-only `effort` MUST fail boot with a configuration error. The resolved `effort` is part of the persisted provider-settings snapshot and applies on resume.
+When `effort` is set to a non-empty value, Lucy MUST send it verbatim as the OpenAI Chat Completions `reasoning_effort` request field; when it is unset or omitted, Lucy MUST NOT send the field. Lucy MUST NOT validate `effort` against a fixed enum — compatibility is the user's responsibility, and a value the configured provider or model rejects is a runtime provider error, not a boot failure. An empty or whitespace-only `effort` MUST fail boot with a configuration error. The resolved `effort` is sent with each request when set.
 
-Lucy MUST resolve config and ambient context at new-session boot and persist the resolved system prompt in the session snapshot. Existing sessions MUST NOT change when the config file is edited.
+`config.toml` is the source of truth for model and effort whenever a session starts or resumes. The interactive TUI MUST provide an idle-only `/settings` menu that reads the configured provider catalog, supports typed model filtering plus keyboard selection, and writes selected model/effort values back to config before applying them to the current session. Catalog capability metadata MAY provide a finite effort picker; when it does not, the UI MUST accept a user-entered effort value. A resumed session MUST reload the current config model and effort rather than reuse the header values. The session header and every interactive setting transition MUST retain a secret-safe timestamped provider-settings audit record so historical requests remain attributable without making the header authoritative.
+
+Lucy MUST resolve config and ambient context at new-session boot and persist the resolved system prompt in the session snapshot. Editing config does not change the resolved prompt, cwd, or skill snapshot of an existing session.
 
 ## Context and forces
 
@@ -50,7 +52,9 @@ Users need to inspect and change the minimal model guidance without recompiling 
 - The configured provider API-key environment variable is removed from every Lucy child environment, including context-discovery helpers and `cmd` shells.
 - Early fallback diagnostics scrub every non-empty inherited environment value, including short values; missing-key diagnostics do not echo the configured environment-variable name.
 - A resumed session whose current key is already present in its raw file is rejected rather than sent to the provider or exposed by listing.
-- `effort` is persisted in the session provider-settings snapshot; a session header whose `effort` contains the active provider key is rejected like other provider-setting values.
+- The session header and every provider-settings audit record are secret-safe; an effort containing the active provider key is rejected like other provider-setting values.
+- Model and effort are reloaded from `config.toml` on every new or resumed session; the session audit trail records rather than overrides those selections.
+- `/settings` is available only when the TUI has no active turn, and provider catalog failures must not expose credentials.
 - Config parse errors identify the setting/file without echoing secret values.
 - A session's resolved prompt remains stable across resume.
 
@@ -60,11 +64,11 @@ A compiled prompt would be simpler but violate user ownership. An installer-spec
 
 ## Consequences
 
-The first run mutates the user's home directory. Users must start a new session for prompt/config changes to apply. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for v1.
+The first run mutates the user's home directory. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for v1.
 
 ## Enforcement
 
-Tests MUST cover first-run creation, no-overwrite behavior, config parsing, environment-key lookup, redaction, and prompt snapshot stability.
+Tests MUST cover first-run creation, no-overwrite behavior, config parsing, environment-key lookup, redaction, prompt snapshot stability, provider-catalog fallback behavior, settings persistence, resume-time model/effort reload, and provider-settings audit records.
 
 ## Revisit when
 

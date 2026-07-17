@@ -12,7 +12,6 @@ use crate::model::{ChatMessage, ChatToolCall};
 use crate::redaction::{conflicts_with_protected_literal, redact_secret, redaction_marker};
 
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_PROVIDER_TOOL_CALLS: usize = 64;
 const MAX_PROVIDER_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_REASONING_DETAILS_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -76,6 +75,17 @@ pub struct ProviderTurn {
     pub reasoning_details: Vec<Value>,
 }
 
+pub(crate) enum ProviderStreamEvent {
+    ReasoningStarted,
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModel {
+    pub id: String,
+    pub efforts: Option<Vec<String>>,
+}
+
 pub struct Provider {
     client: Client,
     async_client: AsyncClient,
@@ -84,6 +94,35 @@ pub struct Provider {
     effort: Option<String>,
     api_key_env: String,
     api_key: String,
+}
+
+fn model_efforts(entry: &Value) -> Option<Vec<String>> {
+    let values = entry
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("supported_efforts"))
+        .or_else(|| {
+            [
+                "supported_reasoning_efforts",
+                "reasoning_efforts",
+                "reasoning_effort",
+                "efforts",
+            ]
+            .into_iter()
+            .find_map(|key| entry.get(key))
+        })
+        .and_then(Value::as_array)?;
+    let efforts = values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .fold(Vec::new(), |mut efforts, value| {
+            if !efforts.iter().any(|effort| effort == value) {
+                efforts.push(value.to_owned());
+            }
+            efforts
+        });
+    (!efforts.is_empty()).then_some(efforts)
 }
 
 fn context_window_from_models(payload: &Value, model: &str) -> Option<usize> {
@@ -112,6 +151,7 @@ fn chat_request(
     messages: &[ChatMessage],
     effort: &Option<String>,
     include_tools: bool,
+    include_subagents: bool,
 ) -> Value {
     let mut request = json!({
         "model": model,
@@ -122,23 +162,19 @@ fn chat_request(
         "stream": true,
     });
     if include_tools {
-        request["tools"] = json!([
-            {
-                "type": "function",
-                "function": {
-                    "name": "cmd",
-                    "description": "Execute a finite shell command in the session starting directory.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "command": { "type": "string" }
-                        },
-                        "required": ["command"],
-                        "additionalProperties": false
-                    }
-                }
+        let mut tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "cmd",
+                "description": "Execute a finite shell command in the session starting directory.",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": false}
             }
-        ]);
+        })];
+        if include_subagents {
+            tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":"Start an isolated background task and immediately return its task ID. The worker has cmd but cannot delegate further.","parameters":{"type":"object","properties":{"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"check_subagent","description":"Inspect the in-process status or completed result of a background subagent.","parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
+        }
+        request["tools"] = Value::Array(tools);
     } else {
         request["max_tokens"] = json!(COMPACTION_MAX_SUMMARY_TOKENS);
     }
@@ -226,6 +262,58 @@ impl Provider {
         &self.api_key_env
     }
 
+    pub(crate) fn models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        let base_url = self
+            .endpoint
+            .strip_suffix("/chat/completions")
+            .ok_or_else(|| ProviderError::new("invalid provider endpoint"))?;
+        let response = self
+            .client
+            .get(format!("{base_url}/models"))
+            .bearer_auth(&self.api_key)
+            .timeout(MODEL_METADATA_TIMEOUT)
+            .send()
+            .map_err(|_| ProviderError::new("unable to load provider models"))?;
+        if !response.status().is_success() {
+            return Err(ProviderError::new("unable to load provider models"));
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|_| ProviderError::new("unable to load provider models"))?;
+        if bytes.len() > MAX_MODEL_METADATA_BYTES {
+            return Err(ProviderError::new(
+                "provider model catalog exceeded the response limit",
+            ));
+        }
+        let payload: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| ProviderError::new("invalid provider model catalog"))?;
+        let models = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::new("invalid provider model catalog"))?;
+        let mut result = models
+            .iter()
+            .filter_map(|entry| {
+                let id = entry
+                    .get("id")
+                    .or_else(|| entry.get("name"))
+                    .and_then(Value::as_str)?
+                    .trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let efforts = model_efforts(entry);
+                Some(ProviderModel {
+                    id: id.to_owned(),
+                    efforts,
+                })
+            })
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.id.cmp(&right.id));
+        result.dedup_by(|left, right| left.id == right.id);
+        Ok(result)
+    }
+
     /// Query the OpenAI-compatible model catalog for the configured model's
     /// context window. Providers that do not expose context metadata simply
     /// return `None`; this lookup is only used by the interactive statusline.
@@ -254,7 +342,7 @@ impl Provider {
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> Result<ProviderTurn, ProviderError> {
-        let request = chat_request(&self.model, messages, &self.effort, true);
+        let request = chat_request(&self.model, messages, &self.effort, true, true);
 
         let response = self
             .client
@@ -320,13 +408,6 @@ impl Provider {
                             .get("index")
                             .and_then(Value::as_u64)
                             .map_or(position, |index| index as usize);
-                        if !tool_calls.contains_key(&index)
-                            && tool_calls.len() >= MAX_PROVIDER_TOOL_CALLS
-                        {
-                            return Err(ProviderError::new(
-                                "provider response exceeded the tool-call limit",
-                            ));
-                        }
                         let partial = tool_calls.entry(index).or_default();
                         if let Some(id) = call.get("id").and_then(Value::as_str) {
                             append_provider_field(
@@ -362,11 +443,6 @@ impl Provider {
                     }
                 }
                 if let Some(function_call) = delta.get("function_call") {
-                    if !tool_calls.contains_key(&0) && tool_calls.len() >= MAX_PROVIDER_TOOL_CALLS {
-                        return Err(ProviderError::new(
-                            "provider response exceeded the tool-call limit",
-                        ));
-                    }
                     let partial = tool_calls.entry(0).or_default();
                     if let Some(name) = function_call.get("name").and_then(Value::as_str) {
                         append_provider_field(
@@ -447,8 +523,13 @@ impl Provider {
         cancellation: &CancellationToken,
     ) -> Result<String, ProviderError> {
         let mut ignored = |_text: &str| Ok(());
-        let turn =
-            self.stream_chat_cancellable_with_options(messages, &mut ignored, cancellation, false)?;
+        let turn = self.stream_chat_cancellable_with_options(
+            messages,
+            &mut ignored,
+            cancellation,
+            false,
+            false,
+        )?;
         if !turn.tool_calls.is_empty() {
             return Err(ProviderError::new(
                 "compaction summary requested an unsupported tool",
@@ -462,35 +543,65 @@ impl Provider {
 
     /// Stream through an async response so cancellation can drop the pending
     /// socket read instead of waiting for the blocking client's timeout.
+    #[allow(dead_code)]
     pub(crate) fn stream_chat_cancellable(
         &self,
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
         cancellation: &CancellationToken,
     ) -> Result<ProviderTurn, ProviderError> {
-        self.stream_chat_cancellable_with_options(messages, on_text, cancellation, true)
+        self.stream_chat_cancellable_with_options(messages, on_text, cancellation, true, true)
     }
 
-    fn stream_chat_cancellable_with_options(
+    pub(crate) fn stream_chat_cancellable_with_options(
         &self,
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
+        include_subagents: bool,
+    ) -> Result<ProviderTurn, ProviderError> {
+        let mut on_event = |event| match event {
+            ProviderStreamEvent::ReasoningStarted => Ok(()),
+            ProviderStreamEvent::Text(text) => on_text(&text),
+        };
+        self.stream_chat_cancellable_with_options_and_events(
+            messages,
+            &mut on_event,
+            cancellation,
+            include_tools,
+            include_subagents,
+        )
+    }
+
+    pub(crate) fn stream_chat_cancellable_with_options_and_events(
+        &self,
+        messages: &[ChatMessage],
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
+        cancellation: &CancellationToken,
+        include_tools: bool,
+        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| ProviderError::new("unable to initialize provider runtime"))?;
-        runtime.block_on(self.stream_chat_async(messages, on_text, cancellation, include_tools))
+        runtime.block_on(self.stream_chat_async(
+            messages,
+            on_event,
+            cancellation,
+            include_tools,
+            include_subagents,
+        ))
     }
 
     async fn stream_chat_async(
         &self,
         messages: &[ChatMessage],
-        on_text: &mut dyn FnMut(&str) -> io::Result<()>,
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
+        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(ProviderError::cancelled(ProviderTurn {
@@ -499,7 +610,13 @@ impl Provider {
                 reasoning_details: Vec::new(),
             }));
         }
-        let request = chat_request(&self.model, messages, &self.effort, include_tools);
+        let request = chat_request(
+            &self.model,
+            messages,
+            &self.effort,
+            include_tools,
+            include_subagents,
+        );
         let request = self
             .async_client
             .post(&self.endpoint)
@@ -547,7 +664,7 @@ impl Provider {
                 break;
             };
             let done = decoder.feed(&chunk, &mut |data| {
-                accumulator.on_data(data, &self.api_key, on_text)
+                accumulator.on_data(data, &self.api_key, on_event)
             })?;
             if done {
                 break;
@@ -557,7 +674,7 @@ impl Provider {
             return Err(ProviderError::cancelled(accumulator.partial_turn()));
         }
         let parse_result =
-            decoder.finish(&mut |data| accumulator.on_data(data, &self.api_key, on_text))?;
+            decoder.finish(&mut |data| accumulator.on_data(data, &self.api_key, on_event))?;
         if !parse_result.received_payload {
             return Err(ProviderError::new(
                 "provider stream contained no valid payload",
@@ -585,6 +702,7 @@ struct ProviderAccumulator {
     reasoning_details_bytes: usize,
     tool_argument_bytes: usize,
     finish_reason: Option<String>,
+    reasoning_started: bool,
 }
 
 impl ProviderAccumulator {
@@ -592,7 +710,7 @@ impl ProviderAccumulator {
         &mut self,
         data: Value,
         api_key: &str,
-        on_text: &mut dyn FnMut(&str) -> io::Result<()>,
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
     ) -> Result<(), ProviderError> {
         if let Some(message) = provider_error_message(&data) {
             return Err(ProviderError::new(format!(
@@ -613,11 +731,16 @@ impl ProviderAccumulator {
         let Some(delta) = choice.get("delta") else {
             return Ok(());
         };
-        append_reasoning_details(
+        let received_reasoning = append_reasoning_details(
             &mut self.reasoning_details,
             &mut self.reasoning_details_bytes,
             delta,
         )?;
+        if received_reasoning && !self.reasoning_started {
+            self.reasoning_started = true;
+            on_event(ProviderStreamEvent::ReasoningStarted)
+                .map_err(|_| ProviderError::new("unable to emit reasoning state"))?;
+        }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if self.content.len().saturating_add(text.len()) > MAX_PROVIDER_CONTENT_BYTES {
                 return Err(ProviderError::new(
@@ -625,7 +748,8 @@ impl ProviderAccumulator {
                 ));
             }
             self.content.push_str(text);
-            on_text(text).map_err(|_| ProviderError::new("unable to emit assistant delta"))?;
+            on_event(ProviderStreamEvent::Text(text.to_owned()))
+                .map_err(|_| ProviderError::new("unable to emit assistant delta"))?;
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for (position, call) in calls.iter().enumerate() {
@@ -633,13 +757,6 @@ impl ProviderAccumulator {
                     .get("index")
                     .and_then(Value::as_u64)
                     .map_or(position, |index| index as usize);
-                if !self.tool_calls.contains_key(&index)
-                    && self.tool_calls.len() >= MAX_PROVIDER_TOOL_CALLS
-                {
-                    return Err(ProviderError::new(
-                        "provider response exceeded the tool-call limit",
-                    ));
-                }
                 let partial = self.tool_calls.entry(index).or_default();
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
                     append_provider_field(
@@ -673,12 +790,6 @@ impl ProviderAccumulator {
             }
         }
         if let Some(function_call) = delta.get("function_call") {
-            if !self.tool_calls.contains_key(&0) && self.tool_calls.len() >= MAX_PROVIDER_TOOL_CALLS
-            {
-                return Err(ProviderError::new(
-                    "provider response exceeded the tool-call limit",
-                ));
-            }
             let partial = self.tool_calls.entry(0).or_default();
             if let Some(name) = function_call.get("name").and_then(Value::as_str) {
                 append_provider_field(
@@ -766,12 +877,12 @@ fn append_reasoning_details(
     target: &mut Vec<Value>,
     serialized_bytes: &mut usize,
     delta: &Value,
-) -> Result<(), ProviderError> {
+) -> Result<bool, ProviderError> {
     let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) else {
-        return Ok(());
+        return Ok(false);
     };
     if details.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let serialized_delta = serde_json::to_vec(details)
         .map_err(|_| ProviderError::new("provider reasoning details could not be serialized"))?;
@@ -789,7 +900,7 @@ fn append_reasoning_details(
     }
     target.extend(details.iter().cloned());
     *serialized_bytes = combined_bytes;
-    Ok(())
+    Ok(true)
 }
 
 fn append_provider_field(
@@ -1111,11 +1222,13 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            true,
         );
         let compact = chat_request(
             "model",
             &[ChatMessage::user("hello".to_owned())],
             &None,
+            false,
             false,
         );
 
@@ -1123,6 +1236,39 @@ mod tests {
         assert!(normal.get("max_tokens").is_none());
         assert!(compact.get("tools").is_none());
         assert_eq!(compact["max_tokens"], COMPACTION_MAX_SUMMARY_TOKENS);
+    }
+
+    #[test]
+    fn model_catalog_reads_nested_and_compatible_effort_metadata() {
+        let openrouter = serde_json::json!({
+            "reasoning": {
+                "supported_efforts": ["max", "xhigh", "high", "medium", "low", "none"]
+            }
+        });
+        assert_eq!(
+            model_efforts(&openrouter),
+            Some(vec![
+                "max".to_owned(),
+                "xhigh".to_owned(),
+                "high".to_owned(),
+                "medium".to_owned(),
+                "low".to_owned(),
+                "none".to_owned(),
+            ])
+        );
+
+        let compatible = serde_json::json!({
+            "supported_reasoning_efforts": ["light", "medium", "max", "light", ""]
+        });
+        assert_eq!(
+            model_efforts(&compatible),
+            Some(vec![
+                "light".to_owned(),
+                "medium".to_owned(),
+                "max".to_owned()
+            ])
+        );
+        assert_eq!(model_efforts(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -1230,6 +1376,76 @@ mod tests {
         assert_eq!(calls[&0].id, "c1");
         assert_eq!(calls[&0].name, "cmd");
         assert_eq!(calls[&0].arguments, "{command:pwd}");
+    }
+
+    #[test]
+    fn cancellable_accumulator_accepts_more_than_sixty_four_tool_calls() {
+        let mut accumulator = ProviderAccumulator::default();
+        let tool_calls = (0..65)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "id": format!("call-{index}"),
+                    "function": {
+                        "name": "cmd",
+                        "arguments": "{\"command\":\"true\"}"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        accumulator
+            .on_data(
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {"tool_calls": tool_calls},
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                "provider-secret",
+                &mut |_| Ok(()),
+            )
+            .expect("tool-call chunk");
+
+        let turn = accumulator.finish().expect("provider turn");
+        assert_eq!(turn.tool_calls.len(), 65);
+    }
+
+    #[test]
+    fn reasoning_stream_event_is_emitted_once_before_assistant_text() {
+        let mut accumulator = ProviderAccumulator::default();
+        let mut events = Vec::new();
+        let mut on_event = |event| {
+            match event {
+                ProviderStreamEvent::ReasoningStarted => events.push("started".to_owned()),
+                ProviderStreamEvent::Text(text) => events.push(text),
+            }
+            Ok(())
+        };
+
+        accumulator
+            .on_data(
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "reasoning_details": [{"type": "reasoning.text", "text": "thinking"}]
+                        }
+                    }]
+                }),
+                "provider-secret",
+                &mut on_event,
+            )
+            .expect("reasoning chunk");
+        accumulator
+            .on_data(
+                serde_json::json!({
+                    "choices": [{"delta": {"content": "answer"}}]
+                }),
+                "provider-secret",
+                &mut on_event,
+            )
+            .expect("answer chunk");
+
+        assert_eq!(events, vec!["started".to_owned(), "answer".to_owned()]);
     }
 
     #[test]

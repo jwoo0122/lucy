@@ -58,6 +58,12 @@ enum SessionRecord {
         #[serde(default)]
         skills: Vec<SkillEntry>,
     },
+    #[serde(rename = "provider_settings")]
+    ProviderSettings {
+        timestamp: u64,
+        model: String,
+        effort: Option<String>,
+    },
     #[serde(rename = "message")]
     Message {
         timestamp: u64,
@@ -123,6 +129,12 @@ pub struct CompactionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "record")]
 pub enum SessionHistoryRecord {
+    #[serde(rename = "provider_settings")]
+    ProviderSettings {
+        timestamp: u64,
+        model: String,
+        effort: Option<String>,
+    },
     #[serde(rename = "message")]
     Message {
         timestamp: u64,
@@ -342,6 +354,24 @@ impl Session {
                     }
                     header = Some((created_at, cwd, boot_system_prompt, llm, skills));
                 }
+                SessionRecord::ProviderSettings {
+                    timestamp,
+                    model,
+                    effort,
+                } => {
+                    if header.is_none() {
+                        return Err(session_error(
+                            "session provider settings precede header",
+                            active_secret.as_deref(),
+                        ));
+                    }
+                    updated_at = Some(timestamp);
+                    history.push(SessionHistoryRecord::ProviderSettings {
+                        timestamp,
+                        model,
+                        effort,
+                    });
+                }
                 SessionRecord::Message { timestamp, message } => {
                     if header.is_none() {
                         return Err(session_error(
@@ -437,6 +467,33 @@ impl Session {
             history,
             secret: active_secret,
         })
+    }
+
+    pub fn append_provider_settings(
+        &mut self,
+        model: String,
+        effort: Option<String>,
+    ) -> Result<(), SessionError> {
+        let timestamp = now();
+        let record = SessionRecord::ProviderSettings {
+            timestamp,
+            model: model.clone(),
+            effort: effort.clone(),
+        };
+        if let Some(secret) = self.secret.as_deref() {
+            if record_contains_secret(&record, secret) {
+                return Err(session_record_rejected(secret));
+            }
+        }
+        let mut file = open_session_for_append(&self.path)?;
+        write_record(&mut file, &record)?;
+        self.history.push(SessionHistoryRecord::ProviderSettings {
+            timestamp,
+            model,
+            effort,
+        });
+        self.updated_at = timestamp;
+        Ok(())
     }
 
     pub fn append_message(&mut self, message: ChatMessage) -> Result<(), SessionError> {
@@ -601,8 +658,9 @@ impl Session {
                         completed_tool_calls.insert(observation.id.clone());
                     }
                 }
-                SessionHistoryRecord::Interruption { .. } | SessionHistoryRecord::Compaction(_) => {
-                }
+                SessionHistoryRecord::ProviderSettings { .. }
+                | SessionHistoryRecord::Interruption { .. }
+                | SessionHistoryRecord::Compaction(_) => {}
             }
         }
         messages
@@ -833,6 +891,17 @@ fn record_contains_secret(record: &SessionRecord, secret: &str) -> bool {
                         || skill.path.display().to_string().contains(secret)
                         || skill.contents.contains(secret)
                 })
+        }
+        SessionRecord::ProviderSettings {
+            timestamp,
+            model,
+            effort,
+        } => {
+            timestamp.to_string().contains(secret)
+                || model.contains(secret)
+                || effort
+                    .as_deref()
+                    .is_some_and(|value| value.contains(secret))
         }
         SessionRecord::Message { timestamp, message } => {
             timestamp.to_string().contains(secret) || message_contains_secret(message, secret)

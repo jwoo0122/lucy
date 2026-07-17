@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -8,7 +11,7 @@ use crate::config::{Config, DEFAULT_API_KEY_ENV};
 use crate::context::{resolve_boot_context_with_api_key_env, InstructionSource, SkillEntry};
 use crate::model::{estimate_context_tokens, estimate_message_tokens, ChatMessage, ChatToolCall};
 use crate::protocol::{EventSink, ProtocolEvent, ProtocolWriter};
-use crate::provider::{Provider, ProviderTurn};
+use crate::provider::{Provider, ProviderStreamEvent, ProviderTurn};
 use crate::redaction::{
     conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key, redact_secret,
     redaction_marker,
@@ -30,8 +33,9 @@ struct InputRecord {
     text: Option<String>,
 }
 
-const MAX_TOOL_ROUNDS: usize = 32;
-const MAX_TOOL_CALLS_PER_MESSAGE: usize = 64;
+const MAX_CONCURRENT_SUBAGENTS: usize = 4;
+const MAX_SUBAGENT_TASK_BYTES: usize = 64 * 1024;
+static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
 const USER_CANCEL_REASON: &str = "user_cancelled";
 const PROVIDER_PHASE: &str = "provider_stream";
 const COMMAND_PHASE: &str = "cmd";
@@ -47,7 +51,7 @@ pub enum FrontendMode {
 
 pub fn run_cli<R, W, E>(args: &[String], input: R, output: W, diagnostics: E) -> i32
 where
-    R: BufRead,
+    R: BufRead + Send + 'static,
     W: Write,
     E: Write,
 {
@@ -88,7 +92,7 @@ pub fn run_cli_at_home<R, W, E>(
     cwd: &Path,
 ) -> i32
 where
-    R: BufRead,
+    R: BufRead + Send + 'static,
     W: Write,
     E: Write,
 {
@@ -109,7 +113,7 @@ fn run_cli_at_home_with_terminals<R, W, E>(
     stdout_is_tty: bool,
 ) -> i32
 where
-    R: BufRead,
+    R: BufRead + Send + 'static,
     W: Write,
     E: Write,
 {
@@ -157,13 +161,33 @@ where
 
     let (session, provider, resumed, attached_agents) = if let Some(id) = options.session.as_deref()
     {
-        let session = match Session::resume(home, id) {
+        let mut session = match Session::resume(home, id) {
             Ok(session) => session,
             Err(error) => {
                 write_diagnostic(&mut diagnostics, &error.to_string());
                 return 1;
             }
         };
+        let config = match Config::load_or_create(home) {
+            Ok(config) => config,
+            Err(error) => {
+                write_diagnostic(&mut diagnostics, &error.to_string());
+                return 1;
+            }
+        };
+        let selected = match config.resolved_llm() {
+            Ok(settings) => settings,
+            Err(error) => {
+                write_diagnostic_safe(
+                    &mut diagnostics,
+                    &error.to_string(),
+                    configured_api_key(&config).as_deref(),
+                );
+                return 1;
+            }
+        };
+        session.llm.model = selected.model;
+        session.llm.effort = selected.effort;
         let provider = match Provider::new(&session.llm) {
             Ok(provider) => provider,
             Err(error) => {
@@ -171,6 +195,16 @@ where
                 return 1;
             }
         };
+        if let Err(error) =
+            session.append_provider_settings(session.llm.model.clone(), session.llm.effort.clone())
+        {
+            write_diagnostic_safe(
+                &mut diagnostics,
+                &error.to_string(),
+                Some(provider.api_key()),
+            );
+            return 1;
+        }
         if mode == FrontendMode::Tui && conflicts_with_tui_literal(provider.api_key()) {
             write_diagnostic_safe(
                 &mut diagnostics,
@@ -280,10 +314,13 @@ where
     };
 
     let harness = Harness {
+        home: home.to_path_buf(),
         session,
         provider,
         context_window: None,
         attached_agents,
+        subagents: Arc::new(Mutex::new(HashMap::new())),
+        completed_subagents: mpsc::channel(),
     };
     if mode == FrontendMode::Tui {
         return match crate::tui::run(harness, resumed, output) {
@@ -306,16 +343,37 @@ where
         return 1;
     }
 
-    for line in input.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
+    let (input_tx, input_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in input.lines() {
+            if input_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut input_closed = false;
+    while !input_closed || harness.has_running_subagents() {
+        if let Some(notification) = harness.next_subagent_notification() {
+            if let Err(error) = harness.handle_message(&notification, &mut protocol, None) {
+                let error = redact_secret(&error, Some(harness.provider.api_key()));
+                let _ = protocol.error(&error);
+            }
+            continue;
+        }
+        let line = match input_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => {
                 write_diagnostic_safe(
                     &mut diagnostics,
                     &format!("unable to read stdin: {error}"),
                     Some(harness.provider.api_key()),
                 );
                 return 1;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                input_closed = true;
+                continue;
             }
         };
         if line.trim().is_empty() {
@@ -348,7 +406,6 @@ where
             }
         }
     }
-
     0
 }
 
@@ -377,6 +434,7 @@ pub fn resolve_mode(
 }
 
 pub(crate) struct Harness {
+    pub(crate) home: PathBuf,
     pub(crate) session: Session,
     pub(crate) provider: Provider,
     /// Model context metadata resolved by the interactive frontend; `None`
@@ -386,6 +444,22 @@ pub(crate) struct Harness {
     /// AGENTS.md sources selected for this newly created session's boot context.
     /// The TUI uses these only while its first-boot welcome is visible.
     pub(crate) attached_agents: Vec<String>,
+    subagents: Arc<Mutex<HashMap<String, SubagentState>>>,
+    completed_subagents: (
+        mpsc::Sender<SubagentCompletion>,
+        mpsc::Receiver<SubagentCompletion>,
+    ),
+}
+
+#[derive(Clone)]
+enum SubagentState {
+    Running,
+    Completed(Value),
+}
+
+struct SubagentCompletion {
+    task_id: String,
+    result: Value,
 }
 
 fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
@@ -430,6 +504,123 @@ fn find_compaction_boundary(
 }
 
 impl Harness {
+    pub(crate) fn next_subagent_notification(&mut self) -> Option<String> {
+        let completion = self.completed_subagents.1.try_recv().ok()?;
+        Some(format!(
+            "Background subagent {} completed. Deliver this result to the user and continue the task: {}",
+            completion.task_id,
+            serde_json::to_string(&completion.result).unwrap_or_else(|_| "{\"error\":\"unable to encode subagent result\"}".to_owned())
+        ))
+    }
+
+    fn has_running_subagents(&self) -> bool {
+        self.subagents.lock().is_ok_and(|states| {
+            states
+                .values()
+                .any(|state| matches!(state, SubagentState::Running))
+        })
+    }
+
+    fn spawn_subagent(&self, task: String, model: Option<String>, effort: Option<String>) -> Value {
+        let mut subagents = match self.subagents.lock() {
+            Ok(subagents) => subagents,
+            Err(_) => return serde_json::json!({"error": "subagent registry unavailable"}),
+        };
+        let running = subagents
+            .values()
+            .filter(|state| matches!(state, SubagentState::Running))
+            .count();
+        if running >= MAX_CONCURRENT_SUBAGENTS {
+            return serde_json::json!({"error": format!("subagent concurrency limit is {MAX_CONCURRENT_SUBAGENTS}")});
+        }
+        let task_id = format!(
+            "subagent-{}",
+            NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        subagents.insert(task_id.clone(), SubagentState::Running);
+        drop(subagents);
+        let settings = self.session.llm.clone();
+        let boot = self.session.boot_system_prompt.clone();
+        let cwd = self.session.cwd.clone();
+        let secret = self.provider.api_key().to_owned();
+        let states = Arc::clone(&self.subagents);
+        let completed = self.completed_subagents.0.clone();
+        let completion_id = task_id.clone();
+        std::thread::spawn(move || {
+            let result = redact_json_value(
+                run_subagent(settings, boot, cwd, task, model, effort, None),
+                &secret,
+            );
+            if let Ok(mut states) = states.lock() {
+                states.insert(
+                    completion_id.clone(),
+                    SubagentState::Completed(result.clone()),
+                );
+            }
+            let _ = completed.send(SubagentCompletion {
+                task_id: completion_id,
+                result,
+            });
+        });
+        serde_json::json!({"task_id": task_id, "status": "queued"})
+    }
+
+    fn subagent_status(&self, arguments: &str) -> Value {
+        let task_id = match serde_json::from_str::<Value>(arguments)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }) {
+            Some(task_id) => task_id,
+            None => return serde_json::json!({"error": "check_subagent requires a task_id string"}),
+        };
+        match self
+            .subagents
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&task_id).cloned())
+        {
+            Some(SubagentState::Running) => {
+                serde_json::json!({"task_id": task_id, "status": "running"})
+            }
+            Some(SubagentState::Completed(result)) => {
+                serde_json::json!({"task_id": task_id, "status": "completed", "result": result})
+            }
+            None => serde_json::json!({"task_id": task_id, "status": "unknown"}),
+        }
+    }
+
+    pub(crate) fn apply_settings(
+        &mut self,
+        home: &Path,
+        model: String,
+        effort: Option<String>,
+    ) -> Result<(), String> {
+        let config = Config::load_or_create(home).map_err(|error| error.to_string())?;
+        let mut settings = config.resolved_llm().map_err(|error| error.to_string())?;
+        settings.model = model.trim().to_owned();
+        settings.effort = effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        // Endpoint and credential remain the session's established provider boundary.
+        settings.base_url = self.session.llm.base_url.clone();
+        settings.api_key_env = self.session.llm.api_key_env.clone();
+        let provider = Provider::new(&settings).map_err(|error| error.to_string())?;
+        // Validate the candidate before changing the user-owned source of truth.
+        Config::save_selection(home, &settings.model, settings.effort.as_deref())
+            .map_err(|error| error.to_string())?;
+        self.session
+            .append_provider_settings(settings.model.clone(), settings.effort.clone())
+            .map_err(|error| error.to_string())?;
+        self.session.llm = settings;
+        self.provider = provider;
+        self.context_window = self.provider.context_window();
+        Ok(())
+    }
+
     fn should_compact(&self, messages: &[ChatMessage]) -> bool {
         self.context_window
             .is_some_and(|window| should_compact_context(estimate_context_tokens(messages), window))
@@ -507,17 +698,10 @@ impl Harness {
                 .map_err(|error| format!("unable to emit skill attachment state: {error}"))?;
         }
 
-        let mut tool_rounds = 0;
-        let mut tool_calls: usize = 0;
         let mut compacted_for_turn = false;
         loop {
             if cancellation.is_some_and(|token| token.is_cancelled()) {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
-            }
-            if tool_rounds >= MAX_TOOL_ROUNDS {
-                return Err(format!(
-                    "tool loop exceeded maximum of {MAX_TOOL_ROUNDS} provider rounds"
-                ));
             }
             let mut messages = self.session.provider_messages();
             let tokens_before = estimate_context_tokens(&messages);
@@ -530,21 +714,49 @@ impl Harness {
                 .map_err(|error| format!("unable to emit context usage: {error}"))?;
             let mut raw_content = String::new();
             let mut redactor = SecretRedactor::new(&secret);
+            let mut reasoning_active = false;
             let stream_result = {
-                let mut on_text = |delta: &str| {
-                    raw_content.push_str(delta);
-                    redactor.push(delta, |safe_delta| {
-                        sink.emit_event(&ProtocolEvent::AssistantDelta {
-                            text: safe_delta.to_owned(),
-                        })
-                    })
+                let mut on_event = |event: ProviderStreamEvent| -> io::Result<()> {
+                    match event {
+                        ProviderStreamEvent::ReasoningStarted => {
+                            if !reasoning_active {
+                                reasoning_active = true;
+                                sink.reasoning_started()?;
+                            }
+                            Ok(())
+                        }
+                        ProviderStreamEvent::Text(delta) => {
+                            if reasoning_active {
+                                reasoning_active = false;
+                                sink.reasoning_completed()?;
+                            }
+                            raw_content.push_str(&delta);
+                            redactor.push(&delta, |safe_delta| {
+                                sink.emit_event(&ProtocolEvent::AssistantDelta {
+                                    text: safe_delta.to_owned(),
+                                })
+                            })
+                        }
+                    }
                 };
                 match cancellation {
-                    Some(token) => {
-                        self.provider
-                            .stream_chat_cancellable(&messages, &mut on_text, token)
-                    }
-                    None => self.provider.stream_chat(&messages, &mut on_text),
+                    Some(token) => self
+                        .provider
+                        .stream_chat_cancellable_with_options_and_events(
+                            &messages,
+                            &mut on_event,
+                            token,
+                            true,
+                            true,
+                        ),
+                    None => self.provider.stream_chat(&messages, &mut |delta| {
+                        raw_content.push_str(delta);
+                        redactor.push(delta, |safe_delta| {
+                            sink.emit_event(&ProtocolEvent::AssistantDelta {
+                                text: safe_delta.to_owned(),
+                            })
+                        })
+                    }),
                 }
             };
             redactor
@@ -555,11 +767,21 @@ impl Harness {
                 })
                 .map_err(|error| format!("unable to write assistant delta: {error}"))?;
             let turn = match stream_result {
-                Ok(turn) => turn,
+                Ok(turn) => {
+                    if reasoning_active {
+                        sink.reasoning_completed()
+                            .map_err(|error| format!("unable to emit reasoning state: {error}"))?;
+                    }
+                    turn
+                }
                 Err(error)
                     if cancellation.is_some_and(|token| token.is_cancelled())
                         || error.is_cancelled() =>
                 {
+                    if reasoning_active {
+                        sink.reasoning_completed()
+                            .map_err(|error| format!("unable to emit reasoning state: {error}"))?;
+                    }
                     let partial = error.partial_turn().cloned().unwrap_or(ProviderTurn {
                         content: raw_content,
                         tool_calls: Vec::new(),
@@ -573,37 +795,28 @@ impl Harness {
                         Vec::new(),
                     );
                 }
-                Err(error) => return Err(error.to_string()),
+                Err(error) => {
+                    if reasoning_active {
+                        sink.reasoning_completed()
+                            .map_err(|error| format!("unable to emit reasoning state: {error}"))?;
+                    }
+                    return Err(error.to_string());
+                }
             };
             let canceled_after_stream = cancellation.is_some_and(|token| token.is_cancelled());
-            if !turn.reasoning_details.is_empty() {
-                sink.reasoning_started()
-                    .map_err(|error| format!("unable to emit reasoning state: {error}"))?;
-            }
 
-            if turn.tool_calls.iter().any(|call| call.name != "cmd") {
+            if turn.tool_calls.iter().any(|call| {
+                call.name != "cmd" && call.name != "spawn_subagent" && call.name != "check_subagent"
+            }) {
                 if canceled_after_stream {
                     return self.interrupt(sink, PROVIDER_PHASE, &turn.content, &[], Vec::new());
                 }
                 return Err("provider requested an unsupported tool".to_owned());
             }
-            if tool_calls.saturating_add(turn.tool_calls.len()) > MAX_TOOL_CALLS_PER_MESSAGE {
-                if canceled_after_stream {
-                    return self.interrupt(sink, PROVIDER_PHASE, &turn.content, &[], Vec::new());
-                }
-                return Err(format!(
-                    "tool call budget exceeded maximum of {MAX_TOOL_CALLS_PER_MESSAGE} calls per input message"
-                ));
-            }
-
             let safe_tool_calls = turn
                 .tool_calls
                 .iter()
-                .map(|call| ChatToolCall {
-                    id: redact_secret(&call.id, Some(&secret)),
-                    name: redact_secret(&call.name, Some(&secret)),
-                    arguments: redact_tool_arguments(&call.arguments, &secret),
-                })
+                .map(|call| safe_tool_call(call, &secret))
                 .collect::<Vec<_>>();
             let assistant_content = redact_secret(&turn.content, Some(&secret));
             let safe_reasoning_details = redact_reasoning_details(&turn.reasoning_details, &secret);
@@ -637,8 +850,6 @@ impl Harness {
                 return Ok(());
             }
 
-            tool_rounds += 1;
-            tool_calls += safe_tool_calls.len();
             for safe_call in &safe_tool_calls {
                 sink.emit_event(&ProtocolEvent::ToolCall {
                     id: safe_call.id.clone(),
@@ -647,25 +858,32 @@ impl Harness {
                 })
                 .map_err(|error| format!("unable to write tool call: {error}"))?;
             }
-            for index in 0..turn.tool_calls.len() {
-                let raw_call = &turn.tool_calls[index];
+            for (index, raw_call) in turn.tool_calls.iter().enumerate() {
                 let safe_call = &safe_tool_calls[index];
-                let result = if cancellation.is_some_and(|token| token.is_cancelled()) {
-                    crate::command::canceled_result(&safe_call.arguments, &secret)
+                let result = if raw_call.name == "spawn_subagent" {
+                    match parse_subagent_arguments(&raw_call.arguments) {
+                        Ok((task, model, effort)) => self.spawn_subagent(task, model, effort),
+                        Err(error) => serde_json::json!({"error": error}),
+                    }
+                } else if raw_call.name == "check_subagent" {
+                    self.subagent_status(&raw_call.arguments)
+                } else if cancellation.is_some_and(|token| token.is_cancelled()) {
+                    serde_json::to_value(crate::command::canceled_result(
+                        &safe_call.arguments,
+                        &secret,
+                    ))
+                    .map_err(|error| format!("unable to encode cmd result: {error}"))?
                 } else {
-                    crate::command::execute_with_cancellation(
+                    serde_json::to_value(crate::command::execute_with_cancellation(
                         &raw_call.arguments,
                         &self.session.cwd,
                         self.provider.api_key_env(),
                         Some(&secret),
                         cancellation,
-                    )
+                    ))
+                    .map_err(|error| format!("unable to encode cmd result: {error}"))?
                 };
-                let result = redact_json_value(
-                    serde_json::to_value(result)
-                        .map_err(|error| format!("unable to encode cmd result: {error}"))?,
-                    &secret,
-                );
+                let result = redact_json_value(result, &secret);
                 let tool_content = serde_json::to_string(&result)
                     .map_err(|error| format!("unable to encode tool result: {error}"))?;
                 let tool_message = ChatMessage::tool(
@@ -799,6 +1017,111 @@ impl Harness {
             (Some(persistence), Some(event)) => Err(format!(
                 "unable to persist interruption: {persistence}; unable to write interruption event: {event}"
             )),
+        }
+    }
+}
+
+fn parse_subagent_arguments(
+    arguments: &str,
+) -> Result<(String, Option<String>, Option<String>), String> {
+    let value: Value = serde_json::from_str(arguments)
+        .map_err(|_| "spawn_subagent arguments must be a JSON object")?;
+    let object = value
+        .as_object()
+        .ok_or("spawn_subagent arguments must be a JSON object")?;
+    if object
+        .keys()
+        .any(|key| key != "task" && key != "model" && key != "effort")
+    {
+        return Err("spawn_subagent arguments contain an unsupported field".to_owned());
+    }
+    let task = object
+        .get("task")
+        .and_then(Value::as_str)
+        .ok_or("spawn_subagent task must be a string")?
+        .trim()
+        .to_owned();
+    if task.is_empty() || task.len() > MAX_SUBAGENT_TASK_BYTES {
+        return Err("spawn_subagent task must be non-empty and bounded".to_owned());
+    }
+    let optional = |key: &str| -> Result<Option<String>, String> {
+        match object.get(key) {
+            None => Ok(None),
+            Some(Value::String(value)) if !value.trim().is_empty() => {
+                Ok(Some(value.trim().to_owned()))
+            }
+            _ => Err(format!("spawn_subagent {key} must be a non-empty string")),
+        }
+    };
+    Ok((task, optional("model")?, optional("effort")?))
+}
+
+fn run_subagent(
+    mut settings: crate::config::LlmSettings,
+    boot_context: String,
+    cwd: std::path::PathBuf,
+    task: String,
+    model: Option<String>,
+    effort: Option<String>,
+    cancellation: Option<crate::cancellation::CancellationToken>,
+) -> Value {
+    if let Some(model) = model {
+        settings.model = model;
+    }
+    if let Some(effort) = effort {
+        settings.effort = Some(effort);
+    }
+    let selected_model = settings.model.clone();
+    let selected_effort = settings.effort.clone();
+    let provider = match Provider::new(&settings) {
+        Ok(provider) => provider,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let mut messages = vec![ChatMessage::system(boot_context), ChatMessage::user(task)];
+    let cancellation = cancellation.unwrap_or_default();
+    loop {
+        if cancellation.is_cancelled() {
+            return serde_json::json!({"cancelled": true});
+        }
+        let mut ignored = |_text: &str| Ok(());
+        let turn = match provider.stream_chat_cancellable_with_options(
+            &messages,
+            &mut ignored,
+            &cancellation,
+            true,
+            false,
+        ) {
+            Ok(turn) => turn,
+            Err(error) if error.is_cancelled() || cancellation.is_cancelled() => {
+                return serde_json::json!({"cancelled": true})
+            }
+            Err(error) => return serde_json::json!({"error": error.to_string()}),
+        };
+        if turn.tool_calls.iter().any(|call| call.name != "cmd") {
+            return serde_json::json!({"error": "subagent requested an unsupported tool"});
+        }
+        messages.push(ChatMessage::assistant(
+            turn.content.clone(),
+            turn.tool_calls.clone(),
+        ));
+        if turn.tool_calls.is_empty() {
+            return serde_json::json!({"model": selected_model, "effort": selected_effort, "output": turn.content});
+        }
+        for call in turn.tool_calls {
+            let result = crate::command::execute_with_cancellation(
+                &call.arguments,
+                &cwd,
+                provider.api_key_env(),
+                Some(provider.api_key()),
+                Some(&cancellation),
+            );
+            let content = match serde_json::to_string(&result) {
+                Ok(content) => content,
+                Err(_) => {
+                    return serde_json::json!({"error": "unable to encode subagent command result"})
+                }
+            };
+            messages.push(ChatMessage::tool(call.id, call.name, content));
         }
     }
 }
@@ -974,19 +1297,50 @@ fn expand_skill_invocation(
     })
 }
 
+#[cfg(test)]
 fn redact_tool_arguments(arguments: &str, secret: &str) -> String {
-    let fallback = || "{}".to_owned();
-    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
-        return fallback();
+    safe_tool_call(
+        &ChatToolCall {
+            id: String::new(),
+            name: "cmd".to_owned(),
+            arguments: arguments.to_owned(),
+        },
+        secret,
+    )
+    .arguments
+}
+
+fn safe_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
+    let valid = match call.name.as_str() {
+        "cmd" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.len() == 1 && object.get("command").is_some_and(Value::is_string)
+            }),
+        "spawn_subagent" => parse_subagent_arguments(&call.arguments).is_ok(),
+        "check_subagent" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.len() == 1 && object.get("task_id").is_some_and(Value::is_string)
+            }),
+        _ => false,
     };
-    let Some(object) = value.as_object() else {
-        return fallback();
+    let arguments = if valid {
+        serde_json::to_string(&redact_json_value(
+            serde_json::from_str(&call.arguments).unwrap_or(Value::Null),
+            secret,
+        ))
+        .unwrap_or_else(|_| "{}".to_owned())
+    } else {
+        "{}".to_owned()
     };
-    if object.len() != 1 || !object.get("command").is_some_and(Value::is_string) {
-        return fallback();
+    ChatToolCall {
+        id: redact_secret(&call.id, Some(secret)),
+        name: redact_secret(&call.name, Some(secret)),
+        arguments,
     }
-    let redacted = redact_json_value(value, secret);
-    serde_json::to_string(&redacted).unwrap_or_else(|_| fallback())
 }
 
 fn safe_partial_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
@@ -995,7 +1349,7 @@ fn safe_partial_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
         .and_then(|value| value.as_object().cloned())
         .is_some_and(|object| object.len() == 1 && object.contains_key("command"))
     {
-        redact_tool_arguments(&call.arguments, secret)
+        safe_tool_call(call, secret).arguments
     } else {
         // An incomplete argument fragment is an observation only. Do not
         // preserve malformed provider JSON: decoding it later could expose a
@@ -1201,6 +1555,123 @@ mod tests {
     }
 
     #[test]
+    fn spawned_worker_has_no_tool_round_limit() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("worker listener");
+        listener
+            .set_nonblocking(true)
+            .expect("worker listener nonblocking");
+        let address = listener.local_addr().expect("worker address");
+        let mut responses = (0..33)
+            .map(|index| {
+                let tool = serde_json::json!({
+                    "id": "provider-id",
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": format!("worker-call-{index}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "cmd",
+                                    "arguments": "{\"command\":\"true\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                });
+                format!("data: {tool}\n\ndata: [DONE]\n\n")
+            })
+            .collect::<Vec<_>>();
+        responses.push(normalized_provider_response("worker complete"));
+        let expected_requests = responses.len();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut requests = 0;
+            for response in responses {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok((stream, address)) => {
+                            stream
+                                .set_nonblocking(false)
+                                .expect("worker connection blocking");
+                            break (stream, address);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "worker request timed out"
+                            );
+                            thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("worker accept: {error}"),
+                    }
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("worker clone"));
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("worker request header");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().expect("worker content length");
+                        }
+                    }
+                }
+                let mut body = vec![0_u8; content_length];
+                reader.read_exact(&mut body).expect("worker request body");
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                stream.write_all(header.as_bytes()).expect("worker header");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("worker response");
+                stream.flush().expect("worker flush");
+                requests += 1;
+            }
+            requests
+        });
+
+        let key_env = format!("LUCY_WORKER_LOOP_KEY_{}", std::process::id());
+        std::env::set_var(&key_env, "provider-secret");
+        let settings = crate::config::LlmSettings {
+            base_url: format!("http://{address}/v1"),
+            model: "worker-model".to_owned(),
+            api_key_env: key_env.clone(),
+            effort: None,
+        };
+        let result = run_subagent(
+            settings,
+            "boot context".to_owned(),
+            std::env::current_dir().expect("worker cwd"),
+            "inspect many steps".to_owned(),
+            None,
+            None,
+            Some(CancellationToken::new()),
+        );
+
+        assert_eq!(result["output"], "worker complete");
+        assert_eq!(server.join().expect("worker server"), expected_requests);
+        std::env::remove_var(key_env);
+    }
+
+    fn normalized_provider_response(text: &str) -> String {
+        let payload = serde_json::json!({
+            "id": "provider-id",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+        });
+        format!("data: {payload}\n\ndata: [DONE]\n\n")
+    }
+
+    #[test]
     fn mid_turn_compaction_summarizes_without_tools_then_continues_original_request() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("compaction listener");
         let address = listener.local_addr().expect("compaction address");
@@ -1306,10 +1777,13 @@ mod tests {
         }
 
         let mut harness = Harness {
+            home: std::env::temp_dir(),
             session,
             provider,
             context_window: Some(1),
             attached_agents: Vec::new(),
+            subagents: Arc::new(Mutex::new(HashMap::new())),
+            completed_subagents: mpsc::channel(),
         };
         let cancellation = CancellationToken::new();
         let mut sink = Sink {
