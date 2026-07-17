@@ -433,6 +433,7 @@ impl Harness {
                     let partial = error.partial_turn().cloned().unwrap_or(ProviderTurn {
                         content: raw_content,
                         tool_calls: Vec::new(),
+                        reasoning_details: Vec::new(),
                     });
                     return self.interrupt(
                         sink,
@@ -471,8 +472,10 @@ impl Harness {
                 })
                 .collect::<Vec<_>>();
             let assistant_content = redact_secret(&turn.content, Some(&secret));
-            let assistant =
+            let safe_reasoning_details = redact_reasoning_details(&turn.reasoning_details, &secret);
+            let mut assistant =
                 ChatMessage::assistant(assistant_content.clone(), safe_tool_calls.clone());
+            assistant.reasoning_details = safe_reasoning_details;
             if let Err(error) = self.session.append_message(assistant) {
                 if cancellation.is_some_and(|token| token.is_cancelled()) {
                     let interruption = self.interrupt(
@@ -817,6 +820,16 @@ fn redact_json_value(value: Value, secret: &str) -> Value {
     }
 }
 
+fn redact_reasoning_details(details: &[Value], secret: &str) -> Option<Vec<Value>> {
+    if details.is_empty() {
+        return None;
+    }
+    match redact_json_value(Value::Array(details.to_vec()), secret) {
+        Value::Array(details) => Some(details),
+        _ => None,
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     let mut options = CliOptions {
         session: None,
@@ -1138,6 +1151,25 @@ mod tests {
         assert!(redacted["timed_out"].is_boolean());
         assert!(redacted["stdout_truncated"].is_boolean());
         assert!(redacted["error"].is_null());
+    }
+
+    #[test]
+    fn reasoning_details_are_recursively_redacted_before_persistence() {
+        let details = vec![serde_json::json!({
+            "type": "reasoning.text",
+            "text": "provider-secret",
+            "nested": [{"value": "provider-secret"}],
+            "provider-secret": "provider-secret"
+        })];
+        let redacted = redact_reasoning_details(&details, "provider-secret")
+            .expect("non-empty reasoning details");
+        let redacted = Value::Array(redacted);
+        let encoded = serde_json::to_string(&redacted).expect("reasoning details JSON");
+        assert!(!encoded.contains("provider-secret"));
+        assert_eq!(redacted[0]["type"], "reasoning.text");
+        assert_eq!(redacted[0]["text"], "[REDACTED]");
+        assert_eq!(redacted[0]["nested"][0]["value"], "[REDACTED]");
+        assert!(redacted[0].get("provider-secret").is_none());
     }
 
     #[test]

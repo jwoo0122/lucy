@@ -730,6 +730,11 @@ fn message_contains_secret(message: &ChatMessage, secret: &str) -> bool {
             .content
             .as_deref()
             .is_some_and(|content| content.contains(secret))
+        || message.reasoning_details.as_ref().is_some_and(|details| {
+            details
+                .iter()
+                .any(|detail| json_value_contains_secret(detail, secret))
+        })
         || message
             .name
             .as_deref()
@@ -1089,6 +1094,67 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_details_round_trip_through_session_and_provider_history() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_REASONING_DETAILS_KEY".to_owned(),
+            effort: None,
+        };
+        let mut session = Session::create_with_secret(&home, &cwd, "prompt".to_owned(), llm, None)
+            .expect("create");
+        let details = vec![serde_json::json!({
+            "type": "reasoning.text",
+            "text": "provider detail"
+        })];
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(details.clone());
+        session.append_message(assistant).expect("assistant");
+
+        let resumed = Session::resume(&home, &session.id).expect("resume");
+        assert_eq!(resumed.messages[0].reasoning_details, Some(details.clone()));
+        let provider_assistant = resumed
+            .provider_messages()
+            .into_iter()
+            .find(|message| message.role == "assistant")
+            .expect("provider assistant");
+        assert_eq!(provider_assistant.reasoning_details, Some(details));
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn append_rejects_secrets_nested_in_reasoning_details() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_REASONING_SECRET_KEY".to_owned(),
+            effort: None,
+        };
+        let mut session = Session::create_with_secret(
+            &home,
+            &cwd,
+            "prompt".to_owned(),
+            llm,
+            Some("provider-secret"),
+        )
+        .expect("create");
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(vec![serde_json::json!({
+            "type": "reasoning.text",
+            "text": "provider-secret"
+        })]);
+        let error = session
+            .append_message(assistant)
+            .expect_err("secret reasoning details");
+        assert_eq!(error.to_string(), "session record rejected");
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
     fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments() {
         let home = temporary_home();
         let cwd = std::env::current_dir().expect("cwd");
@@ -1096,6 +1162,7 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             model: "model".to_owned(),
             api_key_env: "LUCY_NO_SESSION_KEY".to_owned(),
+            effort: None,
         };
         let mut session = Session::create_with_secret(&home, &cwd, "prompt".to_owned(), llm, None)
             .expect("create");
