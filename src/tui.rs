@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -16,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use serde_json::Value;
@@ -31,7 +32,6 @@ use crate::session::SessionHistoryRecord;
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
-const MAX_DISPLAY_RESULT_CHARS: usize = 8 * 1024;
 const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Maximum number of wrapped input rows the input box grows to before it
@@ -60,13 +60,28 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
         }
     };
     let mut terminal_guard = TerminalGuard::new(terminal);
+    let backend = terminal_guard.terminal_mut().backend_mut();
     if let Err(error) = execute!(
-        terminal_guard.terminal_mut().backend_mut(),
+        backend,
         EnterAlternateScreen,
         EnableMouseCapture,
         Hide
     ) {
         return Err(format!("unable to enter terminal UI: {error}"));
+    }
+    // Kitty keyboard protocol makes Shift+Enter (and other modified keys)
+    // distinguishable from plain Enter. Only push it on terminals known to
+    // support it; otherwise the enhancement sequence would leak as literal
+    // text on screen.
+    if supports_keyboard_enhancement() {
+        let _ = execute!(
+            backend,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            )
+        );
+        terminal_guard.keyboard_enhancement = true;
     }
     let worker = thread::spawn(move || worker_loop(&mut harness, request_rx, message_tx, resumed));
 
@@ -318,12 +333,14 @@ fn wait_for_worker(worker: JoinHandle<()>, grace: Duration) {
 
 struct TerminalGuard<W: Write> {
     terminal: Option<Terminal<CrosstermBackend<W>>>,
+    keyboard_enhancement: bool,
 }
 
 impl<W: Write> TerminalGuard<W> {
     fn new(terminal: Terminal<CrosstermBackend<W>>) -> Self {
         Self {
             terminal: Some(terminal),
+            keyboard_enhancement: false,
         }
     }
 
@@ -339,6 +356,9 @@ impl<W: Write> Drop for TerminalGuard<W> {
         let Some(mut terminal) = self.terminal.take() else {
             return;
         };
+        if self.keyboard_enhancement {
+            let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        }
         let _ = terminal.show_cursor();
         let _ = disable_raw_mode();
         let _ = execute!(
@@ -349,6 +369,28 @@ impl<W: Write> Drop for TerminalGuard<W> {
         );
         let _ = terminal.backend_mut().flush();
     }
+}
+
+/// Heuristic for terminals that implement the kitty keyboard protocol.
+/// `PushKeyboardEnhancementFlags` is a no-op on supported terminals, but on
+/// unsupported ones the CSI sequence can render as literal text, so it is only
+/// enabled when the terminal advertises support via `TERM`/`TERM_PROGRAM`.
+fn supports_keyboard_enhancement() -> bool {
+    fn env(name: &str) -> Option<String> {
+        std::env::var(name).ok().map(|value| value.to_lowercase())
+    }
+    let term = env("TERM").unwrap_or_default();
+    let program = env("TERM_PROGRAM").unwrap_or_default();
+    if term.starts_with("xterm-kitty")
+        || term.starts_with("ghostty")
+        || term.starts_with("xterm-ghostty")
+    {
+        return true;
+    }
+    matches!(
+        program.as_str(),
+        "ghostty" | "kitty" | "wezterm" | "alacritty" | "foot" | "footclient" | "iterm.app"
+    )
 }
 
 enum WorkerRequest {
@@ -670,11 +712,18 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
 fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
     let mut lines = Vec::new();
-    for (index, item) in state.transcript.iter().enumerate() {
-        if index > 0 {
+    // Track the previous rendered item so a ToolResult can be folded onto the
+    // same logical line as its preceding ToolCall instead of producing a
+    // separate transcript block.
+    let mut prev: Option<&TranscriptItem> = None;
+    for item in &state.transcript {
+        let is_result_after_call = matches!(item, TranscriptItem::ToolResult { .. })
+            && matches!(prev, Some(TranscriptItem::ToolCall { .. }));
+        if !is_result_after_call && !lines.is_empty() {
             // One blank line between every pair of transcript items so user
             // messages, assistant messages, and tool calls/results stay
-            // visually separated.
+            // visually separated. A ToolResult that directly follows a
+            // ToolCall is rendered on the same line and skips the separator.
             lines.push(Line::raw(String::new()));
         }
         match item {
@@ -687,30 +736,50 @@ fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
                 push_wrapped(&mut lines, &text, width, Style::default());
             }
             TranscriptItem::ToolCall {
-                id,
+                id: _,
                 name,
                 arguments,
             } => {
-                let body = format!("tool {name} [{id}]\n{}", pretty_arguments(arguments));
-                let text = redact_secret(&body, Some(&state.secret));
-                push_wrapped(&mut lines, &text, width, Style::default());
+                let call_text = format!("[tool:{name} {}]", call_arguments(arguments));
+                let call_text = redact_secret(&call_text, Some(&state.secret));
+                push_spans_wrapped(
+                    &mut lines,
+                    &[(call_text, tool_call_style())],
+                    width,
+                );
             }
-            TranscriptItem::ToolResult { id, name, result } => {
-                let pretty = serde_json::to_string_pretty(result)
-                    .unwrap_or_else(|_| "{}".to_owned());
-                let body = format!("result {name} [{id}]\n{}", bounded_display(&pretty));
-                let text = redact_secret(&body, Some(&state.secret));
-                push_wrapped(&mut lines, &text, width, Style::default());
+            TranscriptItem::ToolResult { id: _, name: _, result } => {
+                let result_text = format_tool_result(result);
+                let result_text = redact_secret(&result_text, Some(&state.secret));
+                if is_result_after_call {
+                    if let Some(last) = lines.last_mut() {
+                        last.spans.push(Span::raw(" > "));
+                        last.spans.push(Span::styled(result_text, tool_result_style()));
+                    } else {
+                        push_spans_wrapped(
+                            &mut lines,
+                            &[(result_text, tool_result_style())],
+                            width,
+                        );
+                    }
+                } else {
+                    push_spans_wrapped(
+                        &mut lines,
+                        &[(result_text, tool_result_style())],
+                        width,
+                    );
+                }
             }
             TranscriptItem::Error(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_wrapped(&mut lines, &text, width, Style::default());
+                push_wrapped(&mut lines, &text, width, error_style());
             }
             TranscriptItem::Info(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_wrapped(&mut lines, &text, width, Style::default());
+                push_wrapped(&mut lines, &text, width, info_style());
             }
         }
+        prev = Some(item);
     }
     if lines.is_empty() {
         lines.push(Line::raw("type a message"));
@@ -718,14 +787,61 @@ fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn pretty_arguments(arguments: &str) -> String {
-    let parsed: Value = serde_json::from_str(arguments)
-        .unwrap_or_else(|_| Value::String(arguments.to_owned()));
-    serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| arguments.to_owned())
+/// Render tool call arguments as the command string inside double quotes, for
+/// example `"cat README.md"`. Malformed arguments fall back to the raw text.
+fn call_arguments(arguments: &str) -> String {
+    let parsed: Value = match serde_json::from_str(arguments) {
+        Ok(value) => value,
+        Err(_) => return arguments.to_owned(),
+    };
+    if let Some(command) = parsed.get("command").and_then(Value::as_str) {
+        return format!("\"{command}\"");
+    }
+    serde_json::to_string(&parsed).unwrap_or_else(|_| arguments.to_owned())
+}
+
+/// Render a tool result as a single-line JSON-string-array literal containing
+/// stdout (or stderr when stdout is empty). Newlines are escaped so the whole
+/// result stays on one line. Output is truncated to `RESULT_PREVIEW_CHARS`.
+fn format_tool_result(result: &Value) -> String {
+    let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let output = if !stdout.is_empty() { stdout } else { stderr };
+    let truncated = truncate_output(output);
+    // Build a JSON string literal so newlines and quotes are escaped and the
+    // result renders on a single line as `["..."]`.
+    let json_string = serde_json::to_string(&truncated).unwrap_or_else(|_| "\"\"".to_owned());
+    format!("[{json_string}]")
+}
+
+const RESULT_PREVIEW_CHARS: usize = 50;
+
+fn truncate_output(output: &str) -> String {
+    let mut result: String = output.chars().take(RESULT_PREVIEW_CHARS).collect();
+    if output.chars().count() > RESULT_PREVIEW_CHARS {
+        result.push('…');
+    }
+    result
 }
 
 fn user_message_style() -> Style {
-    Style::default().bg(Color::Rgb(96, 86, 42))
+    Style::default().fg(Color::Yellow)
+}
+
+fn tool_call_style() -> Style {
+    Style::default().fg(Color::Magenta)
+}
+
+fn tool_result_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn error_style() -> Style {
+    Style::default().fg(Color::Red)
+}
+
+fn info_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
@@ -737,6 +853,36 @@ fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style:
     if !added {
         lines.push(Line::styled(String::new(), style));
     }
+}
+
+/// Push a logical line built from styled segments. When the rendered width
+/// exceeds `width`, the whole line is character-wrapped; wrapped continuations
+/// keep the style of the segment they fall on.
+fn push_spans_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    segments: &[(String, Style)],
+    width: usize,
+) {
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width = 0usize;
+    for (text, style) in segments {
+        for character in text.chars() {
+            let char_width =
+                unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if current_width + char_width > width && !current_spans.is_empty() {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+                current_width = 0;
+            }
+            let mut buffer = [0u8; 4];
+            let s = character.encode_utf8(&mut buffer);
+            current_spans.push(Span::styled(s.to_owned(), *style));
+            current_width += char_width;
+        }
+    }
+    if current_spans.is_empty() {
+        current_spans.push(Span::raw(String::new()));
+    }
+    lines.push(Line::from(current_spans));
 }
 
 /// Wrap `text` into rows no wider than `width` display columns. Wrapping is
@@ -773,17 +919,6 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     }
     rows.push(current);
     rows
-}
-
-fn bounded_display(text: &str) -> String {
-    let mut result = text
-        .chars()
-        .take(MAX_DISPLAY_RESULT_CHARS)
-        .collect::<String>();
-    if text.chars().count() > MAX_DISPLAY_RESULT_CHARS {
-        result.push('…');
-    }
-    result
 }
 
 #[cfg(test)]
@@ -868,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn user_lines_use_a_muted_yellow_background_without_role_prefixes() {
+    fn user_lines_use_a_bright_yellow_foreground_without_role_prefixes() {
         let history = [SessionHistoryRecord::Message {
             timestamp: 1,
             message: ChatMessage::user("hello".to_owned()),
@@ -876,7 +1011,8 @@ mod tests {
         let state = UiState::from_history(&history, "provider-secret", "id", false);
         let lines = transcript_lines(&state, 80);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].style.bg, Some(Color::Rgb(96, 86, 42)));
+        assert_eq!(lines[0].style.fg, Some(Color::Yellow));
+        assert_eq!(lines[0].style.bg, None);
         assert_eq!(lines[0].to_string(), "hello");
     }
 
@@ -961,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_arguments_render_as_pretty_json() {
+    fn tool_call_renders_as_compact_single_line_with_command() {
         let history = [SessionHistoryRecord::Message {
             timestamp: 1,
             message: ChatMessage::assistant(
@@ -979,10 +1115,122 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("tool cmd [call-1]"));
-        assert!(text.contains("\"command\": \"pwd\""));
-        // The raw compact JSON string must not appear verbatim.
+        assert!(text.contains("[tool:cmd \"pwd\"]"));
+        // The raw JSON arguments must not appear verbatim.
         assert!(!text.contains("{\"command\":\"pwd\"}"));
+    }
+
+    #[test]
+    fn tool_call_and_result_render_on_one_line_with_truncated_stdout() {
+        let long_stdout = "a".repeat(80);
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-1".to_owned(),
+                        name: "cmd".to_owned(),
+                        arguments: r#"{"command":"cat README.md"}"#.to_owned(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-1".to_owned(),
+                    "cmd".to_owned(),
+                    serde_json::json!({
+                        "command": "cat README.md",
+                        "exit_code": 0,
+                        "stdout": long_stdout,
+                        "stderr": "",
+                    })
+                    .to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "id", false);
+        let lines = transcript_lines(&state, 200);
+        // Call and result share one logical line (no blank line between them).
+        assert_eq!(lines.len(), 1);
+        let text = lines[0].to_string();
+        assert!(text.starts_with("[tool:cmd \"cat README.md\"] > ["));
+        // stdout is truncated to 50 chars plus the ellipsis.
+        assert!(text.contains(&"a".repeat(50)));
+        assert!(text.contains('…'));
+        assert!(!text.contains(&"a".repeat(51)));
+    }
+
+    #[test]
+    fn tool_result_falls_back_to_stderr_when_stdout_is_empty() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-1".to_owned(),
+                        name: "cmd".to_owned(),
+                        arguments: r#"{"command":"bad"}"#.to_owned(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-1".to_owned(),
+                    "cmd".to_owned(),
+                    serde_json::json!({
+                        "command": "bad",
+                        "exit_code": 127,
+                        "stdout": "",
+                        "stderr": "not found",
+                    })
+                    .to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "id", false);
+        let text = transcript_lines(&state, 200)[0].to_string();
+        assert!(text.contains("not found"));
+        assert!(text.contains(" > "));
+    }
+
+    #[test]
+    fn tool_call_and_result_styles_use_foreground_colors() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-1".to_owned(),
+                        name: "cmd".to_owned(),
+                        arguments: r#"{"command":"pwd"}"#.to_owned(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-1".to_owned(),
+                    "cmd".to_owned(),
+                    serde_json::json!({"stdout":"x","stderr":""}).to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "id", false);
+        let lines = transcript_lines(&state, 200);
+        let spans = &lines[0].spans;
+        // Call text is split per-character into Magenta spans; the separator
+        // " > " is a single default-color span; the result is one DarkGray span.
+        assert_eq!(spans[0].style.fg, Some(Color::Magenta));
+        let separator = spans.iter().find(|span| span.content == " > ").expect("separator");
+        assert_eq!(separator.style.fg, None);
+        let result_span = spans.last().expect("result span");
+        assert_eq!(result_span.style.fg, Some(Color::DarkGray));
+        assert_eq!(result_span.content, "[\"x\"]");
     }
 
     #[test]
