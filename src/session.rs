@@ -900,6 +900,7 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             model: "model".to_owned(),
             api_key_env: "LUCY_APPEND_TEST_KEY".to_owned(),
+            effort: None,
         };
         let mut session =
             Session::create(&home, &cwd, "prompt".to_owned(), llm).expect("create session");
@@ -931,6 +932,7 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             model: "model".to_owned(),
             api_key_env: "LUCY_APPEND_LINK_KEY".to_owned(),
+            effort: None,
         };
         let mut session =
             Session::create(&home, &cwd, "prompt".to_owned(), llm).expect("create session");
@@ -959,6 +961,7 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             model: "model".to_owned(),
             api_key_env: "LUCY_APPEND_FIFO_KEY".to_owned(),
+            effort: None,
         };
         let mut session =
             Session::create(&home, &cwd, "prompt".to_owned(), llm).expect("create session");
@@ -1033,6 +1036,7 @@ mod tests {
             base_url: "http://localhost:1234/api/v1".to_owned(),
             model: "test-model".to_owned(),
             api_key_env: "TEST_KEY".to_owned(),
+            effort: None,
         };
         let mut session =
             Session::create(&home, &cwd, "stable prompt".to_owned(), llm.clone()).expect("create");

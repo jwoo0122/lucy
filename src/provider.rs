@@ -76,12 +76,13 @@ pub struct Provider {
     async_client: AsyncClient,
     endpoint: String,
     model: String,
+    effort: Option<String>,
     api_key_env: String,
     api_key: String,
 }
 
-fn chat_request(model: &str, messages: &[ChatMessage]) -> Value {
-    json!({
+fn chat_request(model: &str, messages: &[ChatMessage], effort: &Option<String>) -> Value {
+    let mut request = json!({
         "model": model,
         "messages": messages
             .iter()
@@ -105,7 +106,11 @@ fn chat_request(model: &str, messages: &[ChatMessage]) -> Value {
                 }
             }
         ]
-    })
+    });
+    if let Some(effort) = effort {
+        request["reasoning_effort"] = json!(effort);
+    }
+    request
 }
 
 impl Provider {
@@ -132,6 +137,19 @@ impl Provider {
                 Some(&api_key),
             )));
         }
+        let effort = match &settings.effort {
+            Some(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(ProviderError::new(redact_secret(
+                        "llm.effort must not be empty",
+                        Some(&api_key),
+                    )));
+                }
+                Some(trimmed.to_owned())
+            }
+            None => None,
+        };
         let endpoint = format!(
             "{}/chat/completions",
             settings.base_url.trim_end_matches('/')
@@ -159,6 +177,7 @@ impl Provider {
             async_client,
             endpoint,
             model: settings.model.clone(),
+            effort,
             api_key_env: settings.api_key_env.clone(),
             api_key,
         })
@@ -177,7 +196,7 @@ impl Provider {
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> Result<ProviderTurn, ProviderError> {
-        let request = chat_request(&self.model, messages);
+        let request = chat_request(&self.model, messages, &self.effort);
 
         let response = self
             .client
@@ -381,7 +400,7 @@ impl Provider {
                 tool_calls: Vec::new(),
             }));
         }
-        let request = chat_request(&self.model, messages);
+        let request = chat_request(&self.model, messages, &self.effort);
         let request = self
             .async_client
             .post(&self.endpoint)
@@ -1072,6 +1091,7 @@ mod tests {
                 base_url: "http://localhost".to_owned(),
                 model: "model".to_owned(),
                 api_key_env: environment.clone(),
+                effort: None,
             };
             let error = match Provider::new(&settings) {
                 Ok(_) => panic!("fixed literal conflict should be rejected: {secret}"),
@@ -1091,8 +1111,44 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             model: "model".to_owned(),
             api_key_env: environment.clone(),
+            effort: None,
         };
         assert!(Provider::new(&settings).is_ok());
+        std::env::remove_var(environment);
+    }
+
+    #[test]
+    fn accepts_a_configurable_effort() {
+        let environment = format!("LUCY_PROVIDER_EFFORT_OK_{}", std::process::id());
+        std::env::set_var(&environment, "provider-secret");
+        let settings = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: environment.clone(),
+            effort: Some("high".to_owned()),
+        };
+        assert!(Provider::new(&settings).is_ok());
+        std::env::remove_var(environment);
+    }
+
+    #[test]
+    fn empty_effort_is_rejected_without_echoing_the_key() {
+        let environment = format!("LUCY_PROVIDER_EFFORT_EMPTY_{}", std::process::id());
+        std::env::set_var(&environment, "provider-secret");
+        for effort in ["", "   ", "\t"] {
+            let settings = LlmSettings {
+                base_url: "http://localhost".to_owned(),
+                model: "model".to_owned(),
+                api_key_env: environment.clone(),
+                effort: Some(effort.to_owned()),
+            };
+            let error = match Provider::new(&settings) {
+                Ok(_) => panic!("empty effort should be rejected: {effort:?}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("llm.effort must not be empty"));
+            assert!(!error.to_string().contains("provider-secret"));
+        }
         std::env::remove_var(environment);
     }
 
@@ -1104,6 +1160,7 @@ mod tests {
             base_url: "http://localhost".to_owned(),
             model: "model".to_owned(),
             api_key_env: environment.clone(),
+            effort: None,
         };
         let error = match Provider::new(&settings) {
             Ok(_) => panic!("missing key should be rejected"),

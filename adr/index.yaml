@@ -52,7 +52,7 @@ decisions:
       - harness.agent-boundary-and-protocol
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-16'
+    last_reviewed: '2026-07-17'
   - id: harness.session-and-context-lifecycle
     status: accepted
     scope: harness
