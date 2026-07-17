@@ -1,9 +1,22 @@
 [package]
-name = "lucy"
-version = "0.1.0"
+name = "lucy-cli"
+version = "1.0.0"
 edition = "2021"
 description = "A small local JSONL agent harness"
+homepage = "https://github.com/jwoo0122/lucy"
 license = "MIT"
+repository = "https://github.com/jwoo0122/lucy"
+
+[[bin]]
+name = "lucy"
+path = "src/main.rs"
+
+[lib]
+name = "lucy"
+path = "src/lib.rs"
+
+[package.metadata.dist]
+formula = "lucy"
 
 [dependencies]
 libc = "0.2"
@@ -15,3 +28,8 @@ unicode-width = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
