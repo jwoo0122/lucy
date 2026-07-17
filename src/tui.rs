@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
@@ -34,6 +34,9 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DISPLAY_RESULT_CHARS: usize = 8 * 1024;
 const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Maximum number of wrapped input rows the input box grows to before it
+/// stops expanding and scrolls its contents internally.
+const MAX_INPUT_ROWS: u16 = 12;
 
 pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> Result<(), String> {
     let secret = harness.provider.api_key().to_owned();
@@ -164,12 +167,10 @@ fn event_loop<W: Write>(
             let event =
                 event::read().map_err(|error| format!("unable to read terminal input: {error}"))?;
             if let Event::Mouse(mouse) = event {
-                let max_scroll = max_scroll_for_area(
-                    state,
-                    terminal
-                        .size()
-                        .map_err(|error| format!("unable to read terminal size: {error}"))?,
-                );
+                let size = terminal
+                    .size()
+                    .map_err(|error| format!("unable to read terminal size: {error}"))?;
+                let max_scroll = max_scroll_for_area(state, size);
                 handle_mouse_event(state, mouse.kind, max_scroll);
                 continue;
             }
@@ -203,6 +204,18 @@ fn event_loop<W: Write>(
             }
             match key.code {
                 KeyCode::Enter => {
+                    // Shift+Enter (and Alt+Enter fallback) insert a literal
+                    // newline so the user can write multi-line prompts. Plain
+                    // Enter sends the turn. Many terminals cannot distinguish
+                    // Shift+Enter from Enter, so Alt+Enter is also accepted.
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        if state.input.chars().count() < MAX_DISPLAY_INPUT_CHARS {
+                            state.input.push('\n');
+                        }
+                        continue;
+                    }
                     let text = std::mem::take(&mut state.input);
                     if text.trim().is_empty() {
                         continue;
@@ -228,21 +241,17 @@ fn event_loop<W: Write>(
                     state.input.pop();
                 }
                 KeyCode::Up | KeyCode::PageUp => {
-                    let max_scroll = max_scroll_for_area(
-                        state,
-                        terminal
-                            .size()
-                            .map_err(|error| format!("unable to read terminal size: {error}"))?,
-                    );
+                    let size = terminal
+                        .size()
+                        .map_err(|error| format!("unable to read terminal size: {error}"))?;
+                    let max_scroll = max_scroll_for_area(state, size);
                     scroll_up(state, max_scroll);
                 }
                 KeyCode::Down | KeyCode::PageDown => {
-                    let max_scroll = max_scroll_for_area(
-                        state,
-                        terminal
-                            .size()
-                            .map_err(|error| format!("unable to read terminal size: {error}"))?,
-                    );
+                    let size = terminal
+                        .size()
+                        .map_err(|error| format!("unable to read terminal size: {error}"))?;
+                    let max_scroll = max_scroll_for_area(state, size);
                     scroll_down(state, max_scroll);
                 }
                 KeyCode::Home => {
@@ -561,119 +570,145 @@ enum TranscriptItem {
 
 fn max_scroll_for_area(state: &UiState, size: Size) -> u16 {
     let area = Rect::new(0, 0, size.width, size.height);
+    let input_rows = input_visible_rows(state, area.width);
+    let input_height = input_rows.min(MAX_INPUT_ROWS).max(1) + 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
         .split(area);
-    let lines = transcript_lines(state);
-    let visual_lines = visual_line_count(&lines, chunks[0].width);
-    visual_lines
+    let lines = transcript_lines(state, chunks[0].width);
+    lines
+        .len()
         .saturating_sub(chunks[0].height as usize)
         .min(u16::MAX as usize) as u16
 }
 
-fn visual_line_count(lines: &[Line<'static>], width: u16) -> usize {
-    if width == 0 {
-        return 0;
-    }
+/// Number of wrapped rows the current input prompt occupies at `width`,
+/// including the leading `> ` marker on the first row.
+fn input_visible_rows(state: &UiState, width: u16) -> u16 {
     let width = width as usize;
-    lines.iter().fold(0, |total, line| {
-        let line_width = line.width().max(1);
-        let rows = line_width.saturating_add(width - 1) / width;
-        total.saturating_add(rows)
-    })
+    if width == 0 {
+        return 1;
+    }
+    let prompt = input_prompt(&state.input);
+    let wrapped = wrap_text(&prompt, width);
+    wrapped.len().max(1) as u16
+}
+
+fn input_prompt(input: &str) -> String {
+    format!("> {}", input)
 }
 
 fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
+    let input_rows = input_visible_rows(state, area.width).min(MAX_INPUT_ROWS).max(1);
+    let input_height = input_rows + 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
         .split(area);
 
-    let lines = transcript_lines(state);
+    let width = chunks[0].width;
+    let lines = transcript_lines(state, width);
     let available = chunks[0].height as usize;
-    let visual_lines = visual_line_count(&lines, chunks[0].width);
-    let max_scroll = visual_lines
-        .saturating_sub(available)
-        .min(u16::MAX as usize) as u16;
+    let max_scroll = lines.len().saturating_sub(available).min(u16::MAX as usize) as u16;
     let scroll = if state.auto_scroll {
         max_scroll
     } else {
         state.scroll.min(max_scroll)
     };
-    let transcript = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let transcript = Paragraph::new(lines).scroll((scroll, 0));
     frame.render_widget(transcript, chunks[0]);
 
     let mode = if state.resumed { "resumed" } else { "new" };
     let status_text = format!(
-        " session={} · {} · {} · Enter send · Esc cancel · Ctrl-C exit",
+        " session={} · {} · {} · Enter send · Shift/Alt+Enter newline · Esc cancel · Ctrl-C exit",
         state.session_id, mode, state.status
     );
     let status = Paragraph::new(redact_secret(&status_text, Some(&state.secret)));
     frame.render_widget(status, chunks[1]);
 
-    let input_text = format!("> {}", state.input);
-    let safe_input = redact_secret(&input_text, Some(&state.secret));
     let input_block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let input_area = input_block.inner(chunks[2]);
-    let input = Paragraph::new(safe_input.clone()).block(input_block);
+    let prompt = redact_secret(&input_prompt(&state.input), Some(&state.secret));
+    let wrapped = wrap_text(&prompt, input_area.width.max(1) as usize);
+    let visible = (wrapped.len() as u16).min(input_rows).max(1);
+    let input_scroll = (wrapped.len() as u16).saturating_sub(visible);
+    let input_lines: Vec<Line<'static>> = wrapped
+        .into_iter()
+        .map(|line| Line::raw(line))
+        .collect();
+    let input = Paragraph::new(input_lines.clone())
+        .scroll((input_scroll, 0))
+        .block(input_block);
     frame.render_widget(input, chunks[2]);
     // Ratatui shows the cursor when a frame requests a position and hides it
     // when this branch is skipped, which provides the blink phase.
-    if state.cursor_visible() && !input_area.is_empty() {
-        let cursor_offset = UnicodeWidthStr::width(safe_input.as_str()) as u16;
+    if state.cursor_visible() && !input_area.is_empty() && visible > 0 {
+        // The cursor sits at the end of the input. The last visible row is the
+        // row that holds the cursor when the input is scrolled to the bottom.
+        let last_visible_idx = (input_scroll as usize) + (visible as usize) - 1;
+        let last_row = input_lines
+            .get(last_visible_idx)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        let cursor_offset = UnicodeWidthStr::width(last_row.as_str()) as u16;
         let cursor_x = input_area.x + cursor_offset.min(input_area.width.saturating_sub(1));
-        frame.set_cursor_position((cursor_x, input_area.y));
+        let cursor_y = input_area.y + (visible - 1);
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
-fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
+fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
     let mut lines = Vec::new();
-    for item in &state.transcript {
+    for (index, item) in state.transcript.iter().enumerate() {
+        if index > 0 {
+            // One blank line between every pair of transcript items so user
+            // messages, assistant messages, and tool calls/results stay
+            // visually separated.
+            lines.push(Line::raw(String::new()));
+        }
         match item {
             TranscriptItem::User(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_message_lines(&mut lines, &text, user_message_style());
+                push_wrapped(&mut lines, &text, width, user_message_style());
             }
             TranscriptItem::Assistant(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_message_lines(&mut lines, &text, Style::default());
+                push_wrapped(&mut lines, &text, width, Style::default());
             }
             TranscriptItem::ToolCall {
                 id,
                 name,
                 arguments,
             } => {
-                let text =
-                    redact_secret(&format!("{name} [{id}] {arguments}"), Some(&state.secret));
-                push_labeled_lines(&mut lines, "tool", &text);
+                let body = format!("tool {name} [{id}]\n{}", pretty_arguments(arguments));
+                let text = redact_secret(&body, Some(&state.secret));
+                push_wrapped(&mut lines, &text, width, Style::default());
             }
             TranscriptItem::ToolResult { id, name, result } => {
-                let text = serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".to_owned());
-                let text = redact_secret(
-                    &format!("{name} [{id}]\n{}", bounded_display(&text)),
-                    Some(&state.secret),
-                );
-                push_labeled_lines(&mut lines, "result", &text);
+                let pretty = serde_json::to_string_pretty(result)
+                    .unwrap_or_else(|_| "{}".to_owned());
+                let body = format!("result {name} [{id}]\n{}", bounded_display(&pretty));
+                let text = redact_secret(&body, Some(&state.secret));
+                push_wrapped(&mut lines, &text, width, Style::default());
             }
             TranscriptItem::Error(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_labeled_lines(&mut lines, "error", &text);
+                push_wrapped(&mut lines, &text, width, Style::default());
             }
             TranscriptItem::Info(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_labeled_lines(&mut lines, "status", &text);
+                push_wrapped(&mut lines, &text, width, Style::default());
             }
         }
     }
@@ -683,14 +718,20 @@ fn transcript_lines(state: &UiState) -> Vec<Line<'static>> {
     lines
 }
 
+fn pretty_arguments(arguments: &str) -> String {
+    let parsed: Value = serde_json::from_str(arguments)
+        .unwrap_or_else(|_| Value::String(arguments.to_owned()));
+    serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| arguments.to_owned())
+}
+
 fn user_message_style() -> Style {
     Style::default().bg(Color::Rgb(96, 86, 42))
 }
 
-fn push_message_lines(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
     let mut added = false;
-    for line in text.lines() {
-        lines.push(Line::styled(line.to_owned(), style));
+    for piece in wrap_text(text, width) {
+        lines.push(Line::styled(piece, style));
         added = true;
     }
     if !added {
@@ -698,20 +739,40 @@ fn push_message_lines(lines: &mut Vec<Line<'static>>, text: &str, style: Style) 
     }
 }
 
-fn push_labeled_lines(lines: &mut Vec<Line<'static>>, label: &str, text: &str) {
-    let mut first = true;
+/// Wrap `text` into rows no wider than `width` display columns. Wrapping is
+/// character-based so the row count matches exactly what a non-wrapping
+/// `Paragraph` renderer draws, which keeps auto-scroll pinned to the true
+/// bottom of the transcript regardless of terminal width. Empty lines are
+/// preserved as empty rows.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return text.lines().map(str::to_owned).collect();
+    }
+    let mut rows = Vec::new();
     for line in text.lines() {
-        let content = if first {
-            format!("{label}> {line}")
-        } else {
-            format!("       {line}")
-        };
-        lines.push(Line::raw(content));
-        first = false;
+        rows.extend(wrap_line(line, width));
     }
-    if first {
-        lines.push(Line::raw(format!("{label}>")));
+    if rows.is_empty() {
+        rows.push(String::new());
     }
+    rows
+}
+
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for character in line.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if current_width + char_width > width && !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += char_width;
+    }
+    rows.push(current);
+    rows
 }
 
 fn bounded_display(text: &str) -> String {
@@ -749,7 +810,7 @@ mod tests {
         assert!(matches!(state.transcript[0], TranscriptItem::User(_)));
         assert!(matches!(state.transcript[1], TranscriptItem::Assistant(_)));
         assert!(matches!(state.transcript[2], TranscriptItem::Info(_)));
-        let text = transcript_lines(&state)
+        let text = transcript_lines(&state, 80)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -769,7 +830,7 @@ mod tests {
             message,
         }];
         let state = UiState::from_history(&history, "provider-secret", "id", true);
-        let text = transcript_lines(&state)
+        let text = transcript_lines(&state, 80)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -813,7 +874,7 @@ mod tests {
             message: ChatMessage::user("hello".to_owned()),
         }];
         let state = UiState::from_history(&history, "provider-secret", "id", false);
-        let lines = transcript_lines(&state);
+        let lines = transcript_lines(&state, 80);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].style.bg, Some(Color::Rgb(96, 86, 42)));
         assert_eq!(lines[0].to_string(), "hello");
@@ -826,7 +887,7 @@ mod tests {
             message: ChatMessage::assistant("provider-secret".to_owned(), Vec::new()),
         }];
         let state = UiState::from_history(&history, "provider-secret", "id", false);
-        let text = transcript_lines(&state)
+        let text = transcript_lines(&state, 80)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -853,9 +914,15 @@ mod tests {
     }
 
     #[test]
-    fn visual_line_count_accounts_for_wrapped_lines_and_empty_lines() {
-        let lines = vec![Line::raw("12345"), Line::raw("")];
-        assert_eq!(visual_line_count(&lines, 3), 3);
+    fn wrap_text_breaks_long_lines_and_preserves_empty_lines() {
+        let rows = wrap_text("12345\n\nabc", 3);
+        assert_eq!(rows, vec!["123", "45", "", "abc"]);
+    }
+
+    #[test]
+    fn wrap_line_never_returns_an_empty_vec() {
+        assert_eq!(wrap_line("", 5), vec![""]);
+        assert_eq!(wrap_line("abc", 5), vec!["abc"]);
     }
 
     #[test]
@@ -871,5 +938,59 @@ mod tests {
         assert!(state.busy);
         assert!(state.active_cancel.is_some());
         assert_eq!(state.status, "finalizing");
+    }
+
+    #[test]
+    fn transcript_inserts_a_blank_line_between_items() {
+        let history = [
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::user("hi".to_owned()),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::assistant("hello".to_owned(), Vec::new()),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "id", false);
+        let lines = transcript_lines(&state, 80);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].to_string(), "hi");
+        assert_eq!(lines[1].to_string(), "");
+        assert_eq!(lines[2].to_string(), "hello");
+    }
+
+    #[test]
+    fn tool_call_arguments_render_as_pretty_json() {
+        let history = [SessionHistoryRecord::Message {
+            timestamp: 1,
+            message: ChatMessage::assistant(
+                String::new(),
+                vec![crate::model::ChatToolCall {
+                    id: "call-1".to_owned(),
+                    name: "cmd".to_owned(),
+                    arguments: r#"{"command":"pwd"}"#.to_owned(),
+                }],
+            ),
+        }];
+        let state = UiState::from_history(&history, "secret", "id", false);
+        let text = transcript_lines(&state, 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("tool cmd [call-1]"));
+        assert!(text.contains("\"command\": \"pwd\""));
+        // The raw compact JSON string must not appear verbatim.
+        assert!(!text.contains("{\"command\":\"pwd\"}"));
+    }
+
+    #[test]
+    fn input_prompt_wraps_to_multiple_rows_when_long() {
+        let mut state = UiState::from_history(&[], "secret", "id", false);
+        state.input = "abcdefghij".to_owned();
+        // width 5: "> abcdefghij" wraps to "> abc", "defg", "hij".
+        let rows = input_visible_rows(&state, 5);
+        assert!(rows >= 3);
     }
 }
