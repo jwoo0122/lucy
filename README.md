@@ -41,9 +41,15 @@ system_prompt = "You can access computer resources. Use the provided tools to ac
 base_url = "https://openrouter.ai/api/v1"
 model = ""
 api_key_env = "OPENROUTER_API_KEY"
+# Optional reasoning effort sent as the OpenAI Chat Completions "reasoning_effort"
+# field, e.g. "low", "medium", "high". Omit or leave unset to send no effort.
+# Use a value your provider and model support; an unsupported value fails at runtime.
+# effort = "medium"
 ```
 
 Set `model` before starting a session. Lucy does not guess a model. `base_url` is used as `<base_url>/chat/completions`; any OpenAI-compatible HTTP(S) endpoint can be configured. If `api_key_env` is omitted, runtime uses `OPENAI_API_KEY`.
+
+An optional `[llm]` `effort` sets the OpenAI Chat Completions `reasoning_effort` request field for reasoning-capable models (for example `low`, `medium`, `high`). Omit it or leave it unset to send no effort. The value is sent verbatim, so use one your provider and model accept; an unsupported value is a runtime provider error, not a boot failure. An empty or whitespace-only `effort` fails boot with a configuration error. The resolved `effort` is persisted in the session snapshot and applies on resume.
 
 The key is read only from the named environment variable. It is not written to config, session files, stdout, or diagnostics. Missing model and missing key errors are stable generic diagnostics and do not print the environment-variable name or secret. Keys containing JSON syntax/control characters, only decimal digits, or complete fixed protocol/storage literals are rejected before session output; this prevents redaction from corrupting JSON syntax, schema keys, or typed fields. Newly created session metadata is also rejected if it contains the active key. Structured JSON tool arguments are recursively redacted before protocol and session persistence, including decoded Unicode-escaped strings and unknown object keys; required tool and result field names remain unchanged. Raw provider arguments remain the inputs used for local command execution. Malformed provider arguments are replaced with a valid empty-object placeholder in persisted/provider-facing history and are not executed as commands.
 

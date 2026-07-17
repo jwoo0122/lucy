@@ -445,6 +445,18 @@ fn write_config_with_api_key_env(
     .expect("config");
 }
 
+fn write_config_with_effort(home: &Path, base_url: &str, prompt: &str, model: &str, effort: &str) {
+    fs::create_dir_all(home.join(".lucy")).expect("Lucy directory");
+    let escaped_prompt = prompt.replace('"', "\\\"");
+    fs::write(
+        home.join(".lucy/config.toml"),
+        format!(
+            "system_prompt = \"{escaped_prompt}\"\n\n[llm]\nbase_url = \"{base_url}\"\nmodel = \"{model}\"\napi_key_env = \"LUCY_API_KEY\"\neffort = \"{effort}\"\n"
+        ),
+    )
+    .expect("config");
+}
+
 fn run_lucy(home: &Path, cwd: &Path, args: &[&str], input: &str) -> std::process::Output {
     run_lucy_with_key(home, cwd, args, input, "provider-secret")
 }
@@ -1469,6 +1481,155 @@ fn generated_config_is_not_written_when_it_contains_the_active_key() {
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("OPENROUTER_API_KEY"));
     assert!(!home.join(".lucy/config.toml").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn configured_effort_is_sent_as_reasoning_effort() {
+    let server = MockServer::start(vec![normal_response("finished")]);
+    let (home, project) = temporary_tree("effort-sent");
+    write_config_with_effort(&home, &server.base_url, "base prompt", "mock-model", "high");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 1);
+    let request: Value = serde_json::from_str(&requests[0]).expect("provider request JSON");
+    assert_eq!(request["reasoning_effort"], "high");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("provider-secret"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn omitted_effort_sends_no_reasoning_effort_field() {
+    let server = MockServer::start(vec![normal_response("finished")]);
+    let (home, project) = temporary_tree("effort-omitted");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 1);
+    let request: Value = serde_json::from_str(&requests[0]).expect("provider request JSON");
+    assert!(request.get("reasoning_effort").is_none());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn empty_effort_fails_boot_without_echoing_the_key() {
+    let (home, project) = temporary_tree("effort-empty");
+    write_config_with_effort(
+        &home,
+        "http://127.0.0.1:1/v1",
+        "base prompt",
+        "mock-model",
+        "",
+    );
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("llm.effort must not be empty"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("provider-secret"), "stderr: {stderr}");
+    assert!(!home.join(".lucy/sessions").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn effort_containing_the_active_key_is_rejected_as_a_session_header() {
+    let (home, project) = temporary_tree("effort-key-collision");
+    write_config_with_effort(
+        &home,
+        "http://127.0.0.1:1/v1",
+        "base prompt",
+        "mock-model",
+        "provider-secret",
+    );
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session header"), "stderr: {stderr}");
+    assert!(!stderr.contains("provider-secret"), "stderr: {stderr}");
+    let session_files = home.join(".lucy/sessions");
+    if let Ok(entries) = fs::read_dir(session_files) {
+        assert_eq!(entries.count(), 0);
+    }
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn effort_is_persisted_and_applied_on_resume() {
+    let server = MockServer::start(vec![normal_response("first"), normal_response("resumed")]);
+    let (home, project) = temporary_tree("effort-resume");
+    write_config_with_effort(
+        &home,
+        &server.base_url,
+        "original prompt",
+        "original-model",
+        "high",
+    );
+
+    let first = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"first message\"}\n",
+    );
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    let first_records = parse_lines(&first.stdout);
+    let session_id = first_records[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    // Change config (no effort, different model) to prove resume uses the snapshot.
+    write_config(&home, &server.base_url, "changed prompt", "changed-model");
+
+    let resumed = run_lucy(
+        &home,
+        &project,
+        &["--session", &session_id],
+        "{\"type\":\"message\",\"text\":\"second message\"}\n",
+    );
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
+    assert_eq!(resumed_request["reasoning_effort"], "high");
+    assert_eq!(resumed_request["model"], "original-model");
+    assert_ne!(resumed_request["model"], "changed-model");
+
     fs::remove_dir_all(home).expect("cleanup");
 }
 
