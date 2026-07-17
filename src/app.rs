@@ -10,7 +10,8 @@ use crate::model::{ChatMessage, ChatToolCall};
 use crate::protocol::{EventSink, ProtocolEvent, ProtocolWriter};
 use crate::provider::{Provider, ProviderTurn};
 use crate::redaction::{
-    conflicts_with_tui_literal, is_structural_key, redact_secret, redaction_marker,
+    conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key,
+    redact_secret, redaction_marker,
 };
 use crate::session::Session;
 
@@ -931,11 +932,11 @@ fn write_diagnostic_safe_with_environment<W, I>(
     W: Write,
     I: IntoIterator<Item = String>,
 {
-    let mut safe_line = format!("lucy: {message}");
+    let mut safe_line = format!("!: {message}");
     safe_line = redact_secret(&safe_line, secret);
     let mut environment_secrets = environment_values
         .into_iter()
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && !conflicts_with_protected_literal(value))
         .collect::<Vec<_>>();
     environment_secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
     for environment_secret in environment_secrets {
