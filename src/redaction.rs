@@ -32,6 +32,7 @@ const STRUCTURAL_KEYS: &[&str] = &[
     "phase",
     "reason",
     "record",
+    "reasoning_details",
     "required",
     "resumed",
     "result",

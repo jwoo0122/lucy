@@ -758,6 +758,28 @@ mod tests {
     }
 
     #[test]
+    fn history_replay_does_not_render_assistant_reasoning_details() {
+        let mut message = ChatMessage::assistant("visible answer".to_owned(), Vec::new());
+        message.reasoning_details = Some(vec![serde_json::json!({
+            "type": "reasoning.text",
+            "text": "private reasoning"
+        })]);
+        let history = [SessionHistoryRecord::Message {
+            timestamp: 1,
+            message,
+        }];
+        let state = UiState::from_history(&history, "provider-secret", "id", true);
+        let text = transcript_lines(&state)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("visible answer"));
+        assert!(!text.contains("private reasoning"));
+        assert!(!text.contains("reasoning_details"));
+    }
+
+    #[test]
     fn history_replay_preserves_repeated_records() {
         let history = vec![
             SessionHistoryRecord::Message {

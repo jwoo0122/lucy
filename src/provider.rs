@@ -14,6 +14,7 @@ use crate::redaction::{conflicts_with_protected_literal, redact_secret, redactio
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PROVIDER_TOOL_CALLS: usize = 64;
 const MAX_PROVIDER_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_REASONING_DETAILS_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
@@ -69,6 +70,7 @@ impl std::error::Error for ProviderError {}
 pub struct ProviderTurn {
     pub content: String,
     pub tool_calls: Vec<ChatToolCall>,
+    pub reasoning_details: Vec<Value>,
 }
 
 pub struct Provider {
@@ -215,6 +217,8 @@ impl Provider {
 
         let mut content = String::new();
         let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
+        let mut reasoning_details = Vec::new();
+        let mut reasoning_details_bytes = 0;
         let mut tool_argument_bytes: usize = 0;
         let mut finish_reason = None;
         {
@@ -238,6 +242,11 @@ impl Provider {
                 let Some(delta) = choice.get("delta") else {
                     return Ok(());
                 };
+                append_reasoning_details(
+                    &mut reasoning_details,
+                    &mut reasoning_details_bytes,
+                    delta,
+                )?;
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
                     if content.len().saturating_add(text.len()) > MAX_PROVIDER_CONTENT_BYTES {
                         return Err(ProviderError::new(
@@ -370,6 +379,7 @@ impl Provider {
         Ok(ProviderTurn {
             content,
             tool_calls,
+            reasoning_details,
         })
     }
 
@@ -398,6 +408,7 @@ impl Provider {
             return Err(ProviderError::cancelled(ProviderTurn {
                 content: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_details: Vec::new(),
             }));
         }
         let request = chat_request(&self.model, messages, &self.effort);
@@ -414,6 +425,7 @@ impl Provider {
                 return Err(ProviderError::cancelled(ProviderTurn {
                     content: String::new(),
                     tool_calls: Vec::new(),
+                    reasoning_details: Vec::new(),
                 }));
             }
             match tokio::time::timeout(CANCELLATION_POLL_INTERVAL, request.as_mut()).await {
@@ -481,6 +493,8 @@ struct PartialToolCall {
 struct ProviderAccumulator {
     content: String,
     tool_calls: BTreeMap<usize, PartialToolCall>,
+    reasoning_details: Vec<Value>,
+    reasoning_details_bytes: usize,
     tool_argument_bytes: usize,
     finish_reason: Option<String>,
 }
@@ -511,6 +525,11 @@ impl ProviderAccumulator {
         let Some(delta) = choice.get("delta") else {
             return Ok(());
         };
+        append_reasoning_details(
+            &mut self.reasoning_details,
+            &mut self.reasoning_details_bytes,
+            delta,
+        )?;
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             if self.content.len().saturating_add(text.len()) > MAX_PROVIDER_CONTENT_BYTES {
                 return Err(ProviderError::new(
@@ -612,6 +631,7 @@ impl ProviderAccumulator {
                     arguments: partial.arguments.clone(),
                 })
                 .collect(),
+            reasoning_details: self.reasoning_details.clone(),
         }
     }
 
@@ -649,8 +669,39 @@ impl ProviderAccumulator {
         Ok(ProviderTurn {
             content: self.content,
             tool_calls,
+            reasoning_details: self.reasoning_details,
         })
     }
+}
+
+fn append_reasoning_details(
+    target: &mut Vec<Value>,
+    serialized_bytes: &mut usize,
+    delta: &Value,
+) -> Result<(), ProviderError> {
+    let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if details.is_empty() {
+        return Ok(());
+    }
+    let serialized_delta = serde_json::to_vec(details)
+        .map_err(|_| ProviderError::new("provider reasoning details could not be serialized"))?;
+    let combined_bytes = if target.is_empty() {
+        serialized_delta.len()
+    } else {
+        serialized_bytes
+            .saturating_add(serialized_delta.len())
+            .saturating_sub(1)
+    };
+    if combined_bytes > MAX_PROVIDER_REASONING_DETAILS_BYTES {
+        return Err(ProviderError::new(
+            "provider reasoning details exceeded the response limit",
+        ));
+    }
+    target.extend(details.iter().cloned());
+    *serialized_bytes = combined_bytes;
+    Ok(())
 }
 
 fn append_provider_field(
@@ -1042,6 +1093,178 @@ mod tests {
     }
 
     #[test]
+    fn accumulates_reasoning_details_with_fragmented_tool_calls() {
+        let mut accumulator = ProviderAccumulator::default();
+        accumulator
+            .on_data(
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "reasoning_details": [{
+                                "type": "reasoning.text",
+                                "text": "part one"
+                            }]
+                        }
+                    }]
+                }),
+                "provider-secret",
+                &mut |_| Ok(()),
+            )
+            .expect("first provider chunk");
+        accumulator
+            .on_data(
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "reasoning_details": [{
+                                "type": "reasoning.text",
+                                "text": "part two"
+                            }],
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call-1",
+                                "function": {
+                                    "name": "cmd",
+                                    "arguments": "{\"command\":\"true\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                "provider-secret",
+                &mut |_| Ok(()),
+            )
+            .expect("second provider chunk");
+
+        let partial = accumulator.partial_turn();
+        assert_eq!(partial.reasoning_details.len(), 2);
+        let turn = accumulator.finish().expect("provider turn");
+        assert_eq!(
+            turn.reasoning_details,
+            vec![
+                json!({"type": "reasoning.text", "text": "part one"}),
+                json!({"type": "reasoning.text", "text": "part two"}),
+            ]
+        );
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "cmd");
+    }
+
+    #[test]
+    fn accumulates_many_small_reasoning_details_and_rejects_overflow_atomically() {
+        const FRAGMENT_COUNT: usize = 4096;
+        let mut details = Vec::new();
+        let mut serialized_bytes = 0;
+        let delta = serde_json::json!({
+            "reasoning_details": [{
+                "type": "reasoning.text",
+                "text": "x".repeat(64)
+            }]
+        });
+        for _ in 0..FRAGMENT_COUNT {
+            append_reasoning_details(&mut details, &mut serialized_bytes, &delta)
+                .expect("small reasoning detail");
+        }
+        assert_eq!(details.len(), FRAGMENT_COUNT);
+
+        let first_chunk_delta = serde_json::json!({
+            "reasoning_details": [{
+                "type": "reasoning.text",
+                "text": "x".repeat(500 * 1024)
+            }]
+        });
+        let first_chunk_bytes = serde_json::to_vec(&first_chunk_delta["reasoning_details"])
+            .expect("first reasoning detail chunk")
+            .len();
+        assert!(first_chunk_bytes < MAX_PROVIDER_REASONING_DETAILS_BYTES);
+        append_reasoning_details(&mut details, &mut serialized_bytes, &first_chunk_delta)
+            .expect("first individually bounded reasoning detail chunk");
+        assert!(serialized_bytes <= MAX_PROVIDER_REASONING_DETAILS_BYTES);
+
+        let second_chunk_delta = serde_json::json!({
+            "reasoning_details": [{
+                "type": "reasoning.text",
+                "text": "x".repeat(200 * 1024)
+            }]
+        });
+        let second_chunk_bytes = serde_json::to_vec(&second_chunk_delta["reasoning_details"])
+            .expect("second reasoning detail chunk")
+            .len();
+        assert!(second_chunk_bytes < MAX_PROVIDER_REASONING_DETAILS_BYTES);
+        assert!(
+            serialized_bytes
+                .saturating_add(second_chunk_bytes)
+                .saturating_sub(1)
+                > MAX_PROVIDER_REASONING_DETAILS_BYTES
+        );
+
+        let prior_details = details.clone();
+        let prior_bytes = serialized_bytes;
+        let error =
+            append_reasoning_details(&mut details, &mut serialized_bytes, &second_chunk_delta)
+                .expect_err("reasoning details limit");
+
+        assert_eq!(
+            error.to_string(),
+            "provider reasoning details exceeded the response limit"
+        );
+        assert_eq!(details, prior_details);
+        assert_eq!(serialized_bytes, prior_bytes);
+        assert_eq!(
+            serde_json::to_vec(&details)
+                .expect("accumulated reasoning details")
+                .len(),
+            serialized_bytes
+        );
+        assert!(serialized_bytes <= MAX_PROVIDER_REASONING_DETAILS_BYTES);
+    }
+
+    #[test]
+    fn rejects_reasoning_details_that_exceed_the_serialized_response_limit_before_retaining_them() {
+        let mut accumulator = ProviderAccumulator::default();
+        let retained = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "reasoning_details": [{
+                        "type": "reasoning.text",
+                        "text": "retained"
+                    }]
+                }
+            }]
+        });
+        accumulator
+            .on_data(retained, "provider-secret", &mut |_| Ok(()))
+            .expect("details within limit");
+
+        let oversized = "x".repeat(MAX_PROVIDER_REASONING_DETAILS_BYTES);
+        let error = accumulator
+            .on_data(
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "reasoning_details": [{"text": oversized}]
+                        }
+                    }]
+                }),
+                "provider-secret",
+                &mut |_| Ok(()),
+            )
+            .expect_err("reasoning details limit");
+        assert_eq!(
+            error.to_string(),
+            "provider reasoning details exceeded the response limit"
+        );
+        assert_eq!(
+            accumulator.reasoning_details,
+            vec![serde_json::json!({
+                "type": "reasoning.text",
+                "text": "retained"
+            })]
+        );
+    }
+
+    #[test]
     fn accepts_compatible_finish_reasons_and_rejects_incomplete_ones() {
         for reason in [
             None,
@@ -1212,6 +1435,7 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             model: "model".to_owned(),
             api_key_env: environment.clone(),
+            effort: None,
         })
         .expect("provider");
         let token = CancellationToken::new();

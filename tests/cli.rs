@@ -226,6 +226,44 @@ fn tool_response_with_arguments(arguments: String, call_id: &str) -> String {
     tool_response_with_finish_reason(arguments, call_id, "tool_calls")
 }
 
+fn tool_response_with_reasoning_details(arguments: String, call_id: &str) -> String {
+    let reasoning_first = json!({
+        "id": "provider-id",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "reasoning_details": [{
+                    "type": "reasoning.text",
+                    "text": "private reasoning one"
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let reasoning_and_tool = json!({
+        "id": "provider-id",
+        "object": "chat.completion.chunk",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "reasoning_details": [{
+                    "type": "reasoning.text",
+                    "text": "private reasoning two"
+                }],
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "cmd", "arguments": arguments}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {reasoning_first}\n\ndata: {reasoning_and_tool}\n\ndata: [DONE]\n\n")
+}
+
 fn tool_response_with_finish_reason(
     arguments: String,
     call_id: &str,
@@ -660,6 +698,76 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
     assert!(!session_bytes.contains("provider-secret"));
     assert!(session_bytes.contains("base prompt"));
 
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn reasoning_details_survive_tool_follow_up_and_session_resume_without_public_output() {
+    let server = MockServer::start(vec![
+        tool_response_with_reasoning_details(
+            json!({"command": "true"}).to_string(),
+            "call-reasoning",
+        ),
+        normal_response("finished"),
+        normal_response("resumed"),
+    ]);
+    let (home, project) = temporary_tree("reasoning-details");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let first = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"inspect\"}\n",
+    );
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    assert!(first.stderr.is_empty(), "stderr: {:?}", first.stderr);
+    let first_output = String::from_utf8_lossy(&first.stdout);
+    assert!(!first_output.contains("reasoning_details"));
+    assert!(!first_output.contains("private reasoning"));
+    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let resumed = run_lucy(
+        &home,
+        &project,
+        &["--session", &session_id],
+        "{\"type\":\"message\",\"text\":\"resume\"}\n",
+    );
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+    assert!(resumed.stderr.is_empty(), "stderr: {:?}", resumed.stderr);
+    let resumed_output = String::from_utf8_lossy(&resumed.stdout);
+    assert!(!resumed_output.contains("reasoning_details"));
+    assert!(!resumed_output.contains("private reasoning"));
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    let expected_details = json!([
+        {"type": "reasoning.text", "text": "private reasoning one"},
+        {"type": "reasoning.text", "text": "private reasoning two"}
+    ]);
+    for request_body in [&requests[1], &requests[2]] {
+        let request: Value = serde_json::from_str(request_body).expect("provider request JSON");
+        let assistant = request["messages"]
+            .as_array()
+            .expect("provider messages")
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("assistant tool-call message");
+        assert_eq!(assistant["reasoning_details"], expected_details);
+    }
+
+    let session_file = fs::read_dir(home.join(".lucy/sessions"))
+        .expect("sessions")
+        .next()
+        .expect("session entry")
+        .expect("session file")
+        .path();
+    let session_bytes = fs::read_to_string(session_file).expect("session contents");
+    assert!(session_bytes.contains("reasoning_details"));
+    assert!(session_bytes.contains("private reasoning one"));
     fs::remove_dir_all(home).expect("cleanup");
 }
 

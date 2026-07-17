@@ -7,6 +7,8 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -26,6 +28,7 @@ impl ChatMessage {
         Self {
             role: "system".to_owned(),
             content: Some(content),
+            reasoning_details: None,
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
@@ -36,6 +39,7 @@ impl ChatMessage {
         Self {
             role: "user".to_owned(),
             content: Some(content),
+            reasoning_details: None,
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
@@ -46,6 +50,7 @@ impl ChatMessage {
         Self {
             role: "assistant".to_owned(),
             content: (!content.is_empty()).then_some(content),
+            reasoning_details: None,
             name: None,
             tool_call_id: None,
             tool_calls,
@@ -56,6 +61,7 @@ impl ChatMessage {
         Self {
             role: "tool".to_owned(),
             content: Some(content),
+            reasoning_details: None,
             name: Some(name),
             tool_call_id: Some(tool_call_id),
             tool_calls: Vec::new(),
@@ -67,6 +73,11 @@ impl ChatMessage {
             "role": self.role,
             "content": self.content,
         });
+        if self.role == "assistant" {
+            if let Some(reasoning_details) = &self.reasoning_details {
+                message["reasoning_details"] = Value::Array(reasoning_details.clone());
+            }
+        }
         if let Some(name) = &self.name {
             message["name"] = Value::String(name.clone());
         }
@@ -121,5 +132,30 @@ mod tests {
         );
         assert_eq!(tool.to_openai_value()["tool_call_id"], "call-1");
         assert_eq!(tool.to_openai_value()["name"], "cmd");
+    }
+
+    #[test]
+    fn reasoning_details_are_optional_and_only_sent_for_assistant_messages() {
+        let details = vec![json!({
+            "type": "reasoning.text",
+            "text": "private reasoning"
+        })];
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(details.clone());
+        assert_eq!(
+            assistant.to_openai_value()["reasoning_details"],
+            json!(details)
+        );
+
+        let old_message: ChatMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": "old session"
+        }))
+        .expect("old message without reasoning details");
+        assert_eq!(old_message.reasoning_details, None);
+
+        let mut user = ChatMessage::user("question".to_owned());
+        user.reasoning_details = Some(vec![json!({"text": "must not be sent"})]);
+        assert!(user.to_openai_value().get("reasoning_details").is_none());
     }
 }
