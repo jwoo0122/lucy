@@ -17,7 +17,7 @@ decisions:
     depends_on: []
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-17'
+    last_reviewed: '2026-07-18'
   - id: harness.command-execution
     status: accepted
     scope: harness

@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::config::{
     ensure_not_symlink, ensure_private_dir, ensure_private_file, lucy_dir, LlmSettings,
 };
+use crate::context::SkillEntry;
 use crate::model::{ChatMessage, ChatToolCall};
 use crate::redaction::{conflicts_with_protected_literal, redact_secret};
 
@@ -54,6 +55,8 @@ enum SessionRecord {
         cwd: String,
         boot_system_prompt: String,
         llm: LlmSettings,
+        #[serde(default)]
+        skills: Vec<SkillEntry>,
     },
     #[serde(rename = "message")]
     Message {
@@ -71,6 +74,13 @@ enum SessionRecord {
         tool_calls: Vec<ChatToolCall>,
         #[serde(default)]
         tool_results: Vec<SessionToolResult>,
+    },
+    #[serde(rename = "compaction")]
+    Compaction {
+        timestamp: u64,
+        summary: String,
+        first_kept_message: usize,
+        tokens_before: usize,
     },
 }
 
@@ -97,6 +107,18 @@ pub struct InterruptionRecord {
     pub tool_results: Vec<SessionToolResult>,
 }
 
+/// A durable summary boundary that lets provider context shrink without
+/// rewriting the append-only session history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionRecord {
+    pub timestamp: u64,
+    pub summary: String,
+    /// Message ordinal (excluding the system prompt) at which retained context
+    /// begins. Messages before this boundary remain available for replay only.
+    pub first_kept_message: usize,
+    pub tokens_before: usize,
+}
+
 /// The ordered, replayable records after a session header.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "record")]
@@ -115,6 +137,8 @@ pub enum SessionHistoryRecord {
         tool_calls: Vec<ChatToolCall>,
         tool_results: Vec<SessionToolResult>,
     },
+    #[serde(rename = "compaction")]
+    Compaction(CompactionRecord),
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +148,9 @@ pub struct Session {
     pub cwd: PathBuf,
     pub boot_system_prompt: String,
     pub llm: LlmSettings,
+    /// Skills are immutable per-session just like the boot prompt, so a
+    /// resumed `/<name>` skill command cannot silently load changed files.
+    pub skills: Vec<SkillEntry>,
     pub created_at: u64,
     pub updated_at: u64,
     pub messages: Vec<ChatMessage>,
@@ -160,6 +187,17 @@ impl Session {
         llm: LlmSettings,
         secret: Option<&str>,
     ) -> Result<Self, SessionError> {
+        Self::create_with_skills_and_secret(home, cwd, boot_system_prompt, llm, Vec::new(), secret)
+    }
+
+    pub fn create_with_skills_and_secret(
+        home: &Path,
+        cwd: &Path,
+        boot_system_prompt: String,
+        llm: LlmSettings,
+        skills: Vec<SkillEntry>,
+        secret: Option<&str>,
+    ) -> Result<Self, SessionError> {
         let cwd = fs::canonicalize(cwd)
             .map_err(|_error| SessionError::new("unable to resolve session cwd"))?;
         let sessions_directory = sessions_dir(home);
@@ -183,6 +221,7 @@ impl Session {
                 cwd: cwd.display().to_string(),
                 boot_system_prompt: boot_system_prompt.clone(),
                 llm: llm.clone(),
+                skills: skills.clone(),
             };
             if let Some(secret) = secret {
                 if record_contains_secret(&record, secret) {
@@ -207,6 +246,7 @@ impl Session {
                         cwd,
                         boot_system_prompt,
                         llm,
+                        skills,
                         created_at,
                         updated_at: created_at,
                         messages: Vec::new(),
@@ -292,6 +332,7 @@ impl Session {
                     cwd,
                     boot_system_prompt,
                     llm,
+                    skills,
                 } => {
                     if version != 1 || session_id != id || header.is_some() {
                         return Err(session_error(
@@ -299,7 +340,7 @@ impl Session {
                             active_secret.as_deref(),
                         ));
                     }
-                    header = Some((created_at, cwd, boot_system_prompt, llm));
+                    header = Some((created_at, cwd, boot_system_prompt, llm, skills));
                 }
                 SessionRecord::Message { timestamp, message } => {
                     if header.is_none() {
@@ -339,10 +380,44 @@ impl Session {
                         tool_results,
                     });
                 }
+                SessionRecord::Compaction {
+                    timestamp,
+                    summary,
+                    first_kept_message,
+                    tokens_before,
+                } => {
+                    if header.is_none() {
+                        return Err(session_error(
+                            "session compaction precedes header",
+                            active_secret.as_deref(),
+                        ));
+                    }
+                    updated_at = Some(timestamp);
+                    history.push(SessionHistoryRecord::Compaction(CompactionRecord {
+                        timestamp,
+                        summary,
+                        first_kept_message,
+                        tokens_before,
+                    }));
+                }
             }
         }
 
-        let Some((created_at, cwd, boot_system_prompt, llm)) = header else {
+        let message_count = messages.len();
+        if history.iter().any(|record| {
+            matches!(
+                record,
+                SessionHistoryRecord::Compaction(compaction)
+                    if compaction.first_kept_message > message_count
+            )
+        }) {
+            return Err(session_error(
+                "invalid compaction boundary",
+                active_secret.as_deref(),
+            ));
+        }
+
+        let Some((created_at, cwd, boot_system_prompt, llm, skills)) = header else {
             return Err(session_error(
                 "session has no header",
                 active_secret.as_deref(),
@@ -355,6 +430,7 @@ impl Session {
             cwd,
             boot_system_prompt,
             llm,
+            skills,
             created_at,
             updated_at: updated_at.unwrap_or(created_at),
             messages,
@@ -416,7 +492,46 @@ impl Session {
         Ok(())
     }
 
+    /// Append a summary boundary without deleting the historical records that
+    /// preceded it. `first_kept_message` counts ordinary message records from
+    /// the start of the session, excluding the boot system prompt.
+    pub fn append_compaction(
+        &mut self,
+        summary: String,
+        first_kept_message: usize,
+        tokens_before: usize,
+    ) -> Result<(), SessionError> {
+        let timestamp = now();
+        let record = SessionRecord::Compaction {
+            timestamp,
+            summary: summary.clone(),
+            first_kept_message,
+            tokens_before,
+        };
+        if let Some(secret) = self.secret.as_deref() {
+            if record_contains_secret(&record, secret) {
+                return Err(session_record_rejected(secret));
+            }
+        }
+        let mut file = open_session_for_append(&self.path)?;
+        write_record(&mut file, &record)?;
+        self.history
+            .push(SessionHistoryRecord::Compaction(CompactionRecord {
+                timestamp,
+                summary,
+                first_kept_message,
+                tokens_before,
+            }));
+        self.updated_at = timestamp;
+        Ok(())
+    }
+
     pub fn provider_messages(&self) -> Vec<ChatMessage> {
+        let latest_compaction = self.history.iter().rev().find_map(|record| match record {
+            SessionHistoryRecord::Compaction(compaction) => Some(compaction),
+            _ => None,
+        });
+        let first_kept_message = latest_compaction.map(|compaction| compaction.first_kept_message);
         let interruption_results = self
             .history
             .iter()
@@ -430,13 +545,29 @@ impl Session {
             })
             .flatten()
             .count();
-        let mut messages = Vec::with_capacity(self.messages.len() + 1 + interruption_results);
+        let mut messages = Vec::with_capacity(
+            self.messages.len()
+                + 1
+                + interruption_results
+                + usize::from(latest_compaction.is_some()),
+        );
         let mut declared_tool_calls = HashSet::new();
         let mut completed_tool_calls = HashSet::new();
         messages.push(ChatMessage::system(self.boot_system_prompt.clone()));
+        if let Some(compaction) = latest_compaction {
+            messages.push(compaction_summary_message(&compaction.summary));
+        }
+
+        let mut message_ordinal = 0usize;
         for record in &self.history {
             match record {
                 SessionHistoryRecord::Message { message, .. } => {
+                    let include =
+                        first_kept_message.is_none_or(|boundary| message_ordinal >= boundary);
+                    message_ordinal += 1;
+                    if !include {
+                        continue;
+                    }
                     if message.role == "assistant" {
                         declared_tool_calls
                             .extend(message.tool_calls.iter().map(|call| call.id.clone()));
@@ -470,7 +601,8 @@ impl Session {
                         completed_tool_calls.insert(observation.id.clone());
                     }
                 }
-                SessionHistoryRecord::Interruption { .. } => {}
+                SessionHistoryRecord::Interruption { .. } | SessionHistoryRecord::Compaction(_) => {
+                }
             }
         }
         messages
@@ -685,6 +817,7 @@ fn record_contains_secret(record: &SessionRecord, secret: &str) -> bool {
             cwd,
             boot_system_prompt,
             llm,
+            skills,
         } => {
             version.to_string().contains(secret)
                 || session_id.contains(secret)
@@ -694,6 +827,12 @@ fn record_contains_secret(record: &SessionRecord, secret: &str) -> bool {
                 || llm.base_url.contains(secret)
                 || llm.model.contains(secret)
                 || llm.api_key_env.contains(secret)
+                || skills.iter().any(|skill| {
+                    skill.name.contains(secret)
+                        || skill.description.contains(secret)
+                        || skill.path.display().to_string().contains(secret)
+                        || skill.contents.contains(secret)
+                })
         }
         SessionRecord::Message { timestamp, message } => {
             timestamp.to_string().contains(secret) || message_contains_secret(message, secret)
@@ -720,6 +859,17 @@ fn record_contains_secret(record: &SessionRecord, secret: &str) -> bool {
                         || observation.name.contains(secret)
                         || json_value_contains_secret(&observation.result, secret)
                 })
+        }
+        SessionRecord::Compaction {
+            timestamp,
+            summary,
+            first_kept_message,
+            tokens_before,
+        } => {
+            timestamp.to_string().contains(secret)
+                || summary.contains(secret)
+                || first_kept_message.to_string().contains(secret)
+                || tokens_before.to_string().contains(secret)
         }
     }
 }
@@ -818,6 +968,15 @@ fn write_record(file: &mut File, record: &SessionRecord) -> Result<(), SessionEr
     file.write_all(b"\n")?;
     file.flush()?;
     Ok(())
+}
+
+const COMPACTION_SUMMARY_PREFIX: &str = "<context_compaction>\nThe earlier conversation was compacted. Treat the following summary as authoritative context for the continued turn.\n\n";
+const COMPACTION_SUMMARY_SUFFIX: &str = "\n</context_compaction>";
+
+fn compaction_summary_message(summary: &str) -> ChatMessage {
+    ChatMessage::user(format!(
+        "{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"
+    ))
 }
 
 fn safe_message_summary(message: &ChatMessage) -> String {
@@ -1091,6 +1250,108 @@ mod tests {
         assert!(file.lines().count() >= 3);
         assert!(!file.contains("TEST_KEY_VALUE"));
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_COMPACTION_KEY".to_owned(),
+            effort: None,
+        };
+        let mut session =
+            Session::create_with_secret(&home, &cwd, "stable prompt".to_owned(), llm, None)
+                .expect("create");
+        session
+            .append_message(ChatMessage::user("old request".to_owned()))
+            .expect("old user");
+        session
+            .append_message(ChatMessage::assistant("old answer".to_owned(), Vec::new()))
+            .expect("old assistant");
+        session
+            .append_message(ChatMessage::user("recent request".to_owned()))
+            .expect("recent user");
+        session
+            .append_message(ChatMessage::assistant(
+                "recent answer".to_owned(),
+                Vec::new(),
+            ))
+            .expect("recent assistant");
+
+        session
+            .append_compaction("old work summary".to_owned(), 2, 123)
+            .expect("append compaction");
+
+        let provider_messages = session.provider_messages();
+        assert_eq!(provider_messages[0].role, "system");
+        assert_eq!(provider_messages[1].role, "user");
+        assert!(provider_messages[1]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("old work summary")));
+        let provider_text = provider_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!provider_text.contains("old request"));
+        assert!(!provider_text.contains("old answer"));
+        assert!(provider_text.contains("recent request"));
+        assert!(provider_text.contains("recent answer"));
+        assert!(matches!(
+            session.history.last(),
+            Some(SessionHistoryRecord::Compaction(CompactionRecord {
+                first_kept_message: 2,
+                tokens_before: 123,
+                ..
+            }))
+        ));
+
+        let resumed = Session::resume(&home, &session.id).expect("resume");
+        assert_eq!(resumed.provider_messages(), provider_messages);
+        assert_eq!(resumed.messages.len(), 4, "history remains append-only");
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn compaction_rejects_a_secret_in_the_summary_without_appending() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let key_env = format!("LUCY_COMPACTION_SECRET_{}", std::process::id());
+        let secret = "provider-secret";
+        std::env::set_var(&key_env, secret);
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: key_env.clone(),
+            effort: None,
+        };
+        let mut session =
+            Session::create_with_secret(&home, &cwd, "prompt".to_owned(), llm, Some(secret))
+                .expect("create");
+        session
+            .append_message(ChatMessage::user("one".to_owned()))
+            .expect("user");
+        let before = fs::read_to_string(&session.path).expect("session bytes");
+
+        let error = session
+            .append_compaction(secret.to_owned(), 0, 1)
+            .expect_err("secret summary should be rejected");
+        assert!(error.to_string().contains("session record rejected"));
+        assert_eq!(
+            fs::read_to_string(&session.path).expect("session bytes"),
+            before
+        );
+        assert!(!session
+            .history
+            .iter()
+            .any(|record| matches!(record, SessionHistoryRecord::Compaction(_))));
+
+        std::env::remove_var(key_env);
+        fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]

@@ -52,11 +52,21 @@ jobs:
             fi
             release=true
           else
+            latest_version="${latest_tag#v}"
+            if [[ "$version" != "$latest_version" ]]; then
+              echo "lucy-cli package version ${version} does not match latest release tag ${latest_tag}" >&2
+              exit 1
+            fi
+
             release-plz update --config release-plz.toml
             git add Cargo.toml Cargo.lock
             if ! git diff --cached --quiet; then
               release=true
               version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lucy-cli") | .version')"
+              if [[ "$version" == "$latest_version" ]]; then
+                echo "release-plz did not advance lucy-cli beyond ${latest_tag}" >&2
+                exit 1
+              fi
             fi
           fi
 

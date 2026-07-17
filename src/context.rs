@@ -11,6 +11,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug)]
 pub struct ContextError(String);
 
@@ -40,11 +42,21 @@ pub struct InstructionSource {
     pub contents: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A discovered Agent Skill. `contents` is retained so explicit invocations
+/// use the exact, symlink-safe snapshot discovered when the session started.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillEntry {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    #[serde(default)]
+    pub contents: String,
+    #[serde(default = "default_model_invocable")]
+    pub model_invocable: bool,
+}
+
+fn default_model_invocable() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +96,8 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
         }
     }
 
+    // More-specific project locations override an earlier skill with the
+    // same declared name.
     let mut skills = BTreeMap::new();
     discover_skills(&home.join(".agents").join("skills"), &mut skills)?;
     for directory in &project_directories {
@@ -459,50 +473,51 @@ fn discover_skills(
     else {
         return Ok(());
     };
+    discover_skill_directory(skills_root, &skills_directory, skills)
+}
 
-    let entries = skills_directory
+fn discover_skill_directory(
+    path: &Path,
+    directory: &ContextDirectory,
+    skills: &mut BTreeMap<String, SkillEntry>,
+) -> Result<(), ContextError> {
+    if let Some(file) = directory
+        .open_regular_file(OsStr::new("SKILL.md"))
+        .map_err(|_error| ContextError::new("unable to inspect skill context"))?
+    {
+        if let Ok(contents) = read_open_file(file) {
+            if let Some((name, description, model_invocable)) = parse_skill_frontmatter(&contents) {
+                skills.insert(
+                    name.clone(),
+                    SkillEntry {
+                        name,
+                        description,
+                        path: path.join("SKILL.md"),
+                        contents,
+                        model_invocable,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut names = directory
         .entries()
         .map_err(|_error| ContextError::new("unable to inspect skill context"))?;
-    let mut directories = entries
-        .into_iter()
-        .map(|name| (skills_root.join(&name), name))
-        .collect::<Vec<_>>();
-    directories.sort_by(|left, right| left.0.cmp(&right.0));
-
-    for (path, name) in directories {
-        let Some(directory) = skills_directory
+    names.sort();
+    for name in names {
+        let Some(child) = directory
             .open_child_directory(&name)
             .map_err(|_error| ContextError::new("unable to inspect skill context"))?
         else {
             continue;
         };
-        let Some(file) = directory
-            .open_regular_file(OsStr::new("SKILL.md"))
-            .map_err(|_error| ContextError::new("unable to inspect skill context"))?
-        else {
-            continue;
-        };
-        let contents = match read_open_file(file) {
-            Ok(contents) => contents,
-            Err(_) => continue,
-        };
-        let Some((name, description)) = parse_skill_frontmatter(&contents) else {
-            continue;
-        };
-        skills.insert(
-            name.clone(),
-            SkillEntry {
-                name,
-                description,
-                path: path.join("SKILL.md"),
-            },
-        );
+        discover_skill_directory(&path.join(&name), &child, skills)?;
     }
-
     Ok(())
 }
 
-fn parse_skill_frontmatter(contents: &str) -> Option<(String, String)> {
+fn parse_skill_frontmatter(contents: &str) -> Option<(String, String, bool)> {
     let lines = contents.lines().collect::<Vec<_>>();
     if lines.first().map(|line| line.trim()) != Some("---") {
         return None;
@@ -516,12 +531,18 @@ fn parse_skill_frontmatter(contents: &str) -> Option<(String, String)> {
 
     let mut name = None;
     let mut description = None;
+    let mut model_invocable = true;
     let mut index = 1;
     while index < end {
         let line = lines[index];
         let trimmed = line.trim_start();
         if let Some(value) = trimmed.strip_prefix("name:") {
             name = parse_scalar(value);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("disable-model-invocation:") {
+            model_invocable = !matches!(value.trim(), "true" | "True" | "TRUE");
             index += 1;
             continue;
         }
@@ -554,10 +575,21 @@ fn parse_skill_frontmatter(contents: &str) -> Option<(String, String)> {
 
     let name = name?.trim().to_owned();
     let description = description?.trim().to_owned();
-    if name.is_empty() || description.is_empty() {
+    if !valid_skill_name(&name) || description.is_empty() || description.chars().count() > 1024 {
         return None;
     }
-    Some((name, description))
+    Some((name, description, model_invocable))
+}
+
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn parse_scalar(value: &str) -> Option<String> {
@@ -574,6 +606,17 @@ fn parse_scalar(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// Keep metadata in the XML-shaped progressive-disclosure catalog from
+/// changing its structure. Full skill contents are intentionally not escaped:
+/// they are loaded only when a skill is selected as instructions.
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn build_system_prompt(
     configured_prompt: &str,
     instruction_files: &[InstructionSource],
@@ -587,17 +630,22 @@ fn build_system_prompt(
             instruction.contents.trim_end()
         ));
     }
-    if !skills.is_empty() {
-        let mut catalog = String::from("## Available skills\n");
-        for skill in skills {
+    let invocable_skills = skills
+        .iter()
+        .filter(|skill| skill.model_invocable)
+        .collect::<Vec<_>>();
+    if !invocable_skills.is_empty() {
+        let mut catalog = String::from("<available_skills>\n");
+        for skill in invocable_skills {
             catalog.push_str(&format!(
-                "- name: {}\n  description: {}\n  path: {}\n",
-                skill.name,
-                skill.description,
-                skill.path.display()
+                "<skill>\n<name>{}</name>\n<description>{}</description>\n<location>{}</location>\n</skill>\n",
+                escape_xml(&skill.name),
+                escape_xml(&skill.description),
+                escape_xml(&skill.path.display().to_string())
             ));
         }
-        sections.push(catalog.trim_end().to_owned());
+        catalog.push_str("</available_skills>");
+        sections.push(catalog);
     }
     sections.join("\n\n")
 }
@@ -827,6 +875,28 @@ mod tests {
         assert!(!context.system_prompt.contains("linked-intermediate"));
 
         fs::remove_dir_all(home).expect("remove tree");
+    }
+
+    #[test]
+    fn skill_frontmatter_enforces_standard_names_and_hides_explicit_only_skills() {
+        assert!(
+            parse_skill_frontmatter("---\nname: valid-skill-2\ndescription: visible\n---\n")
+                .is_some()
+        );
+        assert!(
+            parse_skill_frontmatter("---\nname: Invalid_Skill\ndescription: invalid\n---\n")
+                .is_none()
+        );
+        let hidden = SkillEntry {
+            name: "private-skill".to_owned(),
+            description: "hidden from automatic selection".to_owned(),
+            path: PathBuf::from("/skills/private/SKILL.md"),
+            contents: "instructions".to_owned(),
+            model_invocable: false,
+        };
+        let prompt = build_system_prompt("configured", &[], &[hidden]);
+        assert!(!prompt.contains("private-skill"));
+        assert_eq!(escape_xml("a<&>\"'"), "a&lt;&amp;&gt;&quot;&apos;");
     }
 
     #[test]

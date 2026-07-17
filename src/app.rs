@@ -5,13 +5,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::config::{Config, DEFAULT_API_KEY_ENV};
-use crate::context::resolve_boot_context_with_api_key_env;
-use crate::model::{ChatMessage, ChatToolCall};
+use crate::context::{resolve_boot_context_with_api_key_env, InstructionSource, SkillEntry};
+use crate::model::{estimate_context_tokens, estimate_message_tokens, ChatMessage, ChatToolCall};
 use crate::protocol::{EventSink, ProtocolEvent, ProtocolWriter};
 use crate::provider::{Provider, ProviderTurn};
 use crate::redaction::{
-    conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key,
-    redact_secret, redaction_marker,
+    conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key, redact_secret,
+    redaction_marker,
 };
 use crate::session::Session;
 
@@ -35,6 +35,9 @@ const MAX_TOOL_CALLS_PER_MESSAGE: usize = 64;
 const USER_CANCEL_REASON: &str = "user_cancelled";
 const PROVIDER_PHASE: &str = "provider_stream";
 const COMMAND_PHASE: &str = "cmd";
+const AUTO_COMPACTION_THRESHOLD_PERCENT: usize = 95;
+const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
+const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a coding-agent conversation. Produce a concise, factual continuation summary. Preserve the user's goals, explicit decisions, constraints, files and code changes, commands and results, current implementation state, unresolved work, and exact identifiers that future turns need. Do not invent facts. Return only the summary text; do not call tools.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendMode {
@@ -152,7 +155,8 @@ where
         };
     }
 
-    let (session, provider, resumed) = if let Some(id) = options.session.as_deref() {
+    let (session, provider, resumed, attached_agents) = if let Some(id) = options.session.as_deref()
+    {
         let session = match Session::resume(home, id) {
             Ok(session) => session,
             Err(error) => {
@@ -175,7 +179,7 @@ where
             );
             return 1;
         }
-        (session, provider, true)
+        (session, provider, true, Vec::new())
     } else {
         let config = match Config::load_or_create(home) {
             Ok(config) => config,
@@ -252,11 +256,14 @@ where
             }
         };
         let boot_system_prompt = redact_secret(&context.system_prompt, Some(provider.api_key()));
-        let session = match Session::create_with_secret(
+        let attached_agents = attached_agents(context.instruction_files, provider.api_key());
+        let skills = redact_skills(context.skills, provider.api_key());
+        let session = match Session::create_with_skills_and_secret(
             home,
             &safe_cwd,
             boot_system_prompt,
             llm,
+            skills,
             Some(provider.api_key()),
         ) {
             Ok(session) => session,
@@ -269,10 +276,15 @@ where
                 return 1;
             }
         };
-        (session, provider, false)
+        (session, provider, false, attached_agents)
     };
 
-    let harness = Harness { session, provider };
+    let harness = Harness {
+        session,
+        provider,
+        context_window: None,
+        attached_agents,
+    };
     if mode == FrontendMode::Tui {
         return match crate::tui::run(harness, resumed, output) {
             Ok(()) => 0,
@@ -367,9 +379,112 @@ pub fn resolve_mode(
 pub(crate) struct Harness {
     pub(crate) session: Session,
     pub(crate) provider: Provider,
+    /// Model context metadata resolved by the interactive frontend; `None`
+    /// keeps compaction disabled when an OpenAI-compatible provider exposes no
+    /// context-window metadata.
+    pub(crate) context_window: Option<usize>,
+    /// AGENTS.md sources selected for this newly created session's boot context.
+    /// The TUI uses these only while its first-boot welcome is visible.
+    pub(crate) attached_agents: Vec<String>,
+}
+
+fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
+    context_window > 0
+        && context_tokens as u128 * 100
+            >= context_window as u128 * AUTO_COMPACTION_THRESHOLD_PERCENT as u128
+}
+
+fn find_compaction_boundary(
+    messages: &[ChatMessage],
+    previous_boundary: Option<usize>,
+) -> Option<usize> {
+    let user_starts = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| (message.role == "user").then_some(index))
+        .collect::<Vec<_>>();
+    let mut start = *user_starts.last()?;
+    let end = messages.len();
+    let mut kept_tokens = messages[start..end]
+        .iter()
+        .map(estimate_message_tokens)
+        .sum::<usize>();
+
+    while kept_tokens < COMPACTION_KEEP_RECENT_TOKENS {
+        let Some(previous_start) = user_starts
+            .iter()
+            .copied()
+            .rev()
+            .find(|candidate| *candidate < start)
+        else {
+            break;
+        };
+        start = previous_start;
+        kept_tokens = messages[start..end]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<usize>();
+    }
+
+    (start > 0 && previous_boundary.is_none_or(|previous| start > previous)).then_some(start)
 }
 
 impl Harness {
+    fn should_compact(&self, messages: &[ChatMessage]) -> bool {
+        self.context_window
+            .is_some_and(|window| should_compact_context(estimate_context_tokens(messages), window))
+    }
+
+    fn compaction_boundary(&self) -> Option<usize> {
+        let latest_boundary = self
+            .session
+            .history
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                crate::session::SessionHistoryRecord::Compaction(compaction) => {
+                    Some(compaction.first_kept_message)
+                }
+                _ => None,
+            });
+        find_compaction_boundary(&self.session.messages, latest_boundary)
+    }
+
+    fn compact_context<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+        tokens_before: usize,
+    ) -> Result<(), String> {
+        let Some(boundary) = self.compaction_boundary() else {
+            return Err("context cannot be compacted without an earlier complete turn".to_owned());
+        };
+        let Some(cancellation) = cancellation else {
+            return Err("context compaction requires a cancellable turn".to_owned());
+        };
+        sink.compaction_started()
+            .map_err(|error| format!("unable to emit compaction state: {error}"))?;
+        let context_messages = self.session.provider_messages();
+        let mut summary_messages = Vec::with_capacity(context_messages.len() + 1);
+        summary_messages.push(ChatMessage::system(self.session.boot_system_prompt.clone()));
+        summary_messages.push(ChatMessage::system(COMPACTION_SYSTEM_PROMPT.to_owned()));
+        summary_messages.extend(context_messages.into_iter().skip(1));
+        let summary = match self.provider.summarize(&summary_messages, cancellation) {
+            Ok(summary) => redact_secret(&summary, Some(self.provider.api_key())),
+            Err(error) if cancellation.is_cancelled() || error.is_cancelled() => {
+                return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
+            }
+            Err(error) => return Err(format!("unable to compact context: {error}")),
+        };
+        self.session
+            .append_compaction(summary, boundary, tokens_before)
+            .map_err(|error| format!("unable to persist context compaction: {error}"))?;
+        let tokens_after = estimate_context_tokens(&self.session.provider_messages());
+        sink.compaction_finished(tokens_before, tokens_after)
+            .map_err(|error| format!("unable to emit compaction state: {error}"))?;
+        Ok(())
+    }
+
     pub(crate) fn handle_message<S: EventSink>(
         &mut self,
         text: &str,
@@ -377,7 +492,8 @@ impl Harness {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Result<(), String> {
         let secret = self.provider.api_key().to_owned();
-        let user_message = ChatMessage::user(redact_secret(text, Some(&secret)));
+        let expanded = expand_skill_invocation(text, &self.session.skills)?;
+        let user_message = ChatMessage::user(redact_secret(&expanded.text, Some(&secret)));
         if let Err(error) = self.session.append_message(user_message) {
             if cancellation.is_some_and(|token| token.is_cancelled()) {
                 let interruption = self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
@@ -386,9 +502,14 @@ impl Harness {
             }
             return Err(error.to_string());
         }
+        if let Some(name) = expanded.attached_skill.as_deref() {
+            sink.skill_instruction_attached(name)
+                .map_err(|error| format!("unable to emit skill attachment state: {error}"))?;
+        }
 
         let mut tool_rounds = 0;
         let mut tool_calls: usize = 0;
+        let mut compacted_for_turn = false;
         loop {
             if cancellation.is_some_and(|token| token.is_cancelled()) {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
@@ -398,7 +519,15 @@ impl Harness {
                     "tool loop exceeded maximum of {MAX_TOOL_ROUNDS} provider rounds"
                 ));
             }
-            let messages = self.session.provider_messages();
+            let mut messages = self.session.provider_messages();
+            let tokens_before = estimate_context_tokens(&messages);
+            if !compacted_for_turn && self.should_compact(&messages) {
+                self.compact_context(sink, cancellation, tokens_before)?;
+                compacted_for_turn = true;
+                messages = self.session.provider_messages();
+            }
+            sink.context_usage(estimate_context_tokens(&messages))
+                .map_err(|error| format!("unable to emit context usage: {error}"))?;
             let mut raw_content = String::new();
             let mut redactor = SecretRedactor::new(&secret);
             let stream_result = {
@@ -447,6 +576,10 @@ impl Harness {
                 Err(error) => return Err(error.to_string()),
             };
             let canceled_after_stream = cancellation.is_some_and(|token| token.is_cancelled());
+            if !turn.reasoning_details.is_empty() {
+                sink.reasoning_started()
+                    .map_err(|error| format!("unable to emit reasoning state: {error}"))?;
+            }
 
             if turn.tool_calls.iter().any(|call| call.name != "cmd") {
                 if canceled_after_stream {
@@ -497,6 +630,8 @@ impl Harness {
                 {
                     return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
                 }
+                sink.context_usage(estimate_context_tokens(&self.session.provider_messages()))
+                    .map_err(|error| format!("unable to emit context usage: {error}"))?;
                 sink.emit_event(&ProtocolEvent::TurnEnd)
                     .map_err(|error| format!("unable to write turn end: {error}"))?;
                 return Ok(());
@@ -752,6 +887,93 @@ impl SecretRedactor {
     }
 }
 
+/// Return the AGENTS.md files selected for the current new-session boot context.
+/// Paths are secret-redacted before they can reach the terminal UI.
+fn attached_agents(instruction_files: Vec<InstructionSource>, secret: &str) -> Vec<String> {
+    instruction_files
+        .into_iter()
+        .filter(|source| {
+            source
+                .path
+                .file_name()
+                .is_some_and(|name| name == "AGENTS.md")
+        })
+        .map(|source| redact_secret(&source.path.display().to_string(), Some(secret)))
+        .collect()
+}
+
+/// Store a secret-safe skill snapshot with the session. The source is read
+/// once during secure context discovery; later invocations never follow paths.
+fn escape_xml_attribute(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn redact_skills(skills: Vec<SkillEntry>, secret: &str) -> Vec<SkillEntry> {
+    skills
+        .into_iter()
+        .map(|skill| SkillEntry {
+            name: redact_secret(&skill.name, Some(secret)),
+            description: redact_secret(&skill.description, Some(secret)),
+            path: std::path::PathBuf::from(redact_secret(
+                &skill.path.display().to_string(),
+                Some(secret),
+            )),
+            contents: redact_secret(&skill.contents, Some(secret)),
+            model_invocable: skill.model_invocable,
+        })
+        .collect()
+}
+
+/// The message delivered to the provider and the optional name of the saved
+/// skill snapshot that was attached to it.
+#[derive(Debug)]
+struct ExpandedSkillInvocation {
+    text: String,
+    attached_skill: Option<String>,
+}
+
+/// Expand slash-prefixed skill names into the user message sent to the
+/// provider. This deliberately adds no model-facing tool: skills are context,
+/// not an executable capability of their own.
+fn expand_skill_invocation(
+    text: &str,
+    skills: &[SkillEntry],
+) -> Result<ExpandedSkillInvocation, String> {
+    let Some(invocation) = text.strip_prefix('/') else {
+        return Ok(ExpandedSkillInvocation {
+            text: text.to_owned(),
+            attached_skill: None,
+        });
+    };
+    let mut pieces = invocation.splitn(2, char::is_whitespace);
+    let name = pieces.next().unwrap_or_default();
+    if name.is_empty() {
+        return Err("skill command requires a skill name: /<name> [args]".to_owned());
+    }
+    let Some(skill) = skills.iter().find(|skill| skill.name == name) else {
+        return Err(format!("unknown skill: {name}"));
+    };
+    let arguments = pieces.next().unwrap_or_default().trim();
+    let mut message = format!(
+        "<skill name=\"{}\" location=\"{}\">\n{}\n</skill>",
+        escape_xml_attribute(&skill.name),
+        escape_xml_attribute(&skill.path.display().to_string()),
+        skill.contents.trim()
+    );
+    if !arguments.is_empty() {
+        message.push_str("\n\nUser: ");
+        message.push_str(arguments);
+    }
+    Ok(ExpandedSkillInvocation {
+        text: message,
+        attached_skill: Some(skill.name.clone()),
+    })
+}
+
 fn redact_tool_arguments(arguments: &str, secret: &str) -> String {
     let fallback = || "{}".to_owned();
     let Ok(value) = serde_json::from_str::<Value>(arguments) else {
@@ -952,7 +1174,180 @@ fn write_diagnostic<W: Write>(diagnostics: &mut W, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::cancellation::CancellationToken;
+    use std::io::{Cursor, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn auto_compaction_triggers_at_or_above_ninety_five_percent_only() {
+        assert!(!should_compact_context(94, 100));
+        assert!(should_compact_context(95, 100));
+        assert!(should_compact_context(96, 100));
+        assert!(!should_compact_context(100, 0));
+    }
+
+    #[test]
+    fn compaction_boundary_keeps_complete_recent_turns() {
+        let messages = [
+            ChatMessage::user("old request".to_owned()),
+            ChatMessage::assistant("old answer".to_owned(), Vec::new()),
+            ChatMessage::user("recent request".to_owned()),
+            ChatMessage::assistant("recent answer ".repeat(8_000), Vec::new()),
+        ];
+
+        assert_eq!(find_compaction_boundary(&messages, None), Some(2));
+        assert_eq!(find_compaction_boundary(&messages, Some(2)), None);
+    }
+
+    #[test]
+    fn mid_turn_compaction_summarizes_without_tools_then_continues_original_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("compaction listener");
+        let address = listener.local_addr().expect("compaction address");
+        let responses = ["summary", "continued"];
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response_text in responses {
+                let (mut stream, _) = listener.accept().expect("compaction request");
+                let mut request = String::new();
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("request header");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().expect("content length");
+                        }
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).expect("request body");
+                request.push_str(std::str::from_utf8(&body).expect("request JSON"));
+                requests.push(serde_json::from_str::<Value>(&request).expect("request value"));
+                let payload = serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": response_text},
+                        "finish_reason": null
+                    }]
+                });
+                let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(header.as_bytes())
+                    .expect("response header");
+                stream.write_all(body.as_bytes()).expect("response body");
+                stream.flush().expect("response flush");
+            }
+            requests
+        });
+
+        let key_env = format!("LUCY_COMPACTION_APP_KEY_{}", std::process::id());
+        std::env::set_var(&key_env, "provider-secret");
+        let settings = crate::config::LlmSettings {
+            base_url: format!("http://{address}/v1"),
+            model: "model".to_owned(),
+            api_key_env: key_env.clone(),
+            effort: None,
+        };
+        let provider = Provider::new(&settings).expect("provider");
+        let home = std::env::temp_dir().join(format!("lucy-app-compaction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir(&home).expect("temp home");
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut session = Session::create_with_secret(
+            &home,
+            &cwd,
+            "prompt".to_owned(),
+            settings,
+            Some("provider-secret"),
+        )
+        .expect("session");
+        session
+            .append_message(ChatMessage::user("old request".to_owned()))
+            .expect("old user");
+        session
+            .append_message(ChatMessage::assistant("old answer".to_owned(), Vec::new()))
+            .expect("old answer");
+        session
+            .append_message(ChatMessage::user("recent request".to_owned()))
+            .expect("recent user");
+        session
+            .append_message(ChatMessage::assistant(
+                "recent answer ".repeat(8_000),
+                Vec::new(),
+            ))
+            .expect("recent answer");
+
+        struct Sink {
+            events: Vec<ProtocolEvent>,
+            compaction_started: bool,
+            compaction_finished: bool,
+        }
+        impl EventSink for Sink {
+            fn emit_event(&mut self, event: &ProtocolEvent) -> io::Result<()> {
+                self.events.push(event.clone());
+                Ok(())
+            }
+            fn compaction_started(&mut self) -> io::Result<()> {
+                self.compaction_started = true;
+                Ok(())
+            }
+            fn compaction_finished(&mut self, _: usize, _: usize) -> io::Result<()> {
+                self.compaction_finished = true;
+                Ok(())
+            }
+        }
+
+        let mut harness = Harness {
+            session,
+            provider,
+            context_window: Some(1),
+            attached_agents: Vec::new(),
+        };
+        let cancellation = CancellationToken::new();
+        let mut sink = Sink {
+            events: Vec::new(),
+            compaction_started: false,
+            compaction_finished: false,
+        };
+        harness
+            .handle_message("continue", &mut sink, Some(&cancellation))
+            .expect("continued turn");
+
+        let requests = server.join().expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("tools").is_none());
+        assert!(requests[1].get("tools").is_some());
+        assert!(sink.compaction_started);
+        assert!(sink.compaction_finished);
+        assert!(sink.events.iter().any(
+            |event| matches!(event, ProtocolEvent::AssistantDelta { text } if text == "continued")
+        ));
+        assert!(harness
+            .session
+            .history
+            .iter()
+            .any(|record| matches!(record, crate::session::SessionHistoryRecord::Compaction(_))));
+        let provider_text = harness
+            .session
+            .provider_messages()
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!provider_text.contains("old request"));
+        assert!(provider_text.contains("continue"));
+
+        std::env::remove_var(key_env);
+        std::fs::remove_dir_all(home).expect("cleanup");
+    }
 
     #[test]
     fn parses_only_message_records() {
@@ -1203,5 +1598,54 @@ mod tests {
         );
         let diagnostics = String::from_utf8(diagnostics).expect("diagnostic UTF-8");
         assert!(!diagnostics.contains(secret));
+    }
+    #[test]
+    fn attached_agents_keeps_only_agents_files_and_redacts_their_paths() {
+        let sources = vec![
+            InstructionSource {
+                path: std::path::PathBuf::from("/project/AGENTS.md"),
+                contents: "agents".to_owned(),
+            },
+            InstructionSource {
+                path: std::path::PathBuf::from("/project/CLAUDE.md"),
+                contents: "claude".to_owned(),
+            },
+            InstructionSource {
+                path: std::path::PathBuf::from("/private-secret/AGENTS.md"),
+                contents: "agents".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            attached_agents(sources, "secret"),
+            vec!["/project/AGENTS.md", "/private-!/AGENTS.md"]
+        );
+    }
+
+    #[test]
+    fn expands_slash_prefixed_skill_names_and_keeps_ordinary_messages() {
+        let skill = SkillEntry {
+            name: "release-notes".to_owned(),
+            description: "Writes release notes".to_owned(),
+            path: std::path::PathBuf::from("/skills/release-notes/SKILL.md"),
+            contents: "# Release notes\nUse the template.".to_owned(),
+            model_invocable: true,
+        };
+        let expanded = expand_skill_invocation("/release-notes v1.2", std::slice::from_ref(&skill))
+            .expect("skill command");
+        assert!(expanded.text.contains("# Release notes"));
+        assert!(expanded.text.contains("User: v1.2"));
+        assert_eq!(expanded.attached_skill.as_deref(), Some("release-notes"));
+        let ordinary = expand_skill_invocation("ordinary message", &[]).expect("ordinary message");
+        assert_eq!(ordinary.text, "ordinary message");
+        assert_eq!(ordinary.attached_skill, None);
+        assert_eq!(
+            expand_skill_invocation("/missing", &[]).unwrap_err(),
+            "unknown skill: missing"
+        );
+        assert_eq!(
+            expand_skill_invocation("/skill:release-notes", &[skill]).unwrap_err(),
+            "unknown skill: skill:release-notes"
+        );
     }
 }

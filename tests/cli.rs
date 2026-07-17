@@ -1914,3 +1914,85 @@ fn early_diagnostics_redact_environment_keys_before_config_loading() {
         fs::remove_dir_all(home).expect("cleanup");
     }
 }
+
+#[test]
+fn skill_commands_discover_recursively_and_inject_a_snapshot_with_arguments() {
+    let server = MockServer::start(vec![normal_response("skill complete")]);
+    let (home, project) = temporary_tree("skill-command");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+    let skill = project.join(".agents/skills/writing/release-notes/SKILL.md");
+    fs::create_dir_all(skill.parent().expect("skill parent")).expect("skill directories");
+    fs::write(
+        &skill,
+        "---\nname: release-notes\ndescription: Write concise release notes.\n---\n# Release Notes\nUse the release template.\n",
+    )
+    .expect("skill");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"/release-notes v1.2.0\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    let requests = server.join();
+    assert_eq!(requests.len(), 1);
+    let request: Value = serde_json::from_str(&requests[0]).expect("provider request");
+    let messages = request["messages"].as_array().expect("messages");
+    assert!(messages[0]["content"]
+        .as_str()
+        .expect("system prompt")
+        .contains("<name>release-notes</name>"));
+    let skill_message = messages.last().expect("skill message")["content"]
+        .as_str()
+        .expect("skill contents");
+    assert!(skill_message.contains("# Release Notes"));
+    assert!(skill_message.contains("User: v1.2.0"));
+
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
+    let server = MockServer::start(vec![normal_response("first"), normal_response("second")]);
+    let (home, project) = temporary_tree("skill-resume");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+    let skill = project.join(".agents/skills/release-notes/SKILL.md");
+    fs::create_dir_all(skill.parent().expect("skill parent")).expect("skill directories");
+    fs::write(
+        &skill,
+        "---\nname: release-notes\ndescription: Write release notes.\n---\noriginal instructions\n",
+    )
+    .expect("original skill");
+
+    let first = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"start session\"}\n",
+    );
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fs::write(
+        &skill,
+        "---\nname: release-notes\ndescription: Write release notes.\n---\nchanged instructions\n",
+    )
+    .expect("changed skill");
+
+    let resumed = run_lucy(
+        &home,
+        &project,
+        &["--session", &session_id],
+        "{\"type\":\"message\",\"text\":\"/release-notes\"}\n",
+    );
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("original instructions"));
+    assert!(!requests[1].contains("changed instructions"));
+
+    fs::remove_dir_all(home).expect("cleanup");
+}

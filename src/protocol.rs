@@ -33,6 +33,41 @@ pub enum ProtocolEvent {
 /// The normalized event boundary shared by the machine protocol and the TUI.
 pub trait EventSink {
     fn emit_event(&mut self, event: &ProtocolEvent) -> io::Result<()>;
+
+    /// Notify interactive frontends that the provider sent genuine reasoning
+    /// metadata. This is intentionally not part of the public protocol.
+    fn reasoning_started(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Notify interactive frontends after an explicit skill invocation was
+    /// expanded from the immutable session snapshot. This is not a public
+    /// JSONL protocol event.
+    fn skill_instruction_attached(&mut self, _name: &str) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Notify interactive frontends of the estimated prompt context size.
+    /// This is intentionally not part of the public JSONL protocol.
+    fn context_usage(&mut self, _tokens: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Notify interactive frontends that an internal context compaction began.
+    /// This is intentionally not part of the public JSONL protocol.
+    fn compaction_started(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Notify interactive frontends after a compaction boundary was persisted.
+    /// This is intentionally not part of the public JSONL protocol.
+    fn compaction_finished(
+        &mut self,
+        _tokens_before: usize,
+        _tokens_after: usize,
+    ) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct ProtocolWriter<W> {
@@ -135,6 +170,29 @@ mod tests {
             serde_json::from_str::<Value>(line).expect("JSONL record");
         }
         assert!(!text.contains("choices"));
+    }
+
+    #[test]
+    fn compaction_frontend_state_is_not_emitted_to_jsonl() {
+        let mut output = Vec::new();
+        let mut writer = ProtocolWriter::new(&mut output);
+        writer.context_usage(100).expect("context usage");
+        writer.compaction_started().expect("compaction start");
+        writer
+            .compaction_finished(100, 20)
+            .expect("compaction finish");
+
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn skill_attachment_state_is_not_emitted_to_jsonl() {
+        let mut output = Vec::new();
+        let mut writer = ProtocolWriter::new(&mut output);
+        writer
+            .skill_instruction_attached("release-notes")
+            .expect("non-public TUI state");
+        assert!(output.is_empty());
     }
 
     #[test]

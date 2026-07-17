@@ -31,6 +31,8 @@ In addition to the existing session header and provider messages, a session MAY 
 
 At new-session boot, Lucy MUST resolve and snapshot the configured system prompt, discovered instruction files, and available-skill catalog. Resume MUST restore that exact snapshot rather than rereading current files. Changes to config or instruction files therefore apply only to new sessions unless an explicit reload feature is added later.
 
+Lucy MUST support append-only automatic compaction records without rewriting or deleting the earlier session history. When estimated context reaches at least 95% of the model window at a safe provider/cmd boundary, Lucy MUST use the configured model in a no-tools summary request, retain the most recent complete turns up to approximately 20,000 estimated tokens, and append a compaction record containing the summary, the retained-message boundary, and the pre-compaction token estimate. The active provider context after that boundary MUST be reconstructed as the boot system prompt, the compaction summary, and all retained/subsequent complete messages. Resume MUST apply the same latest compaction boundary. If summary generation or persistence fails, no compaction record or replacement boundary is appended; an ordinary user cancellation may still append the existing interruption record.
+
 Instruction discovery MUST include `~/.lucy/AGENTS.md` or `~/.lucy/CLAUDE.md` as the global source and `AGENTS.md`/`CLAUDE.md` along the path from Git root to cwd. For one directory, `AGENTS.md` takes precedence over `CLAUDE.md`. Files are merged from broadest to most specific. Symlinked instruction files MUST be ignored rather than followed.
 
 Skills MUST be discovered only from the standard `.agents/skills/<name>/SKILL.md` directories globally and along the project path. Symlinked skill directories and `SKILL.md` files MUST be ignored rather than followed. The boot prompt MUST include skill name, description, and path, but not full skill contents. The model loads a relevant skill through `cmd` when needed.
@@ -42,6 +44,8 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 ## Invariants
 
 - Session records include the boot snapshot and all valid user, assistant, tool-call, and tool-result messages needed to reconstruct the active conversation.
+- Compaction records are valid JSONL, append-only, secret-safe, ordered at a complete turn boundary, and identify the summary, retained-message boundary, and token estimate. Historical messages remain available for replay even when they are omitted from the next provider context.
+- Resume and `provider_messages()` apply only the latest compaction boundary on the active session path; they do not send compacted-away raw messages in addition to the summary.
 - Interruption records are valid JSONL, append-only, secret-safe, ordered with surrounding messages, and explicitly identify user cancellation; they are replayed by the TUI.
 - Incomplete provider tool-call fragments are retained only as safe interruption observations and are never executed or included in provider message history; safe `cmd` result observations may only close a previously declared matching tool call.
 - Newly created session headers MUST reject cwd or provider-setting values containing the active provider key.
@@ -58,11 +62,11 @@ Rereading context on every turn would observe edits immediately but break prompt
 
 ## Consequences
 
-Users must start a new session to pick up edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Partial canceled output is faithfully recoverable in the transcript without forcing malformed provider tool history. Cross-process session locking and crash-recovery rewriting are outside this minimal lifecycle.
+Users must start a new session to pick up edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Partial canceled output is faithfully recoverable in the transcript without forcing malformed provider tool history. Compaction can reduce the active provider context while retaining the full append-only history, but the generated summary is a model-derived representation and is not a byte-for-byte substitute for omitted messages. Cross-process session locking and crash-recovery rewriting are outside this minimal lifecycle.
 
 ## Enforcement
 
-Tests MUST create, persist, close, and resume a session; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence and skill catalog discovery; and verify interruption records, safe partial output, ordering, and resume replay.
+Tests MUST create, persist, close, and resume a session; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence and skill catalog discovery; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled.
 
 ## Revisit when
 

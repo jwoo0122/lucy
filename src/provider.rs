@@ -24,6 +24,9 @@ const MAX_PROVIDER_TOOL_CALL_ID_BYTES: usize = 16 * 1024;
 const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 16 * 1024;
 const MAX_PROVIDER_ERROR_BYTES: usize = 16 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
 
 #[derive(Debug)]
 pub struct ProviderError {
@@ -83,7 +86,33 @@ pub struct Provider {
     api_key: String,
 }
 
-fn chat_request(model: &str, messages: &[ChatMessage], effort: &Option<String>) -> Value {
+fn context_window_from_models(payload: &Value, model: &str) -> Option<usize> {
+    let models = payload.get("data").and_then(Value::as_array)?;
+    let entry = models.iter().find(|entry| {
+        entry.get("id").and_then(Value::as_str) == Some(model)
+            || entry.get("name").and_then(Value::as_str) == Some(model)
+    })?;
+    [
+        entry.get("context_length"),
+        entry.get("context_window"),
+        entry.get("max_context_length"),
+        entry
+            .get("top_provider")
+            .and_then(|provider| provider.get("context_length")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_u64)
+    .and_then(|value| usize::try_from(value).ok())
+    .filter(|value| *value > 0)
+}
+
+fn chat_request(
+    model: &str,
+    messages: &[ChatMessage],
+    effort: &Option<String>,
+    include_tools: bool,
+) -> Value {
     let mut request = json!({
         "model": model,
         "messages": messages
@@ -91,7 +120,9 @@ fn chat_request(model: &str, messages: &[ChatMessage], effort: &Option<String>) 
             .map(ChatMessage::to_openai_value)
             .collect::<Vec<_>>(),
         "stream": true,
-        "tools": [
+    });
+    if include_tools {
+        request["tools"] = json!([
             {
                 "type": "function",
                 "function": {
@@ -107,8 +138,10 @@ fn chat_request(model: &str, messages: &[ChatMessage], effort: &Option<String>) 
                     }
                 }
             }
-        ]
-    });
+        ]);
+    } else {
+        request["max_tokens"] = json!(COMPACTION_MAX_SUMMARY_TOKENS);
+    }
     if let Some(effort) = effort {
         request["reasoning_effort"] = json!(effort);
     }
@@ -193,12 +226,35 @@ impl Provider {
         &self.api_key_env
     }
 
+    /// Query the OpenAI-compatible model catalog for the configured model's
+    /// context window. Providers that do not expose context metadata simply
+    /// return `None`; this lookup is only used by the interactive statusline.
+    pub(crate) fn context_window(&self) -> Option<usize> {
+        let base_url = self.endpoint.strip_suffix("/chat/completions")?;
+        let response = self
+            .client
+            .get(format!("{base_url}/models"))
+            .bearer_auth(&self.api_key)
+            .timeout(MODEL_METADATA_TIMEOUT)
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = response.bytes().ok()?;
+        if bytes.len() > MAX_MODEL_METADATA_BYTES {
+            return None;
+        }
+        let payload: Value = serde_json::from_slice(&bytes).ok()?;
+        context_window_from_models(&payload, &self.model)
+    }
+
     pub fn stream_chat(
         &self,
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> Result<ProviderTurn, ProviderError> {
-        let request = chat_request(&self.model, messages, &self.effort);
+        let request = chat_request(&self.model, messages, &self.effort, true);
 
         let response = self
             .client
@@ -383,6 +439,27 @@ impl Provider {
         })
     }
 
+    /// Generate an internal compaction summary without exposing `cmd` to the
+    /// summarization request or emitting its text as a normal assistant delta.
+    pub(crate) fn summarize(
+        &self,
+        messages: &[ChatMessage],
+        cancellation: &CancellationToken,
+    ) -> Result<String, ProviderError> {
+        let mut ignored = |_text: &str| Ok(());
+        let turn =
+            self.stream_chat_cancellable_with_options(messages, &mut ignored, cancellation, false)?;
+        if !turn.tool_calls.is_empty() {
+            return Err(ProviderError::new(
+                "compaction summary requested an unsupported tool",
+            ));
+        }
+        if turn.content.trim().is_empty() {
+            return Err(ProviderError::new("compaction summary was empty"));
+        }
+        Ok(turn.content)
+    }
+
     /// Stream through an async response so cancellation can drop the pending
     /// socket read instead of waiting for the blocking client's timeout.
     pub(crate) fn stream_chat_cancellable(
@@ -391,11 +468,21 @@ impl Provider {
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
         cancellation: &CancellationToken,
     ) -> Result<ProviderTurn, ProviderError> {
+        self.stream_chat_cancellable_with_options(messages, on_text, cancellation, true)
+    }
+
+    fn stream_chat_cancellable_with_options(
+        &self,
+        messages: &[ChatMessage],
+        on_text: &mut dyn FnMut(&str) -> io::Result<()>,
+        cancellation: &CancellationToken,
+        include_tools: bool,
+    ) -> Result<ProviderTurn, ProviderError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| ProviderError::new("unable to initialize provider runtime"))?;
-        runtime.block_on(self.stream_chat_async(messages, on_text, cancellation))
+        runtime.block_on(self.stream_chat_async(messages, on_text, cancellation, include_tools))
     }
 
     async fn stream_chat_async(
@@ -403,6 +490,7 @@ impl Provider {
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
         cancellation: &CancellationToken,
+        include_tools: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(ProviderError::cancelled(ProviderTurn {
@@ -411,7 +499,7 @@ impl Provider {
                 reasoning_details: Vec::new(),
             }));
         }
-        let request = chat_request(&self.model, messages, &self.effort);
+        let request = chat_request(&self.model, messages, &self.effort, include_tools);
         let request = self
             .async_client
             .post(&self.endpoint)
@@ -1015,6 +1103,58 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn compaction_request_does_not_include_tools() {
+        let normal = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            true,
+        );
+        let compact = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            false,
+        );
+
+        assert!(normal.get("tools").is_some());
+        assert!(normal.get("max_tokens").is_none());
+        assert!(compact.get("tools").is_none());
+        assert_eq!(compact["max_tokens"], COMPACTION_MAX_SUMMARY_TOKENS);
+    }
+
+    #[test]
+    fn model_catalog_context_window_matches_configured_model() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "other", "context_length": 8_000},
+                {"id": "provider/model", "context_length": 128_000}
+            ]
+        });
+
+        assert_eq!(
+            context_window_from_models(&payload, "provider/model"),
+            Some(128_000)
+        );
+        assert_eq!(context_window_from_models(&payload, "missing"), None);
+    }
+
+    #[test]
+    fn model_catalog_context_window_accepts_provider_fallback_fields() {
+        let payload = serde_json::json!({
+            "data": [{
+                "id": "provider/model",
+                "top_provider": {"context_length": 64_000}
+            }]
+        });
+
+        assert_eq!(
+            context_window_from_models(&payload, "provider/model"),
+            Some(64_000)
+        );
+    }
 
     #[test]
     fn parses_sse_comments_multiline_data_and_done() {

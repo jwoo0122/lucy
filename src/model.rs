@@ -23,6 +23,27 @@ pub struct ChatToolCall {
     pub arguments: String,
 }
 
+/// Estimate the number of context tokens represented by provider messages.
+///
+/// Lucy supports arbitrary OpenAI-compatible providers and does not bundle a
+/// provider-specific tokenizer. Four UTF-8 bytes per token is therefore a
+/// deliberately conservative display estimate; the statusline should expose
+/// context pressure without pretending that every provider uses the same
+/// tokenizer.
+pub(crate) fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    serde_json::to_vec(message)
+        .map(|encoded| encoded.len().div_ceil(4).max(1))
+        .unwrap_or(1)
+}
+
+pub(crate) fn estimate_context_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(estimate_message_tokens)
+        .sum::<usize>()
+        .max(1)
+}
+
 impl ChatMessage {
     pub fn system(content: String) -> Self {
         Self {
@@ -108,6 +129,16 @@ impl ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_token_estimate_is_nonzero_and_grows_with_messages() {
+        let empty = estimate_context_tokens(&[]);
+        let one = estimate_context_tokens(&[ChatMessage::user("hello".to_owned())]);
+
+        assert_eq!(empty, 1);
+        assert!(one > empty);
+        assert!(estimate_message_tokens(&ChatMessage::user("hello".to_owned())) > 0);
+    }
 
     #[test]
     fn tool_assistant_messages_have_openai_compatible_shape() {
