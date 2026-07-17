@@ -19,7 +19,7 @@ jobs:
   publish:
     runs-on: ubuntu-22.04
     env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATE_TOKEN }}
     steps:
       - name: Verify crates.io token
         run: test -n "$CARGO_REGISTRY_TOKEN"
