@@ -571,7 +571,7 @@ enum TranscriptItem {
 fn max_scroll_for_area(state: &UiState, size: Size) -> u16 {
     let area = Rect::new(0, 0, size.width, size.height);
     let input_rows = input_visible_rows(state, area.width);
-    let input_height = input_rows.min(MAX_INPUT_ROWS).max(1) + 2;
+    let input_height = input_rows.clamp(1, MAX_INPUT_ROWS) + 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -605,7 +605,7 @@ fn input_prompt(input: &str) -> String {
 
 fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let area = frame.area();
-    let input_rows = input_visible_rows(state, area.width).min(MAX_INPUT_ROWS).max(1);
+    let input_rows = input_visible_rows(state, area.width).clamp(1, MAX_INPUT_ROWS);
     let input_height = input_rows + 2;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -640,11 +640,11 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let input_area = input_block.inner(chunks[2]);
     let prompt = redact_secret(&input_prompt(&state.input), Some(&state.secret));
     let wrapped = wrap_text(&prompt, input_area.width.max(1) as usize);
-    let visible = (wrapped.len() as u16).min(input_rows).max(1);
+    let visible = (wrapped.len() as u16).clamp(1, input_rows);
     let input_scroll = (wrapped.len() as u16).saturating_sub(visible);
     let input_lines: Vec<Line<'static>> = wrapped
         .into_iter()
-        .map(|line| Line::raw(line))
+        .map(Line::raw)
         .collect();
     let input = Paragraph::new(input_lines.clone())
         .scroll((input_scroll, 0))
