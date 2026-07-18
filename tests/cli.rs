@@ -1548,6 +1548,22 @@ fn malformed_config_diagnostic_does_not_echo_source_or_api_key() {
 }
 
 #[test]
+fn version_prints_without_bootstrapping_configuration() {
+    let (home, project) = temporary_tree("version");
+    let output = run_lucy(&home, &project, &["--version"], "");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        concat!("lucy ", env!("CARGO_PKG_VERSION"), "\n")
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!home.join(".lucy/config.toml").exists());
+
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
 fn forced_tui_fails_clearly_without_terminal_stdio() {
     let (home, project) = temporary_tree("forced-tui-non-terminal");
     let output = run_lucy(&home, &project, &["--tui"], "");

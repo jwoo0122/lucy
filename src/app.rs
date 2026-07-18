@@ -24,6 +24,7 @@ struct CliOptions {
     list_sessions: bool,
     jsonl: bool,
     tui: bool,
+    version: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +56,26 @@ where
     W: Write,
     E: Write,
 {
+    let options = match parse_args(args) {
+        Ok(options) => options,
+        Err(error) => {
+            let mut diagnostics = diagnostics;
+            write_diagnostic(&mut diagnostics, &error);
+            return 2;
+        }
+    };
+    if options.version {
+        if let Err(error) = write_version(output) {
+            let mut diagnostics = diagnostics;
+            write_diagnostic(
+                &mut diagnostics,
+                &format!("unable to write version: {error}"),
+            );
+            return 1;
+        }
+        return 0;
+    }
+
     let home = match home_directory() {
         Ok(home) => home,
         Err(error) => {
@@ -125,6 +146,16 @@ where
             return 2;
         }
     };
+    if options.version {
+        if let Err(error) = write_version(output) {
+            write_diagnostic(
+                &mut diagnostics,
+                &format!("unable to write version: {error}"),
+            );
+            return 1;
+        }
+        return 0;
+    }
     let mode = match resolve_mode(args, stdin_is_tty, stdout_is_tty) {
         Ok(mode) => mode,
         Err(error) => {
@@ -1411,12 +1442,17 @@ fn redact_reasoning_details(details: &[Value], secret: &str) -> Option<Vec<Value
     }
 }
 
+fn write_version<W: Write>(mut output: W) -> io::Result<()> {
+    writeln!(output, "lucy {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     let mut options = CliOptions {
         session: None,
         list_sessions: false,
         jsonl: false,
         tui: false,
+        version: false,
     };
     let mut index = 0;
     while index < args.len() {
@@ -1449,9 +1485,16 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
                 }
                 options.tui = true;
             }
+            "--version" => {
+                if options.version {
+                    return Err("--version cannot be repeated".to_owned());
+                }
+                options.version = true;
+            }
             "--help" | "-h" => {
                 return Err(
-                    "usage: lucy [--jsonl|--tui] [--session <id>] [--list-sessions]".to_owned(),
+                    "usage: lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions]"
+                        .to_owned(),
                 );
             }
             _ => return Err("unknown argument".to_owned()),
