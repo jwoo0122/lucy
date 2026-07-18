@@ -59,7 +59,7 @@ jobs:
             fi
 
             release-plz update --config release-plz.toml
-            git add Cargo.toml Cargo.lock
+            git add Cargo.toml Cargo.lock CHANGELOG.md
             if ! git diff --cached --quiet; then
               release=true
               version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "lucy-cli") | .version')"
@@ -82,7 +82,7 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock CHANGELOG.md
           git commit --allow-empty -m "chore(release): v${version}"
           tag="v${version}"
           git tag --annotate "$tag" --message "Release ${version}"

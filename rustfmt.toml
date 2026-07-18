@@ -1,0 +1,3 @@
+# Keep formatting deterministic across contributors and CI.
+edition = "2021"
+newline_style = "Unix"

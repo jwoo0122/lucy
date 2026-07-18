@@ -26,6 +26,8 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
+const SPAWN_SUBAGENT_DESCRIPTION: &str = "Start an isolated background task and immediately return its task ID. Continue your own work without waiting; when the worker finishes, Lucy automatically starts a follow-up main-agent turn and delivers the completion result. Do not poll with check_subagent unless you need an intermediate status. The worker has cmd but cannot delegate further.";
+const CHECK_SUBAGENT_DESCRIPTION: &str = "Inspect an in-process background subagent only when you need an intermediate status or an on-demand result. Do not poll repeatedly: when the worker finishes, Lucy automatically starts a follow-up main-agent turn and delivers the result, so continue your own work instead.";
 
 #[derive(Debug)]
 pub struct ProviderError {
@@ -171,8 +173,8 @@ fn chat_request(
             }
         })];
         if include_subagents {
-            tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":"Start an isolated background task and immediately return its task ID. The worker has cmd but cannot delegate further.","parameters":{"type":"object","properties":{"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
-            tools.push(json!({"type":"function","function":{"name":"check_subagent","description":"Inspect the in-process status or completed result of a background subagent.","parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":SPAWN_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"check_subagent","description":CHECK_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
         }
         request["tools"] = Value::Array(tools);
     } else {
@@ -1214,6 +1216,35 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn subagent_tool_descriptions_prefer_automatic_completion_over_polling() {
+        let request = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            true,
+            true,
+        );
+        let tools = request["tools"].as_array().expect("model tools");
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["function"]["name"] == name)
+                .and_then(|tool| tool["function"]["description"].as_str())
+                .expect("tool description")
+        };
+
+        let spawn = description("spawn_subagent");
+        assert!(spawn.contains("Continue your own work without waiting"));
+        assert!(spawn.contains("automatically starts a follow-up main-agent turn"));
+        assert!(spawn.contains("Do not poll with check_subagent"));
+
+        let check = description("check_subagent");
+        assert!(check.contains("Do not poll repeatedly"));
+        assert!(check.contains("automatically starts a follow-up main-agent turn"));
+        assert!(check.contains("continue your own work instead"));
+    }
 
     #[test]
     fn compaction_request_does_not_include_tools() {

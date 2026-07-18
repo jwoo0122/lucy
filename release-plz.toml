@@ -1,6 +1,7 @@
 [workspace]
 # Version bumps are committed by the main-branch workflow, not by a release PR.
-changelog_update = false
+# Generate CHANGELOG.md from releasable Conventional Commits during each version bump.
+changelog_update = true
 dependencies_update = false
 
 # Release only feature, bug-fix, performance, or explicitly breaking commits.

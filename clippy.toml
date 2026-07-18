@@ -1,0 +1,6 @@
+# Debug-only and placeholder macros must not ship in the harness.
+disallowed-macros = [
+  { path = "std::dbg", reason = "use structured diagnostics or tests instead" },
+  { path = "std::todo", reason = "implement behavior or return an explicit error" },
+  { path = "std::unimplemented", reason = "implement behavior or return an explicit error" },
+]
