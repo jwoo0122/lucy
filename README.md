@@ -56,6 +56,7 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 
 - **TUI and JSONL:** Supports terminal chat and line-delimited JSON automation.
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
+- **Tool activity UI:** Renders `cmd` as a compact one-line status card and keeps background subagents in a read-only right-side task panel on wide terminals, with a compact inline fallback on narrow terminals.
 - **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification for completion, cancellation, or error when the terminal supports it; JSONL output is unchanged.
 - **Safe local command execution:** Runs trusted finite `cmd` shell commands from the session's starting directory with time and output limits.
 - **Background sub-agents:** `spawn_subagent` immediately returns a queued task ID while up to four isolated workers run in parallel. Workers inherit only boot context and cwd, may use `cmd`, cannot recursively delegate, and can override model or reasoning effort. Completion automatically starts a follow-up main-agent turn; `check_subagent` reports the in-process status or result. The TUI accepts additional user messages while a turn is active and serializes them for processing.
