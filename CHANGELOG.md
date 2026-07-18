@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.1](https://github.com/jwoo0122/lucy/compare/v1.4.0...v1.4.1) - 2026-07-18
+
+### Fixed
+
+- minor design change
+
 ### Changed
 
 - Added pull-request quality gates for formatting, linting, and tests.
