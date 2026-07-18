@@ -55,6 +55,8 @@ const WORKING_GRADIENT_COLORS: [(u8, u8, u8); 4] = [
 const WORKING_GRADIENT_CYCLE: Duration = Duration::from_millis(5000);
 const SKILL_PICKER_MAX_ROWS: usize = 5;
 const BUILTIN_COMMANDS: [&str; 2] = ["settings", "exit"];
+const SUBAGENT_PANEL_WIDTH: u16 = 34;
+const SUBAGENT_PANEL_MIN_TERMINAL_WIDTH: u16 = 100;
 const SETTINGS_MIN_WIDTH: u16 = 36;
 const SETTINGS_MAX_WIDTH: u16 = 88;
 const SETTINGS_MIN_HEIGHT: u16 = 8;
@@ -155,7 +157,11 @@ fn worker_loop(
     }
 
     loop {
-        if let Some(notification) = harness.next_subagent_notification() {
+        if let Some(completion) = harness.next_subagent_completion() {
+            let task_id = completion.task_id.clone();
+            let result = completion.result.clone();
+            let notification = Harness::subagent_notification(&completion);
+            let _ = messages.send(WorkerMessage::SubagentCompleted { task_id, result });
             let cancel = CancellationToken::new();
             let _ = messages.send(WorkerMessage::Started {
                 cancel: cancel.clone(),
@@ -171,7 +177,11 @@ fn worker_loop(
         let request = match requests.recv_timeout(EVENT_POLL) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(notification) = harness.next_subagent_notification() {
+                if let Some(completion) = harness.next_subagent_completion() {
+                    let task_id = completion.task_id.clone();
+                    let result = completion.result.clone();
+                    let notification = Harness::subagent_notification(&completion);
+                    let _ = messages.send(WorkerMessage::SubagentCompleted { task_id, result });
                     let cancel = CancellationToken::new();
                     let _ = messages.send(WorkerMessage::Started {
                         cancel: cancel.clone(),
@@ -232,6 +242,9 @@ fn event_loop<W: Write>(
         loop {
             match messages.try_recv() {
                 Ok(WorkerMessage::Event(event)) => state.apply_event(event),
+                Ok(WorkerMessage::SubagentCompleted { task_id, result }) => {
+                    state.complete_subagent(&task_id, result);
+                }
                 Ok(WorkerMessage::Started { cancel, user_text }) => {
                     if let Some(text) = user_text {
                         state.start_queued_user(&text);
@@ -658,6 +671,10 @@ enum WorkerMessage {
     },
     Catalog(Result<Vec<ProviderModel>, String>),
     SettingsApplied(Result<(), String>, String, Option<String>, Option<usize>),
+    SubagentCompleted {
+        task_id: String,
+        result: Value,
+    },
     Finished,
 }
 
@@ -712,6 +729,25 @@ impl EventSink for ChannelSink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SubagentTask {
+    call_id: String,
+    task_id: Option<String>,
+    task: String,
+    model: Option<String>,
+    effort: Option<String>,
+    status: SubagentStatus,
+    result: Option<Value>,
+}
+
 struct UiState {
     model: String,
     effort: Option<String>,
@@ -730,6 +766,7 @@ struct UiState {
     cursor_epoch: Instant,
     welcome_visible: bool,
     attached_agents: Vec<String>,
+    subagents: Vec<SubagentTask>,
     skill_names: Vec<String>,
     skill_picker_focus: usize,
     skill_picker_suppressed: bool,
@@ -762,6 +799,7 @@ impl UiState {
             cursor_epoch: Instant::now(),
             welcome_visible: !resumed && history.is_empty(),
             attached_agents: Vec::new(),
+            subagents: Vec::new(),
             skill_names: Vec::new(),
             skill_picker_focus: 0,
             skill_picker_suppressed: false,
@@ -1031,8 +1069,13 @@ impl UiState {
     fn add_message(&mut self, message: &ChatMessage) {
         match message.role.as_str() {
             "user" => {
-                let secret = self.secret.clone();
-                self.add_user(message.content.as_deref().unwrap_or(""), &secret);
+                let text = message.content.as_deref().unwrap_or("");
+                if let Some((task_id, result)) = parse_subagent_notification(text) {
+                    self.complete_subagent(&task_id, result);
+                } else {
+                    let secret = self.secret.clone();
+                    self.add_user(text, &secret);
+                }
             }
             "assistant" => {
                 if let Some(content) = message.content.as_deref() {
@@ -1142,14 +1185,100 @@ impl UiState {
             name: call.name.clone(),
             arguments: call.arguments.clone(),
         });
+        if call.name == "spawn_subagent" {
+            self.register_subagent_call(&call.id, &call.arguments);
+        }
     }
 
     fn add_tool_result(&mut self, id: &str, name: &str, result: Value) {
+        if name == "spawn_subagent" {
+            self.update_subagent_queued(id, &result);
+        }
         self.transcript.push(TranscriptItem::ToolResult {
             id: id.to_owned(),
             name: name.to_owned(),
             result,
         });
+    }
+
+    fn register_subagent_call(&mut self, call_id: &str, arguments: &str) {
+        if self.subagents.iter().any(|task| task.call_id == call_id) {
+            return;
+        }
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let task = parsed
+            .as_ref()
+            .and_then(|value| value.get("task"))
+            .and_then(Value::as_str)
+            .map(|task| redact_secret(task.trim(), Some(&self.secret)))
+            .filter(|task| !task.is_empty())
+            .unwrap_or_else(|| "invalid task".to_owned());
+        let model = parsed
+            .as_ref()
+            .and_then(|value| value.get("model"))
+            .and_then(Value::as_str)
+            .map(|value| redact_secret(value, Some(&self.secret)));
+        let effort = parsed
+            .as_ref()
+            .and_then(|value| value.get("effort"))
+            .and_then(Value::as_str)
+            .map(|value| redact_secret(value, Some(&self.secret)));
+        self.subagents.push(SubagentTask {
+            call_id: call_id.to_owned(),
+            task_id: None,
+            task,
+            model,
+            effort,
+            status: SubagentStatus::Queued,
+            result: None,
+        });
+    }
+
+    fn update_subagent_queued(&mut self, call_id: &str, result: &Value) {
+        let Some(task) = self
+            .subagents
+            .iter_mut()
+            .find(|task| task.call_id == call_id)
+        else {
+            return;
+        };
+        task.task_id = result
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        task.status = if result.get("error").is_some() {
+            SubagentStatus::Failed
+        } else {
+            // The queued acknowledgement is emitted after the worker thread
+            // has been launched, so the persistent panel can show its live
+            // state as running while the worker continues in the background.
+            SubagentStatus::Running
+        };
+        task.result = Some(result.clone());
+    }
+
+    fn complete_subagent(&mut self, task_id: &str, result: Value) {
+        if let Some(task) = self
+            .subagents
+            .iter_mut()
+            .find(|task| task.task_id.as_deref() == Some(task_id))
+        {
+            task.status = Self::subagent_result_status(&result);
+            task.result = Some(result);
+        }
+    }
+
+    fn subagent_result_status(result: &Value) -> SubagentStatus {
+        if result.get("error").is_some()
+            || result
+                .get("cancelled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            SubagentStatus::Failed
+        } else {
+            SubagentStatus::Completed
+        }
     }
 
     fn cursor_visible(&self) -> bool {
@@ -1194,6 +1323,20 @@ impl UiState {
     }
 }
 
+fn parse_subagent_notification(text: &str) -> Option<(String, Value)> {
+    let prefix = "Background subagent ";
+    let suffix = " completed. Deliver this result to the user and continue the task: ";
+    let rest = text.strip_prefix(prefix)?;
+    let (task_id, encoded_result) = rest.split_once(suffix)?;
+    if task_id.is_empty() {
+        return None;
+    }
+    Some((
+        task_id.to_owned(),
+        serde_json::from_str(encoded_result).ok()?,
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum TranscriptItem {
     User {
@@ -1216,6 +1359,33 @@ enum TranscriptItem {
     Reasoning {
         complete: bool,
     },
+}
+
+fn subagent_panel_area(state: &UiState, area: Rect) -> Option<Rect> {
+    if state.subagents.is_empty() || area.width < SUBAGENT_PANEL_MIN_TERMINAL_WIDTH {
+        return None;
+    }
+    let width = SUBAGENT_PANEL_WIDTH.min(area.width.saturating_sub(40));
+    (width >= 24).then(|| {
+        Rect::new(
+            area.x + area.width.saturating_sub(width),
+            area.y,
+            width,
+            area.height,
+        )
+    })
+}
+
+fn content_area(state: &UiState, area: Rect) -> Rect {
+    let Some(panel) = subagent_panel_area(state, area) else {
+        return area;
+    };
+    Rect::new(
+        area.x,
+        area.y,
+        panel.x.saturating_sub(area.x + 1),
+        area.height,
+    )
 }
 
 fn ui_layout(state: &UiState, area: Rect) -> (Rect, Option<Rect>, Rect, Rect) {
@@ -1243,7 +1413,7 @@ fn ui_layout(state: &UiState, area: Rect) -> (Rect, Option<Rect>, Rect, Rect) {
 
 fn max_scroll_for_area(state: &UiState, size: Size) -> u16 {
     let area = Rect::new(0, 0, size.width, size.height);
-    let (chat_chunk, _, _, _) = ui_layout(state, area);
+    let (chat_chunk, _, _, _) = ui_layout(state, content_area(state, area));
     let chat_height = chat_chunk.height.saturating_sub(1);
     let lines = transcript_lines(state, chat_chunk.width);
     lines
@@ -1445,7 +1615,8 @@ fn remove_before_cursor(input: &mut String, cursor: &mut usize) -> bool {
 }
 
 fn draw(frame: &mut Frame<'_>, state: &UiState) {
-    let (chat_chunk, picker_area, input_chunk, status_area) = ui_layout(state, frame.area());
+    let content = content_area(state, frame.area());
+    let (chat_chunk, picker_area, input_chunk, status_area) = ui_layout(state, content);
 
     // Activity is conversation state, not terminal help text. Keep it in the
     // chat viewport so the picker can intentionally overlay its ready state.
@@ -1515,7 +1686,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let input_area = input_block.inner(input_chunk);
     let prompt = input_display_text(state);
     let input_rows =
-        input_visible_rows(state, frame.area().width.saturating_sub(2)).clamp(1, MAX_INPUT_ROWS);
+        input_visible_rows(state, content.width.saturating_sub(2)).clamp(1, MAX_INPUT_ROWS);
     let wrapped = wrap_text(&prompt, input_area.width.max(1) as usize);
     let visible = (wrapped.len() as u16).clamp(1, input_rows);
     let cursor_row = cursor_row(&prompt, state.cursor, input_area.width.max(1) as usize);
@@ -1555,6 +1726,9 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
             .style(context_status_style(state));
         frame.render_widget(context, status_chunks[1]);
     }
+    if let Some(panel_area) = subagent_panel_area(state, frame.area()) {
+        draw_subagent_panel(frame, state, panel_area);
+    }
     if let Some(settings) = &state.settings {
         draw_settings(frame, settings, frame.area());
     }
@@ -1570,6 +1744,124 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         let cursor_y = input_area.y + cursor_row.saturating_sub(input_scroll);
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn draw_subagent_panel(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(format!(" workers {} ", state.subagents.len()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width.max(1) as usize;
+    let mut lines = vec![Line::styled(
+        "Background tasks",
+        Style::default().fg(Color::DarkGray),
+    )];
+    for (index, task) in state.subagents.iter().enumerate() {
+        lines.push(Line::raw(String::new()));
+        let status = subagent_status_label(task.status);
+        let status_style = subagent_status_style(task.status);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", subagent_status_icon(task.status)),
+                status_style,
+            ),
+            Span::styled(format!("{status}  "), status_style),
+            Span::styled(format!("#{index}"), Style::default().fg(Color::DarkGray)),
+        ]));
+        push_panel_wrapped(
+            &mut lines,
+            &format!("  {}", redact_secret(&task.task, Some(&state.secret))),
+            width,
+            Style::default().fg(Color::White),
+        );
+        if let Some(task_id) = &task.task_id {
+            push_panel_wrapped(
+                &mut lines,
+                &format!("  {task_id}"),
+                width,
+                Style::default().fg(Color::DarkGray),
+            );
+        }
+        let model = task.model.as_deref().unwrap_or("session model");
+        let effort = task.effort.as_deref().unwrap_or("default effort");
+        push_panel_wrapped(
+            &mut lines,
+            &format!("  {model} · {effort}"),
+            width,
+            Style::default().fg(Color::DarkGray),
+        );
+        if let Some(result) = &task.result {
+            if matches!(
+                task.status,
+                SubagentStatus::Completed | SubagentStatus::Failed
+            ) {
+                let summary = subagent_result_preview(result, &state.secret);
+                push_panel_wrapped(
+                    &mut lines,
+                    &format!("  ↳ {summary}"),
+                    width,
+                    subagent_status_style(task.status),
+                );
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn push_panel_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for row in wrap_text(text, width) {
+        lines.push(Line::styled(row, style));
+    }
+}
+
+fn subagent_status_label(status: SubagentStatus) -> &'static str {
+    match status {
+        SubagentStatus::Queued => "queued",
+        SubagentStatus::Running => "running",
+        SubagentStatus::Completed => "completed",
+        SubagentStatus::Failed => "error",
+    }
+}
+
+fn subagent_status_icon(status: SubagentStatus) -> char {
+    match status {
+        SubagentStatus::Queued => '○',
+        SubagentStatus::Running => '●',
+        SubagentStatus::Completed => '✓',
+        SubagentStatus::Failed => '×',
+    }
+}
+
+fn subagent_status_style(status: SubagentStatus) -> Style {
+    match status {
+        SubagentStatus::Queued => Style::default().fg(PENDING_TOOL_COLOR),
+        SubagentStatus::Running => Style::default().fg(Color::Cyan),
+        SubagentStatus::Completed => Style::default().fg(Color::Green),
+        SubagentStatus::Failed => Style::default().fg(Color::Red),
+    }
+}
+
+fn subagent_result_preview(result: &Value, secret: &str) -> String {
+    let preview = result
+        .get("output")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("error").and_then(Value::as_str))
+        .or_else(|| {
+            result
+                .get("cancelled")
+                .and_then(Value::as_bool)
+                .filter(|cancelled| *cancelled)
+                .map(|_| "cancelled")
+        })
+        .unwrap_or("completed");
+    redact_secret(&truncate_output(preview).replace('\n', " ↵ "), Some(secret))
 }
 
 enum SettingsState {
@@ -1903,28 +2195,14 @@ fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
                 name,
                 arguments,
             } => {
-                let call_text = format!("[tool:{name} {}]", call_arguments(arguments));
-                let call_text = redact_secret(&call_text, Some(&state.secret));
                 let result = matching_tool_result(&state.transcript, index, id);
-                let mut segments = vec![(
-                    call_text,
-                    if result.is_some() {
-                        tool_call_style()
-                    } else {
-                        pending_tool_call_style()
-                    },
-                )];
-                if let Some(result) = result {
-                    let result_text =
-                        redact_secret(&format_tool_result(result), Some(&state.secret));
-                    segments.push((" > ".to_owned(), Style::default()));
-                    segments.push((result_text, tool_result_style()));
+                let segments = if name == "cmd" {
+                    cmd_tool_segments(arguments, result, state)
+                } else if name == "spawn_subagent" {
+                    subagent_tool_segments(id, arguments, state)
                 } else {
-                    segments.push((
-                        format!(" {}", spinner_frame(state)),
-                        pending_tool_call_style(),
-                    ));
-                }
+                    generic_tool_segments(name, arguments, result, state)
+                };
                 push_spans_wrapped(&mut lines, &segments, width);
             }
             TranscriptItem::ToolResult {
@@ -1959,6 +2237,123 @@ fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
         lines.push(Line::raw(""));
     }
     lines
+}
+
+fn cmd_tool_segments(
+    arguments: &str,
+    result: Option<&Value>,
+    state: &UiState,
+) -> Vec<(String, Style)> {
+    let command = redact_secret(&command_display(arguments), Some(&state.secret));
+    let (icon, status, status_style) = result.map(cmd_result_status).unwrap_or((
+        '·',
+        "running".to_owned(),
+        pending_tool_call_style(),
+    ));
+    vec![
+        (format!("{icon} cmd  $ {command}  → "), status_style),
+        (status, status_style),
+    ]
+}
+
+fn command_display(arguments: &str) -> String {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .map(|command| truncate_output(&command))
+        .unwrap_or_else(|| truncate_output(arguments))
+}
+
+fn cmd_result_status(result: &Value) -> (char, String, Style) {
+    if result
+        .get("canceled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return (
+            '!',
+            "canceled".to_owned(),
+            Style::default().fg(Color::Yellow),
+        );
+    }
+    if result
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return (
+            '!',
+            "timeout".to_owned(),
+            Style::default().fg(Color::Yellow),
+        );
+    }
+    if result.get("error").is_some() {
+        return ('×', "error".to_owned(), error_style());
+    }
+    match result.get("exit_code").and_then(Value::as_i64) {
+        Some(0) => ('✓', "exit 0".to_owned(), Style::default().fg(Color::Green)),
+        Some(code) => ('×', format!("exit {code}"), error_style()),
+        None => ('✓', "done".to_owned(), Style::default().fg(Color::Green)),
+    }
+}
+
+fn subagent_tool_segments(call_id: &str, arguments: &str, state: &UiState) -> Vec<(String, Style)> {
+    let task = state
+        .subagents
+        .iter()
+        .find(|task| task.call_id == call_id)
+        .map(|task| task.task.clone())
+        .unwrap_or_else(|| command_display(arguments));
+    let task = redact_secret(&truncate_output(&task), Some(&state.secret));
+    let status = state
+        .subagents
+        .iter()
+        .find(|candidate| candidate.call_id == call_id)
+        .map(|task| subagent_status_label(task.status))
+        .unwrap_or("queued");
+    let style = state
+        .subagents
+        .iter()
+        .find(|candidate| candidate.call_id == call_id)
+        .map(|task| subagent_status_style(task.status))
+        .unwrap_or_else(pending_tool_call_style);
+    vec![(format!("↗ subagent  {task}  → {status}"), style)]
+}
+
+fn generic_tool_segments(
+    name: &str,
+    arguments: &str,
+    result: Option<&Value>,
+    state: &UiState,
+) -> Vec<(String, Style)> {
+    let call_text = redact_secret(
+        &format!("[tool:{name} {}]", call_arguments(arguments)),
+        Some(&state.secret),
+    );
+    let mut segments = vec![(
+        call_text,
+        if result.is_some() {
+            tool_call_style()
+        } else {
+            pending_tool_call_style()
+        },
+    )];
+    if let Some(result) = result {
+        let result_text = redact_secret(&format_tool_result(result), Some(&state.secret));
+        segments.push((" > ".to_owned(), Style::default()));
+        segments.push((result_text, tool_result_style()));
+    } else {
+        segments.push((
+            format!(" {}", spinner_frame(state)),
+            pending_tool_call_style(),
+        ));
+    }
+    segments
 }
 
 fn matching_tool_result<'a>(
@@ -2720,157 +3115,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_renders_as_compact_single_line_with_command() {
-        let history = [SessionHistoryRecord::Message {
-            timestamp: 1,
-            message: ChatMessage::assistant(
-                String::new(),
-                vec![crate::model::ChatToolCall {
-                    id: "call-1".to_owned(),
-                    name: "cmd".to_owned(),
-                    arguments: r#"{"command":"pwd"}"#.to_owned(),
-                }],
-            ),
-        }];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
-        let text = transcript_lines(&state, 80)
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("[tool:cmd \"pwd\"]"));
-        // The raw JSON arguments must not appear verbatim.
-        assert!(!text.contains("{\"command\":\"pwd\"}"));
-    }
-
-    #[test]
-    fn pending_tool_calls_are_orange_and_show_a_spinner() {
-        let history = [SessionHistoryRecord::Message {
-            timestamp: 1,
-            message: ChatMessage::assistant(
-                String::new(),
-                vec![crate::model::ChatToolCall {
-                    id: "call-1".to_owned(),
-                    name: "cmd".to_owned(),
-                    arguments: r#"{"command":"pwd"}"#.to_owned(),
-                }],
-            ),
-        }];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
-        let line = &transcript_lines(&state, 80)[0];
-
-        assert!(line.to_string().contains("[tool:cmd \"pwd\"] "));
-        assert!(line
-            .spans
-            .iter()
-            .all(|span| span.style.fg == Some(PENDING_TOOL_COLOR)));
-        assert!(line.spans.iter().any(|span| {
-            span.content
-                .chars()
-                .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character))
-        }));
-    }
-
-    #[test]
-    fn tool_call_truncates_long_arguments() {
-        let command = "a".repeat(80);
-        let arguments = serde_json::json!({"command": command}).to_string();
-        let history = [SessionHistoryRecord::Message {
-            timestamp: 1,
-            message: ChatMessage::assistant(
-                String::new(),
-                vec![crate::model::ChatToolCall {
-                    id: "call-1".to_owned(),
-                    name: "cmd".to_owned(),
-                    arguments,
-                }],
-            ),
-        }];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
-        let text = transcript_lines(&state, 200)[0].to_string();
-        assert!(text.contains(&format!("[tool:cmd \"{}…\"]", "a".repeat(50))));
-        assert!(!text.contains(&"a".repeat(51)));
-    }
-
-    #[test]
-    fn tool_call_and_result_render_on_one_line_with_truncated_stdout() {
-        let long_stdout = "a".repeat(80);
-        let history = vec![
-            SessionHistoryRecord::Message {
-                timestamp: 1,
-                message: ChatMessage::assistant(
-                    String::new(),
-                    vec![crate::model::ChatToolCall {
-                        id: "call-1".to_owned(),
-                        name: "cmd".to_owned(),
-                        arguments: r#"{"command":"cat README.md"}"#.to_owned(),
-                    }],
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 2,
-                message: ChatMessage::tool(
-                    "call-1".to_owned(),
-                    "cmd".to_owned(),
-                    serde_json::json!({
-                        "command": "cat README.md",
-                        "exit_code": 0,
-                        "stdout": long_stdout,
-                        "stderr": "",
-                    })
-                    .to_string(),
-                ),
-            },
-        ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
-        let lines = transcript_lines(&state, 200);
-        // Call and result share one logical line (no blank line between them).
-        assert_eq!(lines.len(), 1);
-        let text = lines[0].to_string();
-        assert!(text.starts_with("[tool:cmd \"cat README.md\"] > ["));
-        // stdout is truncated to 50 chars plus the ellipsis.
-        assert!(text.contains(&"a".repeat(50)));
-        assert!(text.contains('…'));
-        assert!(!text.contains(&"a".repeat(51)));
-    }
-
-    #[test]
-    fn tool_result_falls_back_to_stderr_when_stdout_is_empty() {
-        let history = vec![
-            SessionHistoryRecord::Message {
-                timestamp: 1,
-                message: ChatMessage::assistant(
-                    String::new(),
-                    vec![crate::model::ChatToolCall {
-                        id: "call-1".to_owned(),
-                        name: "cmd".to_owned(),
-                        arguments: r#"{"command":"bad"}"#.to_owned(),
-                    }],
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 2,
-                message: ChatMessage::tool(
-                    "call-1".to_owned(),
-                    "cmd".to_owned(),
-                    serde_json::json!({
-                        "command": "bad",
-                        "exit_code": 127,
-                        "stdout": "",
-                        "stderr": "not found",
-                    })
-                    .to_string(),
-                ),
-            },
-        ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
-        let text = transcript_lines(&state, 200)[0].to_string();
-        assert!(text.contains("not found"));
-        assert!(text.contains(" > "));
-    }
-
-    #[test]
-    fn tool_call_and_result_styles_use_foreground_colors() {
+    fn cmd_call_renders_as_a_compact_status_line_without_raw_json() {
         let history = vec![
             SessionHistoryRecord::Message {
                 timestamp: 1,
@@ -2888,27 +3133,180 @@ mod tests {
                 message: ChatMessage::tool(
                     "call-1".to_owned(),
                     "cmd".to_owned(),
-                    serde_json::json!({"stdout":"x","stderr":""}).to_string(),
+                    serde_json::json!({"exit_code": 0, "stdout": "secret output"}).to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let text = transcript_lines(&state, 80)[0].to_string();
+
+        assert_eq!(text, "✓ cmd  $ pwd  → exit 0");
+        assert!(!text.contains("secret output"));
+        assert!(!text.contains("{\"command\":\"pwd\"}"));
+    }
+
+    #[test]
+    fn pending_cmd_calls_use_a_compact_running_status() {
+        let history = [SessionHistoryRecord::Message {
+            timestamp: 1,
+            message: ChatMessage::assistant(
+                String::new(),
+                vec![crate::model::ChatToolCall {
+                    id: "call-1".to_owned(),
+                    name: "cmd".to_owned(),
+                    arguments: r#"{"command":"pwd"}"#.to_owned(),
+                }],
+            ),
+        }];
+        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let line = &transcript_lines(&state, 80)[0];
+
+        assert_eq!(line.to_string(), "· cmd  $ pwd  → running");
+        assert!(line
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(PENDING_TOOL_COLOR)));
+    }
+
+    #[test]
+    fn cmd_status_distinguishes_nonzero_exit_timeout_and_cancellation() {
+        let cases = [
+            (
+                serde_json::json!({"exit_code": 127}),
+                "× cmd  $ bad  → exit 127",
+            ),
+            (
+                serde_json::json!({"timed_out": true, "exit_code": null}),
+                "! cmd  $ slow  → timeout",
+            ),
+            (
+                serde_json::json!({"canceled": true}),
+                "! cmd  $ stop  → canceled",
+            ),
+        ];
+        for (result, expected) in cases {
+            let history = vec![
+                SessionHistoryRecord::Message {
+                    timestamp: 1,
+                    message: ChatMessage::assistant(
+                        String::new(),
+                        vec![crate::model::ChatToolCall {
+                            id: "call-1".to_owned(),
+                            name: "cmd".to_owned(),
+                            arguments: serde_json::json!({"command": expected.split("$ ").nth(1).unwrap().split("  ").next().unwrap()}).to_string(),
+                        }],
+                    ),
+                },
+                SessionHistoryRecord::Message {
+                    timestamp: 2,
+                    message: ChatMessage::tool(
+                        "call-1".to_owned(),
+                        "cmd".to_owned(),
+                        result.to_string(),
+                    ),
+                },
+            ];
+            let state = UiState::from_history(&history, "secret", "model", None, false);
+            assert_eq!(transcript_lines(&state, 80)[0].to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn cmd_line_truncates_long_commands_but_never_renders_output() {
+        let command = "a".repeat(80);
+        let arguments = serde_json::json!({"command": command}).to_string();
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-1".to_owned(),
+                        name: "cmd".to_owned(),
+                        arguments,
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-1".to_owned(),
+                    "cmd".to_owned(),
+                    serde_json::json!({"exit_code": 0, "stdout": "output"}).to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let text = transcript_lines(&state, 200)[0].to_string();
+        assert!(text.contains(&format!("$ {}…", "a".repeat(50))));
+        assert!(!text.contains(&"a".repeat(51)));
+        assert!(!text.contains("output"));
+    }
+
+    #[test]
+    fn cmd_lines_remain_compact_for_consecutive_calls() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![
+                        crate::model::ChatToolCall {
+                            id: "call-first".to_owned(),
+                            name: "cmd".to_owned(),
+                            arguments: r#"{"command":"first"}"#.to_owned(),
+                        },
+                        crate::model::ChatToolCall {
+                            id: "call-second".to_owned(),
+                            name: "cmd".to_owned(),
+                            arguments: r#"{"command":"second"}"#.to_owned(),
+                        },
+                    ],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-first".to_owned(),
+                    "cmd".to_owned(),
+                    serde_json::json!({"exit_code": 0}).to_string(),
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 3,
+                message: ChatMessage::tool(
+                    "call-second".to_owned(),
+                    "cmd".to_owned(),
+                    serde_json::json!({"exit_code": 0}).to_string(),
                 ),
             },
         ];
         let state = UiState::from_history(&history, "secret", "model", None, false);
         let lines = transcript_lines(&state, 200);
-        let spans = &lines[0].spans;
-        // Calls and results retain their distinct foreground styles, with an
-        // unstyled separator between them.
-        assert_eq!(spans[0].style.fg, Some(Color::Magenta));
-        assert!(spans.iter().any(|span| span.style.fg.is_none()));
-        let result_text = spans
-            .iter()
-            .filter(|span| span.style.fg == Some(Color::DarkGray))
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(result_text, "[\"x\"]");
-        assert!(!lines[0]
-            .to_string()
-            .chars()
-            .any(|character| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(character)));
+        assert_eq!(lines[0].to_string(), "✓ cmd  $ first  → exit 0");
+        assert_eq!(lines[2].to_string(), "✓ cmd  $ second  → exit 0");
+    }
+
+    #[test]
+    fn cmd_status_styles_use_success_failure_and_pending_colors() {
+        assert_eq!(
+            cmd_result_status(&serde_json::json!({"exit_code": 0})).2.fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            cmd_result_status(&serde_json::json!({"exit_code": 1})).2.fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            cmd_tool_segments(
+                "{\"command\":\"pwd\"}",
+                None,
+                &UiState::from_history(&[], "secret", "model", None, false)
+            )[0]
+            .1
+            .fg,
+            Some(PENDING_TOOL_COLOR)
+        );
     }
 
     #[test]
@@ -3116,14 +3514,156 @@ mod tests {
             3,
             "only the two call lines and their separator remain"
         );
-        assert_eq!(
-            lines[0].to_string(),
-            "[tool:cmd \"first\"] > [\"first result\"]"
+        assert_eq!(lines[0].to_string(), "✓ cmd  $ first  → done");
+        assert_eq!(lines[2].to_string(), "✓ cmd  $ second  → done");
+    }
+    #[test]
+    fn subagent_tasks_keep_metadata_and_move_from_queued_to_done() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-worker".to_owned(),
+                        name: "spawn_subagent".to_owned(),
+                        arguments: serde_json::json!({
+                            "task": "Inspect the command UI",
+                            "model": "worker-model",
+                            "effort": "high"
+                        })
+                        .to_string(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-worker".to_owned(),
+                    "spawn_subagent".to_owned(),
+                    serde_json::json!({"task_id":"subagent-1","status":"queued"}).to_string(),
+                ),
+            },
+        ];
+        let mut state = UiState::from_history(&history, "secret", "model", None, false);
+        assert_eq!(state.subagents.len(), 1);
+        let task = &state.subagents[0];
+        assert_eq!(task.task, "Inspect the command UI");
+        assert_eq!(task.task_id.as_deref(), Some("subagent-1"));
+        assert_eq!(task.model.as_deref(), Some("worker-model"));
+        assert_eq!(task.effort.as_deref(), Some("high"));
+        assert_eq!(task.status, SubagentStatus::Running);
+        assert!(transcript_lines(&state, 80)[0]
+            .to_string()
+            .contains("↗ subagent  Inspect the command UI  → running"));
+
+        state.complete_subagent(
+            "subagent-1",
+            serde_json::json!({"model":"worker-model","output":"finished"}),
         );
+        assert_eq!(state.subagents[0].status, SubagentStatus::Completed);
         assert_eq!(
-            lines[2].to_string(),
-            "[tool:cmd \"second\"] > [\"second result\"]"
+            subagent_result_preview(state.subagents[0].result.as_ref().unwrap(), "secret"),
+            "finished"
         );
+    }
+
+    #[test]
+    fn resumed_subagent_completion_updates_the_panel_without_rendering_internal_prompt() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-worker".to_owned(),
+                        name: "spawn_subagent".to_owned(),
+                        arguments: serde_json::json!({"task":"Inspect"}).to_string(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-worker".to_owned(),
+                    "spawn_subagent".to_owned(),
+                    serde_json::json!({"task_id":"subagent-1","status":"queued"}).to_string(),
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 3,
+                message: ChatMessage::user(Harness::subagent_notification(
+                    &crate::app::SubagentCompletion {
+                        task_id: "subagent-1".to_owned(),
+                        result: serde_json::json!({"output":"resumed result"}),
+                    },
+                )),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "model", None, true);
+        assert_eq!(state.subagents[0].status, SubagentStatus::Completed);
+        assert_eq!(
+            state.subagents[0].result.as_ref().unwrap()["output"],
+            "resumed result"
+        );
+        assert!(!state.transcript.iter().any(|item| {
+            matches!(item, TranscriptItem::User { text, .. } if text.contains("Background subagent"))
+        }));
+    }
+
+    #[test]
+    fn subagent_panel_uses_right_column_only_on_wide_terminals() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect the command UI".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Queued,
+            result: None,
+        });
+        let wide = Rect::new(0, 0, 120, 20);
+        let narrow = Rect::new(0, 0, 80, 20);
+        let panel = subagent_panel_area(&state, wide).expect("wide panel");
+        assert_eq!(panel.width, SUBAGENT_PANEL_WIDTH);
+        assert_eq!(panel.x, 86);
+        assert_eq!(content_area(&state, wide).width, 85);
+        assert!(subagent_panel_area(&state, narrow).is_none());
+        assert_eq!(content_area(&state, narrow), narrow);
+    }
+
+    #[test]
+    fn subagent_panel_renders_status_task_identity_and_result_preview() {
+        let mut state = UiState::from_history(&[], "provider-secret", "model", None, false);
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect the command UI".to_owned(),
+            model: Some("worker-model".to_owned()),
+            effort: Some("high".to_owned()),
+            status: SubagentStatus::Completed,
+            result: Some(serde_json::json!({"output":"worker finished"})),
+        });
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(120, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw panel");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("workers 1"));
+        assert!(screen.contains("completed"));
+        assert!(screen.contains("Inspect the command UI"));
+        assert!(screen.contains("subagent-1"));
+        assert!(screen.contains("worker-model · high"));
+        assert!(screen.contains("worker finished"));
+        assert!(!screen.contains("provider-secret"));
     }
 }
 

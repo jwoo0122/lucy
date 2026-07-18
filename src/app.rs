@@ -353,7 +353,8 @@ where
     });
     let mut input_closed = false;
     while !input_closed || harness.has_running_subagents() {
-        if let Some(notification) = harness.next_subagent_notification() {
+        if let Some(completion) = harness.next_subagent_completion() {
+            let notification = Harness::subagent_notification(&completion);
             if let Err(error) = harness.handle_message(&notification, &mut protocol, None) {
                 let error = redact_secret(&error, Some(harness.provider.api_key()));
                 let _ = protocol.error(&error);
@@ -457,9 +458,9 @@ enum SubagentState {
     Completed(Value),
 }
 
-struct SubagentCompletion {
-    task_id: String,
-    result: Value,
+pub(crate) struct SubagentCompletion {
+    pub(crate) task_id: String,
+    pub(crate) result: Value,
 }
 
 fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
@@ -504,13 +505,16 @@ fn find_compaction_boundary(
 }
 
 impl Harness {
-    pub(crate) fn next_subagent_notification(&mut self) -> Option<String> {
-        let completion = self.completed_subagents.1.try_recv().ok()?;
-        Some(format!(
+    pub(crate) fn next_subagent_completion(&mut self) -> Option<SubagentCompletion> {
+        self.completed_subagents.1.try_recv().ok()
+    }
+
+    pub(crate) fn subagent_notification(completion: &SubagentCompletion) -> String {
+        format!(
             "Background subagent {} completed. Deliver this result to the user and continue the task: {}",
             completion.task_id,
             serde_json::to_string(&completion.result).unwrap_or_else(|_| "{\"error\":\"unable to encode subagent result\"}".to_owned())
-        ))
+        )
     }
 
     fn has_running_subagents(&self) -> bool {
