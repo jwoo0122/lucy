@@ -17,14 +17,14 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect, Size};
 use ratatui::prelude::Frame;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::Harness;
+use crate::app::{Harness, SubagentActivity};
 use crate::cancellation::CancellationToken;
 use crate::model::{estimate_context_tokens, ChatMessage};
 use crate::protocol::{EventSink, ProtocolEvent};
@@ -38,7 +38,8 @@ const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Maximum number of wrapped input rows the input box grows to before it
 /// stops expanding and scrolls its contents internally.
 const MAX_INPUT_ROWS: u16 = 12;
-const WELCOME_MESSAGE: &str = concat!("Coding Agent Harness LUCY - v", env!("CARGO_PKG_VERSION"),);
+const WELCOME_MESSAGE: &str = "Coding Agent Harness LUCY";
+const WELCOME_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const WELCOME_TAGLINE: &str = "An ultra-thin harness for tomorrow's most powerful models";
 const WELCOME_START_COLOR: (u8, u8, u8) = (0, 180, 180);
 const WELCOME_END_COLOR: (u8, u8, u8) = (255, 215, 0);
@@ -52,10 +53,10 @@ const PENDING_TOOL_COLOR: Color = Color::Rgb(
     PENDING_TOOL_COLOR_RGB.1,
     PENDING_TOOL_COLOR_RGB.2,
 );
-/// A successful `cmd` call first retains its pending orange, then sweeps to
-/// green from the left edge of the compact tool line.
-const TOOL_SUCCESS_SWEEP_DURATION: Duration = Duration::from_millis(350);
-const TOOL_SUCCESS_SWEEP_WIDTH: f32 = 3.0;
+/// A completed `cmd` call first retains its pending orange, then sweeps to the
+/// final result colour from the left edge of the compact tool line.
+const TOOL_RESULT_SWEEP_DURATION: Duration = Duration::from_millis(400);
+const TOOL_RESULT_SWEEP_WIDTH: f32 = 4.0;
 const TOOL_SUCCESS_GREEN_RGB: (u8, u8, u8) = (0, 128, 0);
 const QUEUED_MESSAGE_BACKGROUND: Color = Color::Rgb(0, 38, 38);
 const QUEUED_MESSAGE_COLOR: Color = Color::Rgb(150, 255, 245);
@@ -69,8 +70,10 @@ const WORKING_GRADIENT_COLORS: [(u8, u8, u8); 4] = [
 ];
 const WORKING_GRADIENT_CYCLE: Duration = Duration::from_millis(5000);
 const SKILL_PICKER_MAX_ROWS: usize = 5;
+const SUBAGENT_TASK_PREVIEW_CHARS: usize = 25;
+const SUBAGENT_STREAM_MAX_ROWS: usize = 8;
+const SUBAGENT_STREAM_MAX_CHARS: usize = 12 * 1024;
 const BUILTIN_COMMANDS: [&str; 2] = ["settings", "exit"];
-const SUBAGENT_OVERLAY_BACKGROUND: Color = Color::Rgb(55, 0, 55);
 const SUBAGENT_OVERLAY_COLOR: Color = Color::Rgb(255, 0, 255);
 const SETTINGS_MIN_WIDTH: u16 = 36;
 const SETTINGS_MAX_WIDTH: u16 = 88;
@@ -172,6 +175,9 @@ fn worker_loop(
     }
 
     loop {
+        while let Some(activity) = harness.next_subagent_activity() {
+            let _ = messages.send(WorkerMessage::SubagentActivity(activity));
+        }
         if let Some(completion) = harness.next_subagent_completion() {
             let task_id = completion.task_id.clone();
             let result = completion.result.clone();
@@ -192,6 +198,9 @@ fn worker_loop(
         let request = match requests.recv_timeout(EVENT_POLL) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                while let Some(activity) = harness.next_subagent_activity() {
+                    let _ = messages.send(WorkerMessage::SubagentActivity(activity));
+                }
                 if let Some(completion) = harness.next_subagent_completion() {
                     let task_id = completion.task_id.clone();
                     let result = completion.result.clone();
@@ -259,6 +268,9 @@ fn event_loop<W: Write>(
                 Ok(WorkerMessage::Event(event)) => state.apply_event(event),
                 Ok(WorkerMessage::SubagentCompleted { task_id, result }) => {
                     state.complete_subagent(&task_id, result);
+                }
+                Ok(WorkerMessage::SubagentActivity(activity)) => {
+                    state.apply_subagent_activity(activity);
                 }
                 Ok(WorkerMessage::Started { cancel, user_text }) => {
                     if let Some(text) = user_text {
@@ -361,11 +373,32 @@ fn event_loop<W: Write>(
                 continue;
             }
             if key.code == KeyCode::Esc {
+                if state.subagent_focus.is_some() {
+                    state.clear_subagent_focus();
+                    continue;
+                }
                 if let Some(token) = state.active_cancel.as_ref() {
                     if token.cancel() {
                         state.set_status("cancelling");
                     }
                 }
+                continue;
+            }
+            // While the background-worker list owns focus, swallow typing so it
+            // cannot mutate the prompt underneath the stream overlay.
+            if state.subagent_focus.is_some()
+                && matches!(
+                    key.code,
+                    KeyCode::Char(_)
+                        | KeyCode::Backspace
+                        | KeyCode::Enter
+                        | KeyCode::Tab
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Home
+                        | KeyCode::End
+                )
+            {
                 continue;
             }
             match key.code {
@@ -457,21 +490,41 @@ fn event_loop<W: Write>(
                     state.cursor = state.input.chars().count();
                 }
                 KeyCode::Up => {
-                    if !state.move_skill_picker(false) {
+                    if state.move_skill_picker(false) {
+                        // skill picker owns the key
+                    } else if state.subagent_focus.is_some() {
+                        let _ = state.move_subagent_focus(false);
+                    } else {
                         let size = terminal
                             .size()
                             .map_err(|error| format!("unable to read terminal size: {error}"))?;
-                        let max_scroll = max_scroll_for_area(state, size);
-                        scroll_up(state, max_scroll);
+                        let area = tui_viewport(Rect::new(0, 0, size.width, size.height));
+                        let input_width = area.width.saturating_sub(2).max(1) as usize;
+                        if input_cursor_on_first_row(state, input_width)
+                            && state.focus_subagent_list_from_input()
+                        {
+                            // the list is physically above the prompt
+                        } else if !move_input_cursor_vertical(state, input_width, false) {
+                            let max_scroll = max_scroll_for_area(state, size);
+                            scroll_up(state, max_scroll);
+                        }
                     }
                 }
                 KeyCode::Down => {
-                    if !state.move_skill_picker(true) {
+                    if state.move_skill_picker(true) {
+                        // skill picker owns the key
+                    } else if state.subagent_focus.is_some() {
+                        let _ = state.move_subagent_focus(true);
+                    } else {
                         let size = terminal
                             .size()
                             .map_err(|error| format!("unable to read terminal size: {error}"))?;
-                        let max_scroll = max_scroll_for_area(state, size);
-                        scroll_down(state, max_scroll);
+                        let area = tui_viewport(Rect::new(0, 0, size.width, size.height));
+                        let input_width = area.width.saturating_sub(2).max(1) as usize;
+                        if !move_input_cursor_vertical(state, input_width, true) {
+                            let max_scroll = max_scroll_for_area(state, size);
+                            scroll_down(state, max_scroll);
+                        }
                     }
                 }
                 KeyCode::PageUp => {
@@ -686,6 +739,7 @@ enum WorkerMessage {
         task_id: String,
         result: Value,
     },
+    SubagentActivity(SubagentActivity),
     Finished,
 }
 
@@ -748,6 +802,21 @@ enum SubagentStatus {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+enum SubagentStreamItem {
+    Assistant(String),
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        result: Value,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct SubagentTask {
     call_id: String,
     task_id: Option<String>,
@@ -756,6 +825,9 @@ struct SubagentTask {
     effort: Option<String>,
     status: SubagentStatus,
     result: Option<Value>,
+    creation_completed: bool,
+    stream: Vec<SubagentStreamItem>,
+    stream_chars: usize,
 }
 
 /// A bounded interpolation between the resting bars and a live pulse frame.
@@ -791,8 +863,10 @@ struct UiState {
     welcome_visible: bool,
     attached_agents: Vec<String>,
     subagents: Vec<SubagentTask>,
+    subagent_focus: Option<usize>,
     completed_subagent_calls: HashSet<String>,
-    cmd_success_started_at: HashMap<String, Instant>,
+    failed_subagent_calls: HashSet<String>,
+    cmd_result_started_at: HashMap<String, Instant>,
     skill_names: Vec<String>,
     skill_picker_focus: usize,
     skill_picker_suppressed: bool,
@@ -830,8 +904,10 @@ impl UiState {
             welcome_visible: !resumed && history.is_empty(),
             attached_agents: Vec::new(),
             subagents: Vec::new(),
+            subagent_focus: None,
             completed_subagent_calls: HashSet::new(),
-            cmd_success_started_at: HashMap::new(),
+            failed_subagent_calls: HashSet::new(),
+            cmd_result_started_at: HashMap::new(),
             skill_names: Vec::new(),
             skill_picker_focus: 0,
             skill_picker_suppressed: false,
@@ -1323,8 +1399,8 @@ impl UiState {
         if name == "spawn_subagent" {
             self.update_subagent_queued(id, &result);
         }
-        if animate && name == "cmd" && cmd_result_succeeded(&result) {
-            self.cmd_success_started_at
+        if animate && name == "cmd" {
+            self.cmd_result_started_at
                 .insert(id.to_owned(), Instant::now());
         }
         self.transcript.push(TranscriptItem::ToolResult {
@@ -1365,6 +1441,9 @@ impl UiState {
             effort,
             status: SubagentStatus::Queued,
             result: None,
+            creation_completed: false,
+            stream: Vec::new(),
+            stream_chars: 0,
         });
     }
 
@@ -1381,30 +1460,145 @@ impl UiState {
             .and_then(Value::as_str)
             .map(str::to_owned);
         task.status = if result.get("error").is_some() {
+            task.creation_completed = false;
             SubagentStatus::Failed
         } else {
-            // The queued acknowledgement is emitted after the worker thread
-            // has been launched, so the persistent panel can show its live
-            // state as running while the worker continues in the background.
+            // Creation is complete once the queued acknowledgement carries a
+            // task id; the worker itself remains live in the list.
+            task.creation_completed = task.task_id.is_some();
             SubagentStatus::Running
         };
         task.result = Some(result.clone());
     }
 
-    fn complete_subagent(&mut self, task_id: &str, _result: Value) {
+    fn complete_subagent(&mut self, task_id: &str, result: Value) {
         // Completion is delivered to the main agent through the notification
         // message. The task list is only a live background-work view, so do
         // not retain finished workers there. Keep the call identity separately
         // so its transcript line can still say "completed" after removal.
-        if let Some(task) = self
+        let removed_index = self
             .subagents
             .iter()
-            .find(|task| task.task_id.as_deref() == Some(task_id))
-        {
-            self.completed_subagent_calls.insert(task.call_id.clone());
+            .position(|task| task.task_id.as_deref() == Some(task_id));
+        if let Some(index) = removed_index {
+            let call_id = self.subagents[index].call_id.clone();
+            let failed = result.get("error").is_some()
+                || result.get("cancelled").is_some()
+                || result.get("interrupted").is_some();
+            if failed {
+                self.failed_subagent_calls.insert(call_id);
+            } else {
+                self.completed_subagent_calls.insert(call_id);
+            }
+            self.subagents.remove(index);
+            self.subagent_focus = match self.subagent_focus {
+                None => None,
+                Some(focus) if self.subagents.is_empty() => None,
+                Some(focus) if focus > index => Some(focus - 1),
+                Some(focus) if focus == index => Some(focus.min(self.subagents.len() - 1)),
+                Some(focus) => Some(focus),
+            };
         }
-        self.subagents
-            .retain(|task| task.task_id.as_deref() != Some(task_id));
+    }
+
+    fn apply_subagent_activity(&mut self, activity: SubagentActivity) {
+        if let SubagentActivity::Completed { task_id, result } = activity {
+            self.complete_subagent(&task_id, result);
+            return;
+        }
+        let (task_id, item, chars) = match activity {
+            SubagentActivity::AssistantDelta { task_id, text } => {
+                let text = redact_secret(&text, Some(&self.secret));
+                let chars = text.chars().count();
+                (task_id, SubagentStreamItem::Assistant(text), chars)
+            }
+            SubagentActivity::ToolCall {
+                task_id,
+                id,
+                name,
+                arguments,
+            } => {
+                let arguments = redact_secret(&arguments, Some(&self.secret));
+                let chars = arguments.chars().count() + name.len() + id.len();
+                (
+                    task_id,
+                    SubagentStreamItem::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+                    chars,
+                )
+            }
+            SubagentActivity::ToolResult {
+                task_id,
+                id,
+                name,
+                result,
+            } => {
+                let encoded = result.to_string();
+                let chars = encoded.chars().count() + name.len() + id.len();
+                (
+                    task_id,
+                    SubagentStreamItem::ToolResult { id, name, result },
+                    chars,
+                )
+            }
+            SubagentActivity::Completed { .. } => {
+                unreachable!("completed activity is handled above")
+            }
+        };
+        let Some(task) = self
+            .subagents
+            .iter_mut()
+            .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
+        else {
+            return;
+        };
+        // Merge consecutive assistant deltas into one stream item.
+        if let SubagentStreamItem::Assistant(delta) = &item {
+            if let Some(SubagentStreamItem::Assistant(existing)) = task.stream.last_mut() {
+                existing.push_str(delta);
+                task.stream_chars = task.stream_chars.saturating_add(chars);
+                trim_subagent_stream(task);
+                return;
+            }
+        }
+        task.stream.push(item);
+        task.stream_chars = task.stream_chars.saturating_add(chars);
+        trim_subagent_stream(task);
+    }
+
+    fn clear_subagent_focus(&mut self) {
+        self.subagent_focus = None;
+    }
+
+    fn focus_subagent_list_from_input(&mut self) -> bool {
+        if self.subagents.is_empty() {
+            return false;
+        }
+        self.subagent_focus = Some(self.subagents.len() - 1);
+        true
+    }
+
+    fn move_subagent_focus(&mut self, down: bool) -> bool {
+        let Some(focus) = self.subagent_focus else {
+            return false;
+        };
+        if self.subagents.is_empty() {
+            self.subagent_focus = None;
+            return true;
+        }
+        if down {
+            if focus + 1 >= self.subagents.len() {
+                self.subagent_focus = None;
+            } else {
+                self.subagent_focus = Some(focus + 1);
+            }
+        } else if focus > 0 {
+            self.subagent_focus = Some(focus - 1);
+        }
+        true
     }
 
     fn apply_event(&mut self, event: ProtocolEvent) {
@@ -1444,12 +1638,31 @@ impl UiState {
     }
 }
 
+fn trim_subagent_stream(task: &mut SubagentTask) {
+    while task.stream_chars > SUBAGENT_STREAM_MAX_CHARS && !task.stream.is_empty() {
+        let removed = match task.stream.remove(0) {
+            SubagentStreamItem::Assistant(text) => text.chars().count(),
+            SubagentStreamItem::ToolCall {
+                id,
+                name,
+                arguments,
+            } => id.len() + name.len() + arguments.chars().count(),
+            SubagentStreamItem::ToolResult { id, name, result } => {
+                id.len() + name.len() + result.to_string().chars().count()
+            }
+        };
+        task.stream_chars = task.stream_chars.saturating_sub(removed);
+    }
+}
+
 fn parse_subagent_notification(text: &str) -> Option<(String, Value)> {
     let prefix = "Background subagent ";
-    let suffix = " completed. Deliver this result to the user and continue the task: ";
+    let suffix = ". Deliver this result to the user and continue the task: ";
     let rest = text.strip_prefix(prefix)?;
-    let (task_id, encoded_result) = rest.split_once(suffix)?;
-    if task_id.is_empty() {
+    let (header, encoded_result) = rest.split_once(suffix)?;
+    let (task_id, status) = header.split_once(' ')?;
+    if task_id.is_empty() || !matches!(status, "completed" | "failed" | "canceled" | "interrupted")
+    {
         return None;
     }
     Some((
@@ -1489,9 +1702,18 @@ fn activity_text(state: &UiState) -> String {
 
 fn activity_text_at(state: &UiState, now: Instant) -> String {
     match state.status.as_str() {
-        // Lower one-eighth blocks occupy the full terminal-cell width, so
-        // adjoining them creates a continuous low bar with no spacer glyphs.
-        "ready" | "working" | "compacting" => pulse_frame(state.activity_levels_at(now)),
+        // Keep the flame visible while entering or leaving busy mode, but hide
+        // it completely once the idle settle-down transition has finished.
+        "working" | "compacting" => pulse_frame(state.activity_levels_at(now)),
+        "ready"
+            if state
+                .activity_transition
+                .as_ref()
+                .is_some_and(|transition| transition_progress(now, transition) < 1.0) =>
+        {
+            pulse_frame(state.activity_levels_at(now))
+        }
+        "ready" => String::new(),
         _ => format!("● {}", state.status),
     }
 }
@@ -1511,9 +1733,10 @@ fn ui_layout(
     state: &UiState,
     area: Rect,
 ) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>, Rect, Rect) {
-    let input_rows = input_visible_rows(state, area.width.saturating_sub(2));
+    let prompt_rows = input_visible_rows(state, area.width.saturating_sub(2));
+    let list_height = subagent_list_height(state);
     let queue_height = message_queue_height(state);
-    let input_height = input_rows.clamp(1, MAX_INPUT_ROWS) + 2;
+    let input_height = prompt_rows.clamp(1, MAX_INPUT_ROWS) + 2 + list_height;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1525,8 +1748,6 @@ fn ui_layout(
         .split(area);
     let picker_height = skill_picker_height(state);
     let picker_area = (picker_height > 0).then(|| {
-        // The picker sits above queued messages so it never covers the queue
-        // or the prompt border.
         Rect::new(
             chunks[1].x,
             chunks[1].y.saturating_sub(picker_height),
@@ -1534,10 +1755,8 @@ fn ui_layout(
             picker_height,
         )
     });
-    let overlay_area = subagent_overlay_area(state, chunks[0]);
+    let stream_area = subagent_stream_overlay_area(state, chunks[1], chunks[2]);
     let input_area = chunks[2];
-    // Queue rows remain visually aligned with the prompt's inner content, but
-    // live in their own strip above the bordered input widget.
     let queue_area = (queue_height > 0).then(|| {
         Rect::new(
             input_area.x.saturating_add(1),
@@ -1549,35 +1768,47 @@ fn ui_layout(
     (
         chunks[0],
         picker_area,
-        overlay_area,
+        stream_area,
         queue_area,
         input_area,
         chunks[3],
     )
 }
 
-/// Active background workers float over the upper-right transcript instead of
-/// consuming space from the input area. One bordered row is reserved for each
-/// task, plus the top and bottom border rows.
-fn subagent_overlay_area(state: &UiState, area: Rect) -> Option<Rect> {
-    if state.subagents.is_empty() || area.is_empty() {
-        return None;
-    }
-    let width = area.width / 3;
-    if width == 0 {
-        return None;
-    }
-    let height = (state.subagents.len().saturating_add(2))
-        .min(area.height as usize)
-        .min(u16::MAX as usize) as u16;
-    (height > 0).then(|| {
-        Rect::new(
-            area.x + area.width.saturating_sub(width),
-            area.y,
-            width,
-            height,
-        )
-    })
+fn prompt_area(input_area: Rect, state: &UiState) -> Rect {
+    let list_height = subagent_list_height(state);
+    let prompt_height =
+        input_visible_rows(state, input_area.width.saturating_sub(2)).clamp(1, MAX_INPUT_ROWS) + 2;
+    Rect::new(
+        input_area.x,
+        input_area.y.saturating_add(list_height),
+        input_area.width,
+        prompt_height.min(input_area.height.saturating_sub(list_height)),
+    )
+}
+
+fn subagent_list_area(state: &UiState, input_area: Rect) -> Option<Rect> {
+    let height = subagent_list_height(state);
+    (height > 0).then(|| Rect::new(input_area.x, input_area.y, input_area.width, height))
+}
+
+fn subagent_list_height(state: &UiState) -> u16 {
+    state.subagents.len().min(u16::MAX as usize) as u16
+}
+
+/// Focused worker output uses the same transient slot as the slash picker:
+/// immediately above the input, without changing the transcript viewport.
+fn subagent_stream_overlay_area(
+    state: &UiState,
+    queue_area: Rect,
+    input_area: Rect,
+) -> Option<Rect> {
+    let focus = state.subagent_focus?;
+    let task = state.subagents.get(focus)?;
+    let stream_rows = task.stream.len().clamp(1, SUBAGENT_STREAM_MAX_ROWS) as u16;
+    let height = stream_rows.saturating_add(2);
+    let y = queue_area.y.saturating_sub(height);
+    Some(Rect::new(input_area.x, y, input_area.width, height))
 }
 
 fn message_queue_height(state: &UiState) -> u16 {
@@ -1752,12 +1983,107 @@ fn styled_text_span(text: String, highlighted: bool, text_style: Style) -> Span<
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputVisualRow {
+    start: usize,
+    end: usize,
+}
+
+fn input_visual_rows(input: &str, width: usize) -> Vec<InputVisualRow> {
+    let width = width.max(1);
+    let characters = input.chars().collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut row_width = 0;
+
+    for (index, character) in characters.iter().enumerate() {
+        if *character == '\n' {
+            rows.push(InputVisualRow { start, end: index });
+            start = index + 1;
+            row_width = 0;
+            continue;
+        }
+
+        let character_width = unicode_width::UnicodeWidthChar::width(*character).unwrap_or(0);
+        if row_width + character_width > width && index > start {
+            rows.push(InputVisualRow { start, end: index });
+            start = index;
+            row_width = 0;
+        }
+        row_width += character_width;
+    }
+
+    rows.push(InputVisualRow {
+        start,
+        end: characters.len(),
+    });
+    rows
+}
+
+fn input_cursor_row(input: &str, cursor: usize, width: usize) -> usize {
+    let rows = input_visual_rows(input, width);
+    let cursor = cursor.min(input.chars().count());
+    for (index, row) in rows.iter().enumerate() {
+        if cursor < row.end {
+            return index;
+        }
+        if cursor == row.end && rows.get(index + 1).is_none_or(|next| next.start != cursor) {
+            return index;
+        }
+    }
+    rows.len().saturating_sub(1)
+}
+
+fn input_cursor_on_first_row(state: &UiState, width: usize) -> bool {
+    input_cursor_row(&state.input, state.cursor, width) == 0
+}
+
 fn cursor_row(input: &str, cursor: usize, width: usize) -> u16 {
-    let prefix: String = input.chars().take(cursor).collect();
-    wrap_text(&prefix, width)
-        .len()
-        .saturating_sub(1)
-        .min(u16::MAX as usize) as u16
+    input_cursor_row(input, cursor, width).min(u16::MAX as usize) as u16
+}
+
+fn move_input_cursor_vertical(state: &mut UiState, width: usize, down: bool) -> bool {
+    let width = width.max(1);
+    let rows = input_visual_rows(&state.input, width);
+    let current_row = input_cursor_row(&state.input, state.cursor, width);
+    let target_row = if down {
+        current_row + 1
+    } else {
+        current_row.saturating_sub(1)
+    };
+    if target_row == current_row || target_row >= rows.len() {
+        return false;
+    }
+
+    let characters = state.input.chars().collect::<Vec<_>>();
+    let current = rows[current_row];
+    let cursor = state.cursor.min(current.end);
+    let desired_column = characters[current.start..cursor]
+        .iter()
+        .map(|character| unicode_width::UnicodeWidthChar::width(*character).unwrap_or(0))
+        .sum::<usize>();
+    let target = rows[target_row];
+    let mut column = 0;
+    let mut target_cursor = target.end;
+    for (index, character) in characters
+        .iter()
+        .enumerate()
+        .take(target.end)
+        .skip(target.start)
+    {
+        let character_width = unicode_width::UnicodeWidthChar::width(*character).unwrap_or(0);
+        if column + character_width > desired_column {
+            target_cursor = index;
+            break;
+        }
+        column += character_width;
+        if column >= desired_column {
+            target_cursor = index + 1;
+            break;
+        }
+    }
+    state.cursor = target_cursor;
+    true
 }
 
 fn insert_at_cursor(input: &mut String, cursor: &mut usize, character: char) {
@@ -1803,15 +2129,34 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let width = chat_chunk.width;
     if state.welcome_visible {
         let welcome_lines = welcome_lines(&state.attached_agents);
-        let welcome_height = (welcome_lines.len() as u16).min(visible_chat_area.height);
+        // Reserve the bottom row for the version so it remains visually
+        // separated from the title, tagline, and attached instructions.
+        let content_height = visible_chat_area.height.saturating_sub(2);
+        let welcome_height = (welcome_lines.len() as u16).min(content_height);
         let welcome_area = Rect::new(
             visible_chat_area.x,
-            visible_chat_area.y + visible_chat_area.height.saturating_sub(welcome_height) / 2,
+            visible_chat_area.y + content_height.saturating_sub(welcome_height) / 2,
             visible_chat_area.width,
             welcome_height,
         );
         let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
         frame.render_widget(welcome, welcome_area);
+        if visible_chat_area.height > 0 {
+            let version = Paragraph::new(Line::styled(
+                WELCOME_VERSION,
+                Style::default().fg(Color::DarkGray),
+            ))
+            .alignment(Alignment::Center);
+            frame.render_widget(
+                version,
+                Rect::new(
+                    visible_chat_area.x,
+                    visible_chat_area.y + visible_chat_area.height - 1,
+                    visible_chat_area.width,
+                    1,
+                ),
+            );
+        }
     } else {
         let lines = transcript_lines(state, width);
         let available = visible_chat_area.height as usize;
@@ -1828,19 +2173,23 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let activity_now = Instant::now();
     let activity_text = activity_text_at(state, activity_now);
     let activity_elapsed = state.working_elapsed_at(activity_now);
-    let activity = activity_line_at(state, &activity_text, activity_elapsed, activity_now);
     if let Some(picker_area) = picker_area {
         draw_skill_picker(frame, state, picker_area);
+    }
+
+    if let Some(list_area) = subagent_list_area(state, input_chunk) {
+        draw_subagent_list(frame, state, list_area);
     }
 
     let input_text_style = Style::default().fg(Color::White);
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Plain);
-    let prompt_area = input_block.inner(input_chunk);
+    let prompt_chunk = prompt_area(input_chunk, state);
+    let prompt_area = input_block.inner(prompt_chunk);
     let prompt = input_display_text(state);
     let input_rows =
-        input_visible_rows(state, input_chunk.width.saturating_sub(2)).clamp(1, MAX_INPUT_ROWS);
+        input_visible_rows(state, prompt_chunk.width.saturating_sub(2)).clamp(1, MAX_INPUT_ROWS);
     let wrapped = wrap_text(&prompt, prompt_area.width.max(1) as usize);
     let visible = (wrapped.len() as u16).clamp(1, input_rows);
     let cursor_row = cursor_row(&prompt, state.cursor, prompt_area.width.max(1) as usize);
@@ -1856,7 +2205,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         prompt_area.width.max(1) as usize,
         input_text_style,
     );
-    frame.render_widget(input_block, input_chunk);
+    frame.render_widget(input_block, prompt_chunk);
     if let Some(queue_area) = queue_area {
         draw_message_queue(frame, state, queue_area);
     }
@@ -1864,17 +2213,30 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         .style(input_text_style)
         .scroll((input_scroll, 0));
     frame.render_widget(input, prompt_area);
-    draw_prompt_border_gradient(frame, input_chunk);
+    draw_prompt_border_gradient(frame, prompt_chunk);
 
     let effort = state.effort.as_deref().unwrap_or("default");
-    let status_text = format!("{} ({effort})", state.model);
-    let status = Paragraph::new(redact_secret(&status_text, Some(&state.secret)))
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(status, status_area);
-
     let context_text = context_status_text(state);
     let context_width = UnicodeWidthStr::width(context_text.as_str()) as u16;
     let context_area_width = context_width.min(status_area.width);
+    let status_left_width = status_area.width.saturating_sub(context_area_width);
+    let status_left_area = Rect::new(
+        status_area.x,
+        status_area.y,
+        status_left_width,
+        status_area.height,
+    );
+    if !status_left_area.is_empty() {
+        let status_line = model_status_line(
+            state,
+            effort,
+            &activity_text,
+            activity_elapsed,
+            activity_now,
+        );
+        frame.render_widget(Paragraph::new(status_line), status_left_area);
+    }
+
     if context_area_width > 0 {
         let context_area = Rect::new(
             status_area
@@ -1890,18 +2252,11 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         frame.render_widget(context, context_area);
     }
 
-    // Render last so this remains at the exact center of the full status line,
-    // rather than the leftover space between metadata columns.
-    frame.render_widget(
-        Paragraph::new(activity).alignment(Alignment::Center),
-        status_area,
-    );
-
     // The task overlay is a floating surface: draw it after the transcript,
     // picker, input, and status layers so none can cut through its left border
     // or upper-left corner on a constrained terminal layout.
     if let Some(overlay_area) = overlay_area {
-        draw_subagent_overlay(frame, state, overlay_area);
+        draw_subagent_stream_overlay(frame, state, overlay_area);
     }
     if let Some(settings) = &state.settings {
         draw_settings(frame, settings, area);
@@ -1944,44 +2299,107 @@ fn draw_message_queue(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     );
 }
 
-fn draw_subagent_overlay(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+const SUBAGENT_ID_COLORS: [Color; 8] = [
+    Color::Rgb(255, 128, 128),
+    Color::Rgb(255, 190, 90),
+    Color::Rgb(255, 235, 100),
+    Color::Rgb(120, 225, 150),
+    Color::Rgb(100, 220, 220),
+    Color::Rgb(120, 175, 255),
+    Color::Rgb(190, 145, 255),
+    Color::Rgb(255, 130, 220),
+];
+
+fn subagent_id_color(id: &str) -> Color {
+    let hash = id.bytes().fold(0x811c9dc5u32, |hash, byte| {
+        hash.wrapping_mul(0x01000193) ^ u32::from(byte)
+    });
+    SUBAGENT_ID_COLORS[(hash as usize) % SUBAGENT_ID_COLORS.len()]
+}
+
+fn draw_subagent_list(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
     if area.is_empty() {
         return;
     }
-
-    let overlay_style = Style::default()
-        .fg(SUBAGENT_OVERLAY_COLOR)
-        .bg(SUBAGENT_OVERLAY_BACKGROUND);
-    let block = Block::default()
-        .title("Subagents")
-        .title_alignment(Alignment::Right)
-        .borders(Borders::ALL)
-        .style(overlay_style)
-        .border_style(overlay_style);
-    let inner = block.inner(area);
-    let lines = state
-        .subagents
-        .iter()
-        .map(|task| {
-            let indicator = subagent_status_indicator(task.status, state);
-            let task_text = redact_secret(&single_line_preview(&task.task), Some(&state.secret));
-            Line::styled(format!("{indicator} {task_text}"), overlay_style)
-        })
-        .collect::<Vec<_>>();
-
-    // The floating panel must erase the transcript below it before its size or
-    // task count changes, otherwise clipped text could remain visible.
     frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines).style(overlay_style), inner);
+    for (index, task) in state.subagents.iter().enumerate() {
+        let selected = state.subagent_focus == Some(index);
+        let id = task.task_id.as_deref().unwrap_or(&task.call_id);
+        let mut style = Style::default().fg(subagent_id_color(id));
+        if selected {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let model = task.model.as_deref().unwrap_or("session");
+        let effort = task.effort.as_deref().unwrap_or("default");
+        let preview = truncate_chars(
+            &task.task.replace(['\n', '\r'], " ↵ "),
+            SUBAGENT_TASK_PREVIEW_CHARS,
+        );
+        let line = format!("{id} · {model} · {effort} · {preview}");
+        frame.render_widget(
+            Paragraph::new(Line::styled(line, style)),
+            Rect::new(area.x, area.y + index as u16, area.width, 1),
+        );
+    }
 }
 
-fn subagent_status_indicator(status: SubagentStatus, state: &UiState) -> String {
-    match status {
-        SubagentStatus::Queued => "○".to_owned(),
-        SubagentStatus::Running => tool_spinner_frame(state),
-        SubagentStatus::Failed => "×".to_owned(),
+fn draw_subagent_stream_overlay(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
+    let Some(index) = state.subagent_focus else {
+        return;
+    };
+    let Some(task) = state.subagents.get(index) else {
+        return;
+    };
+    if area.is_empty() {
+        return;
     }
+    let style = Style::default().fg(SUBAGENT_OVERLAY_COLOR);
+    let id = task.task_id.as_deref().unwrap_or("pending");
+    let block = Block::default()
+        .title(format!("Subagent {id}"))
+        .borders(Borders::ALL)
+        .style(style)
+        .border_style(style);
+    let inner = block.inner(area);
+    let mut lines = Vec::new();
+    if task.stream.is_empty() {
+        lines.push(Line::styled("waiting for worker output", style));
+    } else {
+        for item in task
+            .stream
+            .iter()
+            .rev()
+            .take(SUBAGENT_STREAM_MAX_ROWS)
+            .rev()
+        {
+            let line = match item {
+                SubagentStreamItem::Assistant(text) => {
+                    format!("assistant  {}", single_line_preview(text))
+                }
+                SubagentStreamItem::ToolCall {
+                    name, arguments, ..
+                } => format!("→ {name}  {}", call_arguments(arguments)),
+                SubagentStreamItem::ToolResult { name, result, .. } => {
+                    format!("← {name}  {}", format_tool_result(result))
+                }
+            };
+            lines.push(Line::styled(
+                redact_secret(&line, Some(&state.secret)),
+                style,
+            ));
+        }
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).style(style), inner);
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut value: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        value.push('…');
+    }
+    value
 }
 
 fn single_line_preview(text: &str) -> String {
@@ -2349,6 +2767,8 @@ fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
                     cmd_tool_segments(id, arguments, result, state)
                 } else if name == "spawn_subagent" {
                     subagent_tool_segments(id, arguments, state)
+                } else if name == "check_subagent" {
+                    check_subagent_tool_segments(arguments, result, state)
                 } else {
                     generic_tool_segments(name, arguments, result, state)
                 };
@@ -2403,8 +2823,13 @@ fn cmd_tool_segments(
     let command = redact_secret(&command_display(arguments), Some(&state.secret));
     if let Some(result) = result {
         let (icon, status, status_style) = cmd_result_status(result);
-        if status == "done" {
-            return cmd_success_segments(call_id, &format!("{icon} cmd  $ {command}"), state);
+        if status == "done" || state.cmd_result_started_at.contains_key(call_id) {
+            let text = if status == "done" {
+                format!("{icon} cmd  $ {command}")
+            } else {
+                format!("{icon} cmd  $ {command}  → {status}")
+            };
+            return cmd_result_segments(call_id, &text, cmd_result_target_color(result), state);
         }
         vec![
             (format!("{icon} cmd  $ {command}  → "), status_style),
@@ -2418,17 +2843,22 @@ fn cmd_tool_segments(
     }
 }
 
-/// During the brief post-success window, turn the compact `cmd` line from the
-/// pending orange into green one character at a time. A few adjacent
-/// characters blend at the leading edge so the visual is a true gradient,
-/// rather than a hard colour boundary.
-fn cmd_success_segments(call_id: &str, text: &str, state: &UiState) -> Vec<(String, Style)> {
+/// During the brief post-result window, turn the compact `cmd` line from the
+/// pending orange into its final result colour one character at a time. A few
+/// adjacent characters blend at the leading edge so the visual is a true
+/// gradient, rather than a hard colour boundary.
+fn cmd_result_segments(
+    call_id: &str,
+    text: &str,
+    target: Color,
+    state: &UiState,
+) -> Vec<(String, Style)> {
     let now = Instant::now();
-    let started_at = state.cmd_success_started_at.get(call_id).copied();
-    if started_at.is_none_or(|started_at| {
-        now.saturating_duration_since(started_at) >= TOOL_SUCCESS_SWEEP_DURATION
-    }) {
-        return vec![(text.to_owned(), Style::default().fg(Color::Green))];
+    let Some(started_at) = state.cmd_result_started_at.get(call_id).copied() else {
+        return vec![(text.to_owned(), Style::default().fg(target))];
+    };
+    if now.saturating_duration_since(started_at) >= TOOL_RESULT_SWEEP_DURATION {
+        return vec![(text.to_owned(), Style::default().fg(target))];
     }
 
     let character_count = text.chars().count();
@@ -2437,51 +2867,42 @@ fn cmd_success_segments(call_id: &str, text: &str, state: &UiState) -> Vec<(Stri
         .map(|(index, character)| {
             (
                 character.to_string(),
-                Style::default().fg(cmd_success_color_at(
-                    started_at.expect("active success sweep"),
+                Style::default().fg(cmd_result_color_at(
+                    started_at,
                     now,
                     index,
                     character_count,
+                    target,
                 )),
             )
         })
         .collect()
 }
 
-fn cmd_success_color_at(
+fn cmd_result_color_at(
     started_at: Instant,
     now: Instant,
     character_index: usize,
     character_count: usize,
+    target: Color,
 ) -> Color {
     let elapsed = now.saturating_duration_since(started_at);
-    if elapsed >= TOOL_SUCCESS_SWEEP_DURATION {
-        return Color::Green;
+    if elapsed >= TOOL_RESULT_SWEEP_DURATION {
+        return target;
     }
 
-    let progress = elapsed.as_secs_f32() / TOOL_SUCCESS_SWEEP_DURATION.as_secs_f32();
+    let progress = elapsed.as_secs_f32() / TOOL_RESULT_SWEEP_DURATION.as_secs_f32();
     // Start the leading blend at the left edge and carry it past the last
-    // character, so no character has to jump to its settled green at the end.
-    let sweep_distance = character_count as f32 + TOOL_SUCCESS_SWEEP_WIDTH - 1.0;
+    // character, so no character has to jump to its settled result colour.
+    let sweep_distance = character_count as f32 + TOOL_RESULT_SWEEP_WIDTH - 1.0;
     let front = progress * sweep_distance;
     let character_progress =
-        ((front - character_index as f32) / TOOL_SUCCESS_SWEEP_WIDTH).clamp(0.0, 1.0);
+        ((front - character_index as f32) / TOOL_RESULT_SWEEP_WIDTH).clamp(0.0, 1.0);
+    let (target_red, target_green, target_blue) = tool_result_color_rgb(target);
     Color::Rgb(
-        interpolate_color(
-            PENDING_TOOL_COLOR_RGB.0,
-            TOOL_SUCCESS_GREEN_RGB.0,
-            character_progress,
-        ),
-        interpolate_color(
-            PENDING_TOOL_COLOR_RGB.1,
-            TOOL_SUCCESS_GREEN_RGB.1,
-            character_progress,
-        ),
-        interpolate_color(
-            PENDING_TOOL_COLOR_RGB.2,
-            TOOL_SUCCESS_GREEN_RGB.2,
-            character_progress,
-        ),
+        interpolate_color(PENDING_TOOL_COLOR_RGB.0, target_red, character_progress),
+        interpolate_color(PENDING_TOOL_COLOR_RGB.1, target_green, character_progress),
+        interpolate_color(PENDING_TOOL_COLOR_RGB.2, target_blue, character_progress),
     )
 }
 
@@ -2494,53 +2915,62 @@ fn command_display(arguments: &str) -> String {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-        .map(|command| truncate_output(&command))
-        .unwrap_or_else(|| truncate_output(arguments))
+        .map(|command| truncate_tool_call(&command))
+        .unwrap_or_else(|| truncate_tool_call(arguments))
 }
 
-fn cmd_result_succeeded(result: &Value) -> bool {
-    !result
+fn cmd_result_target_color(result: &Value) -> Color {
+    if result
         .get("canceled")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && !result
+        || result
             .get("timed_out")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-        && result.get("error").is_none()
-        && !matches!(result.get("exit_code").and_then(Value::as_i64), Some(code) if code != 0)
+    {
+        return Color::Yellow;
+    }
+    if result.get("error").is_some()
+        || matches!(result.get("exit_code").and_then(Value::as_i64), Some(code) if code != 0)
+    {
+        return Color::Red;
+    }
+    Color::Green
+}
+
+fn tool_result_color_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Green => TOOL_SUCCESS_GREEN_RGB,
+        Color::Red => (255, 0, 0),
+        Color::Yellow => (255, 255, 0),
+        _ => unreachable!("cmd result transition uses a named result colour"),
+    }
 }
 
 fn cmd_result_status(result: &Value) -> (char, String, Style) {
+    let target = cmd_result_target_color(result);
     if result
         .get("canceled")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return (
-            '!',
-            "canceled".to_owned(),
-            Style::default().fg(Color::Yellow),
-        );
+        return ('!', "canceled".to_owned(), Style::default().fg(target));
     }
     if result
         .get("timed_out")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return (
-            '!',
-            "timeout".to_owned(),
-            Style::default().fg(Color::Yellow),
-        );
+        return ('!', "timeout".to_owned(), Style::default().fg(target));
     }
     if result.get("error").is_some() {
-        return ('×', "error".to_owned(), error_style());
+        return ('×', "error".to_owned(), Style::default().fg(target));
     }
     match result.get("exit_code").and_then(Value::as_i64) {
-        Some(0) => ('✓', "done".to_owned(), Style::default().fg(Color::Green)),
-        Some(code) => ('×', format!("exit {code}"), error_style()),
-        None => ('✓', "done".to_owned(), Style::default().fg(Color::Green)),
+        Some(0) => ('✓', "done".to_owned(), Style::default().fg(target)),
+        Some(code) => ('×', format!("exit {code}"), Style::default().fg(target)),
+        None => ('✓', "done".to_owned(), Style::default().fg(target)),
     }
 }
 
@@ -2548,7 +2978,7 @@ fn subagent_task_from_arguments(arguments: &str) -> String {
     serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|value| value.get("task").and_then(Value::as_str).map(str::to_owned))
-        .map(|task| truncate_output(&task))
+        .map(|task| truncate_tool_call(&task))
         .unwrap_or_else(|| command_display(arguments))
 }
 
@@ -2557,25 +2987,68 @@ fn subagent_tool_segments(call_id: &str, arguments: &str, state: &UiState) -> Ve
     let task = live_task
         .map(|task| task.task.clone())
         .unwrap_or_else(|| subagent_task_from_arguments(arguments));
-    let task = redact_secret(&truncate_output(&task), Some(&state.secret));
+    let task = redact_secret(&truncate_tool_call(&task), Some(&state.secret));
     let (status, style) = if let Some(task) = live_task {
-        let status = if task.status == SubagentStatus::Running {
-            running_tool_status(state)
+        if task.creation_completed {
+            ("completed".to_owned(), Style::default().fg(Color::Green))
         } else {
-            subagent_status_display(task.status, state)
-        };
-        (status, subagent_status_style(task.status))
+            let status = if task.status == SubagentStatus::Running {
+                running_tool_status(state)
+            } else {
+                subagent_status_display(task.status, state)
+            };
+            (status, subagent_status_style(task.status))
+        }
+    } else if state.failed_subagent_calls.contains(call_id) {
+        ("error".to_owned(), Style::default().fg(Color::Red))
     } else if state.completed_subagent_calls.contains(call_id) {
         ("completed".to_owned(), Style::default().fg(Color::Green))
     } else {
         ("queued".to_owned(), pending_tool_call_style())
     };
-    let separator = if live_task.is_some_and(|task| task.status == SubagentStatus::Running) {
+    let separator = if live_task
+        .is_some_and(|task| task.status == SubagentStatus::Running && !task.creation_completed)
+    {
         "  "
     } else {
         "  → "
     };
     vec![(format!("↗ subagent  {task}{separator}{status}"), style)]
+}
+
+fn check_subagent_tool_segments(
+    arguments: &str,
+    result: Option<&Value>,
+    state: &UiState,
+) -> Vec<(String, Style)> {
+    let task_id = serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "invalid task".to_owned());
+    let task_id = redact_secret(&task_id, Some(&state.secret));
+    let text = if let Some(result) = result {
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        let style = if status == "completed" {
+            Style::default().fg(Color::Green)
+        } else {
+            tool_result_style()
+        };
+        return vec![(format!("⌕ check  {task_id}  → {status}"), style)];
+    } else {
+        format!("⌕ check  {task_id}  ")
+    };
+    vec![(
+        text + &tool_spinner_frame(state).to_string(),
+        pending_tool_call_style(),
+    )]
 }
 
 fn generic_tool_segments(
@@ -2637,19 +3110,29 @@ fn is_result_attached_to_call(transcript: &[TranscriptItem], result_index: usize
     )
 }
 
+const TOOL_CALL_PREVIEW_CHARS: usize = 100;
+
+fn truncate_tool_call(output: &str) -> String {
+    let mut result: String = output.chars().take(TOOL_CALL_PREVIEW_CHARS).collect();
+    if output.chars().count() > TOOL_CALL_PREVIEW_CHARS {
+        result.push('…');
+    }
+    result
+}
+
 /// Render tool call arguments as the command string inside double quotes, for
-/// example `"cat README.md"`. Previews are truncated to the same limit as tool
-/// results; malformed arguments fall back to truncated raw text.
+/// example `"cat README.md"`. Tool-call previews are limited to 100 characters;
+/// malformed arguments fall back to the same bounded raw-text preview.
 fn call_arguments(arguments: &str) -> String {
     let parsed: Value = match serde_json::from_str(arguments) {
         Ok(value) => value,
-        Err(_) => return truncate_output(arguments),
+        Err(_) => return truncate_tool_call(arguments),
     };
     if let Some(command) = parsed.get("command").and_then(Value::as_str) {
-        return format!("\"{}\"", truncate_output(command));
+        return format!("\"{}\"", truncate_tool_call(command));
     }
     let serialized = serde_json::to_string(&parsed).unwrap_or_else(|_| arguments.to_owned());
-    truncate_output(&serialized)
+    truncate_tool_call(&serialized)
 }
 
 /// Render a tool result as a single-line JSON-string-array literal containing
@@ -2780,6 +3263,69 @@ fn format_context_tokens(tokens: usize) -> String {
     }
 }
 
+fn model_status_line(
+    state: &UiState,
+    effort: &str,
+    activity_text: &str,
+    elapsed: Duration,
+    now: Instant,
+) -> Line<'static> {
+    let model = redact_secret(&state.model, Some(&state.secret));
+    let effort = redact_secret(effort, Some(&state.secret));
+    let prefix = format!("{model} · {effort}");
+    let activity_start = prefix.chars().count() + usize::from(!activity_text.is_empty());
+    let text = if activity_text.is_empty() {
+        prefix
+    } else {
+        format!("{prefix} {activity_text}")
+    };
+    let busy = matches!(state.status.as_str(), "working" | "compacting");
+    let settling = state.status == "ready"
+        && state
+            .activity_transition
+            .as_ref()
+            .is_some_and(|transition| transition_progress(now, transition) < 1.0);
+    let animated = (busy || settling) && !activity_text.is_empty();
+    let character_count = text.chars().count().max(1);
+
+    let spans: Vec<Span<'static>> = text
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            let style = if animated {
+                let target = if state.status == "compacting" {
+                    PENDING_TOOL_COLOR
+                } else {
+                    working_gradient_color_for_status(state, elapsed, index, character_count)
+                };
+                Style::default().fg(activity_color_at(state, target, now))
+            } else if !activity_text.is_empty() && index >= activity_start {
+                activity_style_at_now(state, elapsed, now)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Span::styled(character.to_string(), style)
+        })
+        .collect();
+
+    Line::from(spans)
+}
+
+fn working_gradient_color_for_status(
+    state: &UiState,
+    elapsed: Duration,
+    index: usize,
+    character_count: usize,
+) -> Color {
+    let gradient_elapsed = if state.status == "ready" {
+        state.last_active_elapsed
+    } else {
+        elapsed
+    };
+    working_gradient_color_at(gradient_elapsed, index, character_count.max(1))
+}
+
+#[cfg(test)]
 fn activity_line_at<'a>(
     state: &UiState,
     text: &'a str,
@@ -2825,11 +3371,6 @@ fn activity_line_at<'a>(
         }
         _ => Line::styled(text, activity_style_at_now(state, elapsed, now)),
     }
-}
-
-#[cfg(test)]
-fn activity_style_at(state: &UiState, elapsed: Duration) -> Style {
-    activity_style_at_now(state, elapsed, Instant::now())
 }
 
 fn activity_style_at_now(state: &UiState, elapsed: Duration, now: Instant) -> Style {
@@ -2953,7 +3494,7 @@ fn working_gradient_color_at(
     character_index: usize,
     character_count: usize,
 ) -> Color {
-    const SWEEP_WIDTH: f64 = 0.35;
+    const SWEEP_WIDTH: f64 = 0.65;
 
     let position = elapsed.as_secs_f64() / WORKING_GRADIENT_CYCLE.as_secs_f64()
         + character_index as f64 / character_count.max(1) as f64 * SWEEP_WIDTH;
@@ -3259,7 +3800,7 @@ mod tests {
     #[test]
     fn activity_indicator_uses_only_contiguous_block_bars() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        assert_eq!(activity_text(&state), "▁▁▁▁▁");
+        assert_eq!(activity_text(&state), "");
 
         state.set_status("working");
         let working = activity_text(&state);
@@ -3383,7 +3924,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(colors.first(), Some(&Color::Rgb(228, 40, 120)));
-        assert_eq!(colors.last(), Some(&Color::Rgb(232, 43, 89)));
+        assert_eq!(colors.last(), Some(&Color::Rgb(235, 47, 64)));
         assert!(colors.windows(2).all(|pair| pair[0] != pair[1]));
 
         let (start, end, _) = working_gradient_colors_at(1.0);
@@ -3511,6 +4052,7 @@ mod tests {
 
         let line = welcome_line();
         assert_eq!(line.to_string(), WELCOME_MESSAGE);
+        assert_eq!(WELCOME_VERSION, concat!("v", env!("CARGO_PKG_VERSION")));
         assert_eq!(
             line.spans.first().and_then(|span| span.style.fg),
             Some(Color::Rgb(
@@ -3527,6 +4069,30 @@ mod tests {
                 WELCOME_END_COLOR.2,
             ))
         );
+    }
+
+    #[test]
+    fn welcome_renders_the_gray_version_on_the_bottom_chat_row() {
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw welcome screen");
+
+        let chat_area = ui_layout(&state, tui_viewport(area)).0;
+        let version_width = WELCOME_VERSION.chars().count() as u16;
+        let version_x = chat_area.x + (chat_area.width - version_width) / 2;
+        let version_y = chat_area.y + chat_area.height - 1;
+        let buffer = terminal.backend().buffer();
+        let rendered_version = (version_x..version_x + version_width)
+            .map(|x| buffer[(x, version_y)].symbol())
+            .collect::<String>();
+        assert_eq!(rendered_version, WELCOME_VERSION);
+        assert!((version_x..version_x + version_width)
+            .all(|x| buffer[(x, version_y)].fg == Color::DarkGray));
     }
 
     #[test]
@@ -3738,6 +4304,31 @@ mod tests {
     }
 
     #[test]
+    fn multiline_input_arrows_move_cursor_between_explicit_and_wrapped_rows() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.input = "ab\ncd\nef".to_owned();
+        state.cursor = 1;
+
+        assert!(move_input_cursor_vertical(&mut state, 10, true));
+        assert_eq!(
+            state.cursor, 4,
+            "preserve the column on the next explicit row"
+        );
+        assert!(move_input_cursor_vertical(&mut state, 10, true));
+        assert_eq!(state.cursor, 7);
+        assert!(!move_input_cursor_vertical(&mut state, 10, true));
+        assert!(move_input_cursor_vertical(&mut state, 10, false));
+        assert_eq!(state.cursor, 4);
+
+        state.input = "abcdef".to_owned();
+        state.cursor = 1;
+        assert!(move_input_cursor_vertical(&mut state, 3, true));
+        assert_eq!(state.cursor, 4, "wrapped rows use the same visual column");
+        assert!(move_input_cursor_vertical(&mut state, 3, false));
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
     fn completion_event_does_not_release_input_before_worker_finishes() {
         let history = [SessionHistoryRecord::Message {
             timestamp: 1,
@@ -3862,12 +4453,12 @@ mod tests {
         let halfway = started_at + Duration::from_millis(175);
 
         assert_eq!(
-            cmd_success_color_at(started_at, started_at, 0, character_count),
+            cmd_result_color_at(started_at, started_at, 0, character_count, Color::Green),
             PENDING_TOOL_COLOR,
             "a new success must retain the pending orange at the sweep start"
         );
         assert_eq!(
-            cmd_success_color_at(started_at, halfway, 0, character_count),
+            cmd_result_color_at(started_at, halfway, 0, character_count, Color::Green),
             Color::Rgb(
                 TOOL_SUCCESS_GREEN_RGB.0,
                 TOOL_SUCCESS_GREEN_RGB.1,
@@ -3876,16 +4467,17 @@ mod tests {
             "the left edge completes before the rest of the line"
         );
         assert_eq!(
-            cmd_success_color_at(started_at, halfway, 9, character_count),
+            cmd_result_color_at(started_at, halfway, 9, character_count, Color::Green),
             PENDING_TOOL_COLOR,
             "the right edge remains orange until the sweep reaches it"
         );
         assert_eq!(
-            cmd_success_color_at(
+            cmd_result_color_at(
                 started_at,
-                started_at + TOOL_SUCCESS_SWEEP_DURATION,
+                started_at + TOOL_RESULT_SWEEP_DURATION,
                 9,
                 character_count,
+                Color::Green,
             ),
             Color::Green,
             "the completed sweep settles on the existing success green"
@@ -3893,7 +4485,7 @@ mod tests {
     }
 
     #[test]
-    fn only_live_successful_cmd_results_start_a_success_sweep() {
+    fn only_live_cmd_results_start_a_result_sweep() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
         let succeeded = serde_json::json!({"exit_code": 0});
 
@@ -3901,9 +4493,81 @@ mod tests {
         state.add_live_tool_result("success", "cmd", succeeded);
         state.add_live_tool_result("failed", "cmd", serde_json::json!({"exit_code": 1}));
 
-        assert!(!state.cmd_success_started_at.contains_key("historic"));
-        assert!(state.cmd_success_started_at.contains_key("success"));
-        assert!(!state.cmd_success_started_at.contains_key("failed"));
+        assert!(!state.cmd_result_started_at.contains_key("historic"));
+        assert!(state.cmd_result_started_at.contains_key("success"));
+        assert!(state.cmd_result_started_at.contains_key("failed"));
+    }
+
+    #[test]
+    fn cmd_result_sweeps_to_failure_red_with_intermediate_gradient() {
+        let started_at = Instant::now();
+        let character_count = 12;
+        let halfway = started_at + TOOL_RESULT_SWEEP_DURATION / 2;
+
+        assert_eq!(
+            cmd_result_color_at(started_at, started_at, 0, character_count, Color::Red),
+            PENDING_TOOL_COLOR,
+        );
+        let intermediate = cmd_result_color_at(started_at, halfway, 6, character_count, Color::Red);
+        assert_ne!(intermediate, PENDING_TOOL_COLOR);
+        assert_ne!(intermediate, Color::Red);
+        assert_eq!(
+            cmd_result_color_at(started_at, halfway, 0, character_count, Color::Red),
+            Color::Rgb(255, 0, 0),
+            "the leading edge reaches the failure colour first"
+        );
+        assert_eq!(
+            cmd_result_color_at(
+                started_at,
+                halfway,
+                character_count - 1,
+                character_count,
+                Color::Red,
+            ),
+            PENDING_TOOL_COLOR,
+            "the right edge remains at the starting colour"
+        );
+        assert_eq!(
+            cmd_result_color_at(
+                started_at,
+                started_at + TOOL_RESULT_SWEEP_DURATION,
+                character_count - 1,
+                character_count,
+                Color::Red,
+            ),
+            Color::Red,
+        );
+    }
+
+    #[test]
+    fn live_failed_cmd_sweep_keeps_the_final_status_text() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let result = serde_json::json!({"exit_code": 1});
+        state.add_live_tool_result("failed", "cmd", result.clone());
+
+        let segments = cmd_tool_segments("failed", r#"{"command":"bad"}"#, Some(&result), &state);
+        let text = segments
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>();
+
+        assert_eq!(text, "× cmd  $ bad  → exit 1");
+    }
+
+    #[test]
+    fn cmd_result_target_colors_follow_the_final_status() {
+        assert_eq!(
+            cmd_result_target_color(&serde_json::json!({"exit_code": 0})),
+            Color::Green
+        );
+        assert_eq!(
+            cmd_result_target_color(&serde_json::json!({"exit_code": 1})),
+            Color::Red
+        );
+        assert_eq!(
+            cmd_result_target_color(&serde_json::json!({"timed_out": true})),
+            Color::Yellow
+        );
     }
 
     #[test]
@@ -3951,7 +4615,7 @@ mod tests {
 
     #[test]
     fn cmd_line_truncates_long_commands_but_never_renders_output() {
-        let command = "a".repeat(80);
+        let command = "a".repeat(120);
         let arguments = serde_json::json!({"command": command}).to_string();
         let history = vec![
             SessionHistoryRecord::Message {
@@ -3976,8 +4640,8 @@ mod tests {
         ];
         let state = UiState::from_history(&history, "secret", "model", None, false);
         let text = transcript_lines(&state, 200)[0].to_string();
-        assert!(text.contains(&format!("$ {}…", "a".repeat(50))));
-        assert!(!text.contains(&"a".repeat(51)));
+        assert!(text.contains(&format!("$ {}…", "a".repeat(100))));
+        assert!(!text.contains(&"a".repeat(101)));
         assert!(!text.contains("output"));
     }
 
@@ -4094,7 +4758,7 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_status_is_in_the_bottom_status_line_below_the_prompt_gradient() {
+    fn main_agent_status_attaches_busy_indicator_to_model_and_hides_it_when_idle() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
         let area = Rect::new(0, 0, 80, 10);
         let mut terminal =
@@ -4104,94 +4768,61 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &state))
             .expect("draw ready status");
-        let (_, _, _, _, input_area, status_area) = ui_layout(&state, tui_viewport(area));
-        let buffer = terminal.backend().buffer();
-        let activity_width = UnicodeWidthStr::width(activity_text(&state).as_str()) as u16;
-        let activity_start = status_area.x
-            + status_area
-                .width
-                .saturating_sub(activity_width)
-                .saturating_add(1)
-                / 2;
-        let rendered_status = (activity_start..activity_start + activity_width)
-            .map(|x| buffer[(x, status_area.y)].symbol())
-            .collect::<String>();
-        assert_eq!(rendered_status, activity_text(&state));
-        let left_status = (status_area.x..activity_start)
-            .map(|x| buffer[(x, status_area.y)].symbol())
-            .collect::<String>();
-        assert!(left_status.contains("model (default)"));
-        assert_eq!(
-            buffer[(activity_start - 1, status_area.y)].symbol(),
-            " ",
-            "the READY indicator uses five lowest bars without text"
-        );
         let viewport = tui_viewport(area);
+        let (_, _, _, _, _input_area, status_area) = ui_layout(&state, viewport);
+        let buffer = terminal.backend().buffer();
+        let idle_row = (status_area.x..status_area.x + status_area.width)
+            .map(|x| buffer[(x, status_area.y)].symbol())
+            .collect::<String>();
+        assert!(idle_row.starts_with("model · default"));
+        assert!(!idle_row.contains("▁▁▁▁▁"));
+        assert_eq!(buffer[(status_area.x, status_area.y)].fg, Color::DarkGray);
+
+        state.set_status("working");
+        state.busy = true;
+        // Sample the steady working gradient rather than the entry ramp so
+        // this assertion checks the full left-to-right statusline flow.
+        state.activity_transition = None;
+        state.activity_started_at = Instant::now() - Duration::from_secs(1);
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw working status");
+        let (_, _, _, _, _input_area, status_area) = ui_layout(&state, viewport);
+        let buffer = terminal.backend().buffer();
+        let activity = activity_text(&state);
+        let expected_prefix = format!("{} · default ", state.model);
+        let expected_line = format!("{expected_prefix}{activity}");
+        let rendered_line = (status_area.x..status_area.x + expected_line.chars().count() as u16)
+            .map(|x| buffer[(x, status_area.y)].symbol())
+            .collect::<String>();
+        assert_eq!(rendered_line, expected_line);
+        let prefix_width = expected_prefix.chars().count() as u16;
         assert_eq!(
-            input_area.x, viewport.x,
-            "the prompt begins after the left TUI gutter"
+            buffer[(status_area.x + prefix_width - 1, status_area.y)].symbol(),
+            ' '.to_string()
         );
-        assert_eq!(input_area.width, viewport.width);
-        assert_eq!(input_area.y + input_area.height, status_area.y);
-        assert_eq!(
-            buffer[(activity_start, status_area.y)].fg,
-            activity_style_at(&state, Duration::ZERO)
-                .fg
-                .expect("ready status colour")
+        assert!(
+            (0..expected_line.chars().count() as u16).all(|offset| {
+                buffer[(status_area.x + offset, status_area.y)].fg != Color::DarkGray
+            }),
+            "the model, separator, effort, and busy indicator share the animated colour flow"
+        );
+        assert!(
+            (0..expected_line.chars().count() as u16 - 1).any(|offset| {
+                buffer[(status_area.x + offset, status_area.y)].fg
+                    != buffer[(status_area.x + offset + 1, status_area.y)].fg
+            }),
+            "the statusline uses a left-to-right gradient rather than one flat colour"
         );
 
-        // A multiline prompt grows above the status line without moving the
-        // status indicator into the input area.
         state.input = "first\nsecond\nthird".to_owned();
         state.cursor = state.input.chars().count();
         terminal
             .draw(|frame| draw(frame, &state))
-            .expect("draw multiline ready status");
-        let (_, _, _, _, input_area, status_area) = ui_layout(&state, tui_viewport(area));
-        let buffer = terminal.backend().buffer();
-        assert!(
-            input_area.height > 3,
-            "the prompt should have grown vertically"
-        );
-        assert_eq!(
-            (activity_start..activity_start + activity_width)
-                .map(|x| buffer[(x, status_area.y)].symbol())
-                .collect::<String>(),
-            "▁▁▁▁▁",
-            "the READY bars remain centered as the prompt grows"
-        );
+            .expect("draw multiline working status");
+        let (_, _, _, _, input_area, status_area) = ui_layout(&state, viewport);
+        assert!(input_area.height > 3);
         assert_eq!(input_area.y + input_area.height, status_area.y);
-
-        state.set_status("working");
-        state.busy = true;
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw working status");
-        let (_, _, _, _, _input_area, status_area) = ui_layout(&state, tui_viewport(area));
-        let buffer = terminal.backend().buffer();
-        let activity_width = UnicodeWidthStr::width(activity_text(&state).as_str()) as u16;
-        let activity_start = status_area.x
-            + status_area
-                .width
-                .saturating_sub(activity_width)
-                .saturating_add(1)
-                / 2;
-        assert_eq!(
-            buffer[(activity_start, status_area.y)].fg,
-            activity_style_at(&state, Duration::ZERO)
-                .fg
-                .expect("working status colour")
-        );
-        assert!(
-            PULSE_LEVELS.contains(
-                &buffer[(activity_start, status_area.y)]
-                    .symbol()
-                    .chars()
-                    .next()
-                    .expect("pulse bar")
-            ),
-            "the pulse indicator begins at the exact status-line center"
-        );
     }
 
     #[test]
@@ -4605,150 +5236,214 @@ mod tests {
     }
 
     #[test]
-    fn subagent_overlay_is_upper_right_one_third_wide_and_grows_per_task() {
+    fn subagent_list_reserves_rows_between_prompt_and_status() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        for task_id in ["subagent-1", "subagent-2", "subagent-3"] {
-            state.subagents.push(SubagentTask {
-                call_id: format!("call-{task_id}"),
-                task_id: Some(task_id.to_owned()),
-                task: format!("Inspect {task_id}"),
-                model: None,
-                effort: None,
-                status: SubagentStatus::Queued,
-                result: None,
-            });
-        }
-
-        let area = Rect::new(0, 0, 120, 20);
-        let overlay = subagent_overlay_area(&state, area).expect("subagent overlay");
-        assert_eq!(overlay, Rect::new(80, 0, 40, 5));
-
-        // The overlay floats above the transcript and does not steal rows from
-        // the input, queue, or status layout.
-        let (chat, _, layout_overlay, _, input, status) = ui_layout(&state, area);
-        assert_eq!(layout_overlay, Some(overlay));
-        assert_eq!(chat.height, 16);
-        assert_eq!(input.y, 16);
-        assert_eq!(status.y, 19);
-
-        let empty = UiState::from_history(&[], "secret", "model", None, false);
-        assert_eq!(subagent_overlay_area(&empty, area), None);
-    }
-
-    #[test]
-    fn subagent_overlay_stays_above_the_picker_without_breaking_its_left_border() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["alpha".to_owned()]);
-        state.input = "/".to_owned();
-        for index in 0..14 {
-            state.subagents.push(SubagentTask {
-                call_id: format!("call-{index}"),
-                task_id: Some(format!("subagent-{index}")),
-                task: format!("Inspect task {index}"),
-                model: None,
-                effort: None,
-                status: SubagentStatus::Queued,
-                result: None,
-            });
-        }
-
-        let full_area = Rect::new(0, 0, 120, 20);
-        let area = tui_viewport(full_area);
-        let (_, picker_area, overlay_area, _, _, _) = ui_layout(&state, area);
-        let picker_area = picker_area.expect("skill picker");
-        let overlay_area = overlay_area.expect("subagent overlay");
-        assert!(
-            picker_area.y > overlay_area.y && picker_area.y < overlay_area.y + overlay_area.height,
-            "the picker must overlap the task overlay for this layering check"
-        );
-
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
-            full_area.width,
-            full_area.height,
-        ))
-        .expect("test terminal");
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw overlapping picker and overlay");
-
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(overlay_area.x, overlay_area.y)].symbol(), "┌");
-        assert_eq!(
-            buffer[(overlay_area.x, picker_area.y)].symbol(),
-            "│",
-            "the later picker render must not cut through the overlay left border"
-        );
-        assert_eq!(
-            buffer[(overlay_area.x, picker_area.y)].bg,
-            SUBAGENT_OVERLAY_BACKGROUND
-        );
-    }
-
-    #[test]
-    fn subagent_overlay_uses_magenta_one_line_indicators_without_status_words() {
-        let mut state = UiState::from_history(&[], "provider-secret", "model", None, false);
         state.subagents.push(SubagentTask {
             call_id: "call-worker".to_owned(),
             task_id: Some("subagent-1".to_owned()),
-            task: "Inspect the command UI".to_owned(),
+            task: "Inspect the command UI and report findings".to_owned(),
             model: Some("worker-model".to_owned()),
             effort: Some("high".to_owned()),
             status: SubagentStatus::Running,
             result: None,
+            creation_completed: true,
+            stream: Vec::new(),
+            stream_chars: 0,
         });
-        let full_area = Rect::new(0, 0, 120, 20);
-        let area = tui_viewport(full_area);
-        let overlay = subagent_overlay_area(&state, area).expect("subagent overlay");
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
-            full_area.width,
-            full_area.height,
-        ))
-        .expect("test terminal");
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw subagent overlay");
+        let area = Rect::new(0, 0, 80, 20);
+        let (_, _, _, _, input, status) = ui_layout(&state, area);
+        let list = subagent_list_area(&state, input).expect("worker list");
+        let prompt = prompt_area(input, &state);
+        assert_eq!(list.y, input.y);
+        assert_eq!(list.y + list.height, prompt.y);
+        assert_eq!(status.y, input.y + input.height);
 
-        assert_eq!(overlay.width, area.width / 3);
-        assert_eq!(overlay.x + overlay.width, area.x + area.width);
-        assert_eq!(overlay.y, area.y);
-        assert_eq!(overlay.height, 3, "one task plus the two border rows");
-
-        let buffer = terminal.backend().buffer();
-        let screen = buffer
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &state)).expect("draw");
+        let screen = terminal
+            .backend()
+            .buffer()
             .content()
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("Subagents"));
+        assert!(screen.contains("subagent-1"));
+        assert!(screen.contains("worker-model"));
+        assert!(screen.contains("high"));
         assert!(screen.contains("Inspect the command UI"));
-        assert!(!screen.contains("running"));
-        assert!(!screen.contains("working"));
-        assert!(!screen.contains("workers"));
-        assert!(!screen.contains("subagent-1"));
-        assert!(!screen.contains("worker-model"));
-        assert!(!screen.contains("provider-secret"));
+    }
+
+    #[test]
+    fn subagent_rows_use_stable_id_hash_colors() {
         assert_eq!(
-            buffer[(overlay.x + 1, overlay.y + 1)].fg,
-            SUBAGENT_OVERLAY_COLOR
+            subagent_id_color("subagent-1"),
+            subagent_id_color("subagent-1")
         );
+        assert_ne!(
+            subagent_id_color("subagent-1"),
+            subagent_id_color("subagent-2")
+        );
+
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 2)).expect("test terminal");
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state = state;
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Running,
+            result: None,
+            creation_completed: true,
+            stream: Vec::new(),
+            stream_chars: 0,
+        });
+        terminal
+            .draw(|frame| draw_subagent_list(frame, &state, Rect::new(0, 0, 80, 1)))
+            .expect("draw subagent list");
         assert_eq!(
-            buffer[(overlay.x + 1, overlay.y + 1)].bg,
-            SUBAGENT_OVERLAY_BACKGROUND
+            terminal.backend().buffer()[(0, 0)].fg,
+            subagent_id_color("subagent-1")
         );
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn focused_subagent_renders_live_stream_in_picker_slot() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Running,
+            result: None,
+            creation_completed: true,
+            stream: Vec::new(),
+            stream_chars: 0,
+        });
+        state.apply_subagent_activity(SubagentActivity::AssistantDelta {
+            task_id: "subagent-1".to_owned(),
+            text: "worker output".to_owned(),
+        });
+        assert!(state.focus_subagent_list_from_input());
+        let area = Rect::new(0, 0, 80, 20);
+        let (_, picker, stream, _, input, _) = ui_layout(&state, area);
+        let stream = stream.expect("stream overlay");
+        assert_eq!(stream.y + stream.height, input.y);
+        assert!(
+            picker.is_none(),
+            "focused worker replaces the skill overlay slot"
+        );
+
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &state)).expect("draw");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Subagent subagent-1"));
+        assert!(screen.contains("worker output"));
         assert_eq!(
-            buffer[(overlay.x, overlay.y)].bg,
-            SUBAGENT_OVERLAY_BACKGROUND
+            terminal.backend().buffer()[(stream.x + 1, stream.y + 1)].bg,
+            Color::Reset
         );
-        assert_eq!(
-            buffer[(overlay.x, overlay.y)].symbol(),
-            "┌",
-            "the upper-left corner remains visible above other TUI layers"
-        );
-        assert_eq!(
-            buffer[(overlay.x, overlay.y + 1)].symbol(),
-            "│",
-            "the left border remains continuous below the corner"
-        );
+    }
+
+    #[test]
+    fn subagent_focus_moves_between_prompt_and_list_with_spatial_arrows() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.input = "prompt".to_owned();
+        state.cursor = state.input.chars().count();
+        state.subagents.push(SubagentTask {
+            call_id: "call-one".to_owned(),
+            task_id: Some("one".to_owned()),
+            task: "one".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Running,
+            result: None,
+            creation_completed: true,
+            stream: Vec::new(),
+            stream_chars: 0,
+        });
+        assert!(input_cursor_on_first_row(&state, 20));
+        assert!(state.focus_subagent_list_from_input());
+        assert_eq!(state.subagent_focus, Some(0));
+        assert!(state.move_subagent_focus(false));
+        assert_eq!(state.subagent_focus, Some(0));
+        assert!(state.move_subagent_focus(true));
+        assert_eq!(state.subagent_focus, None);
+        assert!(state.focus_subagent_list_from_input());
+        state.clear_subagent_focus();
+        assert_eq!(state.subagent_focus, None);
+    }
+
+    #[test]
+    fn spawn_card_completes_on_successful_creation_while_worker_remains_live() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-worker".to_owned(),
+                        name: "spawn_subagent".to_owned(),
+                        arguments: serde_json::json!({"task":"Inspect"}).to_string(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-worker".to_owned(),
+                    "spawn_subagent".to_owned(),
+                    serde_json::json!({"task_id":"subagent-1","status":"queued"}).to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "model", None, false);
+        assert_eq!(state.subagents.len(), 1);
+        let line = transcript_lines(&state, 100)[0].to_string();
+        assert!(line.contains("→ completed"));
+        assert!(!line.contains("running"));
+    }
+
+    #[test]
+    fn check_subagent_uses_a_compact_one_line_card() {
+        let history = vec![
+            SessionHistoryRecord::Message {
+                timestamp: 1,
+                message: ChatMessage::assistant(
+                    String::new(),
+                    vec![crate::model::ChatToolCall {
+                        id: "call-check".to_owned(),
+                        name: "check_subagent".to_owned(),
+                        arguments: serde_json::json!({"task_id":"subagent-1"}).to_string(),
+                    }],
+                ),
+            },
+            SessionHistoryRecord::Message {
+                timestamp: 2,
+                message: ChatMessage::tool(
+                    "call-check".to_owned(),
+                    "check_subagent".to_owned(),
+                    serde_json::json!({"task_id":"subagent-1","status":"running"}).to_string(),
+                ),
+            },
+        ];
+        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let line = transcript_lines(&state, 100)[0].to_string();
+        assert_eq!(line, "⌕ check  subagent-1  → running");
+        assert!(!line.contains("[tool:"));
     }
 }
 
@@ -4980,8 +5675,8 @@ mod skill_picker_tests {
             .collect::<String>();
         assert!(screen.contains("/a"));
         assert!(
-            screen.contains("▁▁▁▁▁"),
-            "the READY bars remain in the bottom status line below the picker/input"
+            !screen.contains("▁▁▁▁▁"),
+            "the idle indicator is hidden from the status line"
         );
     }
 

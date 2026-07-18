@@ -18,7 +18,7 @@ decisions:
     depends_on: []
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-18'
+    last_reviewed: '2026-07-19'
   - id: harness.command-execution
     status: accepted
     scope: harness
@@ -41,8 +41,9 @@ decisions:
     status: accepted
     scope: harness
     decision_type: configuration
-    summary: Lucy bootstraps a user-editable ~/.lucy/config.toml and reads provider
-      credentials only from the environment.
+    summary: Lucy bootstraps a user-editable XDG config file, migrates the legacy
+      ~/.lucy/config.toml once when needed, and reads provider credentials only from
+      the environment.
     applies_to:
       - src/**
       - tests/**
@@ -53,7 +54,7 @@ decisions:
       - harness.agent-boundary-and-protocol
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-17'
+    last_reviewed: '2026-07-19'
   - id: harness.session-and-context-lifecycle
     status: accepted
     scope: harness
@@ -71,4 +72,4 @@ decisions:
       - harness.configuration-and-provider
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-17'
+    last_reviewed: '2026-07-19'

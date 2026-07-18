@@ -112,10 +112,17 @@ impl Config {
 
     pub fn ensure_exists(home: &Path) -> Result<(), ConfigError> {
         let path = config_path(home);
-        ensure_private_dir(&lucy_dir(home))?;
+        ensure_private_dir(&config_dir(home))?;
         ensure_not_symlink(&path)?;
 
-        if !path.exists() && generated_config_contains_active_key() {
+        if !path.exists() {
+            migrate_legacy_config(home, &path)?;
+        }
+        if path.exists() {
+            ensure_private_file(&path)?;
+            return Ok(());
+        }
+        if generated_config_contains_active_key() {
             return Err(ConfigError::new("configuration bootstrap rejected"));
         }
 
@@ -211,12 +218,70 @@ impl Config {
     }
 }
 
+/// Return Lucy's XDG configuration directory. An unset, empty, or relative
+/// `XDG_CONFIG_HOME` falls back to the standard `$HOME/.config` location.
+pub fn config_dir(home: &Path) -> PathBuf {
+    config_dir_from_xdg_home(home, std::env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+fn config_dir_from_xdg_home(home: &Path, xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    xdg_config_home
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("lucy")
+}
+
+/// Lucy's legacy state directory. Sessions intentionally remain here while
+/// user-editable configuration moves to the XDG configuration directory.
+pub fn lucy_dir(home: &Path) -> PathBuf {
+    home.join(".lucy")
+}
+
 pub fn config_path(home: &Path) -> PathBuf {
+    config_dir(home).join("config.toml")
+}
+
+fn legacy_config_path(home: &Path) -> PathBuf {
     home.join(".lucy").join("config.toml")
 }
 
-pub fn lucy_dir(home: &Path) -> PathBuf {
-    home.join(".lucy")
+fn migrate_legacy_config(home: &Path, destination: &Path) -> Result<(), ConfigError> {
+    let legacy = legacy_config_path(home);
+    let legacy_dir = legacy.parent().expect("legacy config has a parent");
+    ensure_not_symlink(legacy_dir)
+        .map_err(|_error| ConfigError::new("unable to secure legacy config.toml"))?;
+
+    let metadata = match fs::symlink_metadata(&legacy) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_error) => return Err(ConfigError::new("unable to inspect legacy config.toml")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ConfigError::new("unable to secure legacy config.toml"));
+    }
+    let bytes = fs::read(&legacy)
+        .map_err(|_error| ConfigError::new("unable to read legacy config.toml"))?;
+    ensure_private_file(&legacy)
+        .map_err(|_error| ConfigError::new("unable to secure legacy config.toml"))?;
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut destination_file = options
+        .open(destination)
+        .map_err(|_error| ConfigError::new("unable to migrate legacy config.toml"))?;
+    destination_file
+        .write_all(&bytes)
+        .and_then(|()| destination_file.flush())
+        .map_err(|_error| ConfigError::new("unable to migrate legacy config.toml"))?;
+    ensure_private_file(destination)
+        .map_err(|_error| ConfigError::new("unable to secure config.toml"))?;
+    fs::remove_file(legacy)
+        .map_err(|_error| ConfigError::new("unable to remove legacy config.toml"))?;
+    Ok(())
 }
 
 fn generated_config_contains_active_key() -> bool {
@@ -315,7 +380,7 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(
-            fs::metadata(lucy_dir(&home))
+            fs::metadata(config_dir(&home))
                 .expect("Lucy directory metadata")
                 .permissions()
                 .mode()
@@ -337,8 +402,8 @@ mod tests {
     #[test]
     fn rejects_symlinked_config_files_and_directories() {
         let home = temporary_home();
-        let lucy = home.join(".lucy");
-        fs::create_dir(&lucy).expect("Lucy directory");
+        let lucy = config_dir(&home);
+        fs::create_dir_all(&lucy).expect("Lucy directory");
         let target = home.join("config-target.toml");
         fs::write(&target, "system_prompt = \"target\"\n").expect("target config");
         let path = config_path(&home);
@@ -348,16 +413,69 @@ mod tests {
         fs::remove_file(path).expect("remove config symlink");
         fs::remove_dir(lucy).expect("remove Lucy directory");
         fs::remove_file(target).expect("remove target config");
-        fs::remove_dir(&home).expect("remove temp home");
+        fs::remove_dir_all(&home).expect("remove temp home");
 
         let home = temporary_home();
         let target = home.join("lucy-target");
         fs::create_dir(&target).expect("target directory");
-        symlink(&target, home.join(".lucy")).expect("Lucy directory symlink");
+        fs::create_dir_all(config_dir(&home).parent().expect("config parent"))
+            .expect("config parent");
+        symlink(&target, config_dir(&home)).expect("Lucy directory symlink");
         assert!(Config::ensure_exists(&home).is_err());
-        fs::remove_file(home.join(".lucy")).expect("remove Lucy directory symlink");
+        fs::remove_file(config_dir(&home)).expect("remove Lucy directory symlink");
         fs::remove_dir(target).expect("remove target directory");
-        fs::remove_dir(home).expect("remove temp home");
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn migrates_a_legacy_config_once_without_overwriting_xdg_config() {
+        let home = temporary_home();
+        let legacy = legacy_config_path(&home);
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy parent");
+        let legacy_bytes = b"system_prompt = \"legacy\"\n[llm]\nmodel = \"old-model\"\n";
+        fs::write(&legacy, legacy_bytes).expect("legacy config");
+
+        let config = Config::load_or_create(&home).expect("migrate legacy config");
+        assert_eq!(config.system_prompt, "legacy");
+        assert_eq!(
+            fs::read(config_path(&home)).expect("migrated bytes"),
+            legacy_bytes
+        );
+        assert!(!legacy.exists());
+
+        fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&legacy, b"system_prompt = \"stale\"\n").expect("stale legacy config");
+        let loaded = Config::load_or_create(&home).expect("retain XDG config");
+        assert_eq!(loaded.system_prompt, "legacy");
+        assert_eq!(
+            fs::read(config_path(&home)).expect("XDG bytes"),
+            legacy_bytes
+        );
+        assert_eq!(
+            fs::read(&legacy).expect("legacy bytes"),
+            b"system_prompt = \"stale\"\n"
+        );
+
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn config_dir_uses_absolute_xdg_home_and_defaults_otherwise() {
+        let home = temporary_home();
+        let xdg_home = home.join("custom-xdg");
+        assert_eq!(
+            config_dir_from_xdg_home(&home, Some(xdg_home.as_os_str())),
+            xdg_home.join("lucy")
+        );
+        assert_eq!(
+            config_dir_from_xdg_home(&home, None),
+            home.join(".config/lucy")
+        );
+        assert_eq!(
+            config_dir_from_xdg_home(&home, Some(std::ffi::OsStr::new("relative"))),
+            home.join(".config/lucy")
+        );
+        fs::remove_dir_all(home).expect("remove temp home");
     }
 
     #[test]

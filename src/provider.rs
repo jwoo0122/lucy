@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -11,7 +11,11 @@ use crate::config::LlmSettings;
 use crate::model::{ChatMessage, ChatToolCall};
 use crate::redaction::{conflicts_with_protected_literal, redact_secret, redaction_marker};
 
+/// Maximum idle interval between provider response reads.
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(60);
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_RETRY_COUNT: usize = 1;
+const PROVIDER_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_PROVIDER_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_REASONING_DETAILS_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
@@ -28,12 +32,17 @@ const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
 const SPAWN_SUBAGENT_DESCRIPTION: &str = "Start an isolated background task and immediately return its task ID. Continue your own work without waiting; when the worker finishes, Lucy automatically starts a follow-up main-agent turn and delivers the completion result. Do not poll with check_subagent unless you need an intermediate status. The worker has cmd but cannot delegate further.";
 const CHECK_SUBAGENT_DESCRIPTION: &str = "Inspect an in-process background subagent only when you need an intermediate status or an on-demand result. Do not poll repeatedly: when the worker finishes, Lucy automatically starts a follow-up main-agent turn and delivers the result, so continue your own work instead.";
+const WAIT_SUBAGENT_DESCRIPTION: &str = "Wait for a background subagent to reach a terminal state. A timeout only ends the wait; it does not cancel the subagent.";
+const SEND_SUBAGENT_DESCRIPTION: &str = "Queue an additional message for a running background subagent. It is delivered at the worker's next safe provider boundary.";
+const CANCEL_SUBAGENT_DESCRIPTION: &str =
+    "Cancel a running background subagent at the nearest safe provider or command boundary.";
 
 #[derive(Debug)]
 pub struct ProviderError {
     message: String,
     cancelled: bool,
     partial: Option<ProviderTurn>,
+    retryable: bool,
 }
 
 impl ProviderError {
@@ -42,6 +51,16 @@ impl ProviderError {
             message: message.into(),
             cancelled: false,
             partial: None,
+            retryable: false,
+        }
+    }
+
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            cancelled: false,
+            partial: None,
+            retryable: true,
         }
     }
 
@@ -50,6 +69,7 @@ impl ProviderError {
             message: "provider stream canceled".to_owned(),
             cancelled: true,
             partial: Some(partial),
+            retryable: false,
         }
     }
 
@@ -59,6 +79,10 @@ impl ProviderError {
 
     pub fn partial_turn(&self) -> Option<&ProviderTurn> {
         self.partial.as_ref()
+    }
+
+    fn is_retryable(&self) -> bool {
+        self.retryable
     }
 }
 
@@ -70,11 +94,60 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+fn transient_http_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn transient_reqwest_error(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
+}
+
+fn reqwest_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
+}
+
+fn reqwest_failure(
+    prefix: &str,
+    error: reqwest::Error,
+    api_key: &str,
+    retry_before_payload: bool,
+) -> ProviderError {
+    let detail = redact_secret(&error.to_string(), Some(api_key));
+    let message = format!("{prefix} ({}): {detail}", reqwest_error_kind(&error));
+    let mut provider_error = ProviderError::new(message);
+    provider_error.retryable = retry_before_payload && transient_reqwest_error(&error);
+    provider_error
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTurn {
     pub content: String,
     pub tool_calls: Vec<ChatToolCall>,
     pub reasoning_details: Vec<Value>,
+}
+
+fn empty_turn() -> ProviderTurn {
+    ProviderTurn {
+        content: String::new(),
+        tool_calls: Vec::new(),
+        reasoning_details: Vec::new(),
+    }
 }
 
 pub(crate) enum ProviderStreamEvent {
@@ -175,6 +248,9 @@ fn chat_request(
         if include_subagents {
             tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":SPAWN_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
             tools.push(json!({"type":"function","function":{"name":"check_subagent","description":CHECK_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"wait_subagent","description":WAIT_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["task_id"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"send_subagent","description":SEND_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","message"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"cancel_subagent","description":CANCEL_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
         }
         request["tools"] = Value::Array(tools);
     } else {
@@ -228,6 +304,7 @@ impl Provider {
             settings.base_url.trim_end_matches('/')
         );
         let client = Client::builder()
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
             .timeout(PROVIDER_TIMEOUT)
             .build()
             .map_err(|_| {
@@ -237,7 +314,8 @@ impl Provider {
                 ))
             })?;
         let async_client = AsyncClient::builder()
-            .timeout(PROVIDER_TIMEOUT)
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+            .read_timeout(PROVIDER_TIMEOUT)
             .build()
             .map_err(|_| {
                 ProviderError::new(redact_secret(
@@ -344,177 +422,8 @@ impl Provider {
         messages: &[ChatMessage],
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> Result<ProviderTurn, ProviderError> {
-        let request = chat_request(&self.model, messages, &self.effort, true, true);
-
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .header("accept", "text/event-stream")
-            .json(&request)
-            .send()
-            .map_err(|_| ProviderError::new("provider request failed"))?;
-        if !response.status().is_success() {
-            return Err(ProviderError::new(format!(
-                "provider returned HTTP status {}",
-                response.status().as_u16()
-            )));
-        }
-
-        let mut content = String::new();
-        let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
-        let mut reasoning_details = Vec::new();
-        let mut reasoning_details_bytes = 0;
-        let mut tool_argument_bytes: usize = 0;
-        let mut finish_reason = None;
-        {
-            let mut on_data = |data: Value| -> Result<(), ProviderError> {
-                if let Some(message) = provider_error_message(&data) {
-                    return Err(ProviderError::new(format!(
-                        "provider stream error: {}",
-                        redact_secret(message, Some(&self.api_key))
-                    )));
-                }
-                let Some(choice) = data
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .and_then(|choices| choices.first())
-                else {
-                    return Ok(());
-                };
-                if let Some(reason) = validate_finish_reason(choice)? {
-                    finish_reason = Some(reason.to_owned());
-                }
-                let Some(delta) = choice.get("delta") else {
-                    return Ok(());
-                };
-                append_reasoning_details(
-                    &mut reasoning_details,
-                    &mut reasoning_details_bytes,
-                    delta,
-                )?;
-                if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if content.len().saturating_add(text.len()) > MAX_PROVIDER_CONTENT_BYTES {
-                        return Err(ProviderError::new(
-                            "provider assistant content exceeded the response limit",
-                        ));
-                    }
-                    content.push_str(text);
-                    if on_text(text).is_err() {
-                        return Err(ProviderError::new("unable to emit assistant delta"));
-                    }
-                }
-                if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                    for (position, call) in calls.iter().enumerate() {
-                        let index = call
-                            .get("index")
-                            .and_then(Value::as_u64)
-                            .map_or(position, |index| index as usize);
-                        let partial = tool_calls.entry(index).or_default();
-                        if let Some(id) = call.get("id").and_then(Value::as_str) {
-                            append_provider_field(
-                                &mut partial.id,
-                                id,
-                                MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-                                "provider tool-call id exceeded the response limit",
-                            )?;
-                        }
-                        if let Some(function) = call.get("function") {
-                            if let Some(name) = function.get("name").and_then(Value::as_str) {
-                                append_provider_field(
-                                    &mut partial.name,
-                                    name,
-                                    MAX_PROVIDER_TOOL_NAME_BYTES,
-                                    "provider tool-call name exceeded the response limit",
-                                )?;
-                            }
-                            if let Some(arguments) =
-                                function.get("arguments").and_then(Value::as_str)
-                            {
-                                if tool_argument_bytes.saturating_add(arguments.len())
-                                    > MAX_PROVIDER_TOOL_ARGUMENT_BYTES
-                                {
-                                    return Err(ProviderError::new(
-                                        "provider tool arguments exceeded the response limit",
-                                    ));
-                                }
-                                tool_argument_bytes += arguments.len();
-                                partial.arguments.push_str(arguments);
-                            }
-                        }
-                    }
-                }
-                if let Some(function_call) = delta.get("function_call") {
-                    let partial = tool_calls.entry(0).or_default();
-                    if let Some(name) = function_call.get("name").and_then(Value::as_str) {
-                        append_provider_field(
-                            &mut partial.name,
-                            name,
-                            MAX_PROVIDER_TOOL_NAME_BYTES,
-                            "provider tool-call name exceeded the response limit",
-                        )?;
-                    }
-                    if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str)
-                    {
-                        if tool_argument_bytes.saturating_add(arguments.len())
-                            > MAX_PROVIDER_TOOL_ARGUMENT_BYTES
-                        {
-                            return Err(ProviderError::new(
-                                "provider tool arguments exceeded the response limit",
-                            ));
-                        }
-                        tool_argument_bytes += arguments.len();
-                        partial.arguments.push_str(arguments);
-                    }
-                }
-                Ok(())
-            };
-            let mut reader = BufReader::new(response);
-            let parse_result = parse_sse(&mut reader, &mut on_data)?;
-            if !parse_result.received_payload {
-                return Err(ProviderError::new(
-                    "provider stream contained no valid payload",
-                ));
-            }
-            if !parse_result.received_done {
-                return Err(ProviderError::new("provider stream ended before [DONE]"));
-            }
-        }
-
-        let tool_calls = tool_calls
-            .into_iter()
-            .map(|(index, partial)| ChatToolCall {
-                id: if partial.id.is_empty() {
-                    format!("call_{index}")
-                } else {
-                    partial.id
-                },
-                name: partial.name,
-                arguments: partial.arguments,
-            })
-            .collect::<Vec<_>>();
-        if let Some(reason) = finish_reason.as_deref() {
-            if !tool_calls.is_empty() && !matches!(reason, "tool_calls" | "function_call") {
-                return Err(ProviderError::new(
-                    "provider tool calls ended with an incompatible finish reason",
-                ));
-            }
-            if tool_calls.is_empty() && matches!(reason, "tool_calls" | "function_call") {
-                return Err(ProviderError::new(
-                    "provider reported tool completion without a tool call",
-                ));
-            }
-        }
-        if content.is_empty() && tool_calls.is_empty() {
-            return Err(ProviderError::new(
-                "provider stream contained no assistant content or tool calls",
-            ));
-        }
-        Ok(ProviderTurn {
-            content,
-            tool_calls,
-            reasoning_details,
-        })
+        let cancellation = CancellationToken::new();
+        self.stream_chat_cancellable_with_options(messages, on_text, &cancellation, true, true)
     }
 
     /// Generate an internal compaction summary without exposing `cmd` to the
@@ -588,7 +497,7 @@ impl Provider {
             .enable_all()
             .build()
             .map_err(|_| ProviderError::new("unable to initialize provider runtime"))?;
-        runtime.block_on(self.stream_chat_async(
+        runtime.block_on(self.stream_chat_async_with_retries(
             messages,
             on_event,
             cancellation,
@@ -597,7 +506,38 @@ impl Provider {
         ))
     }
 
-    async fn stream_chat_async(
+    async fn stream_chat_async_with_retries(
+        &self,
+        messages: &[ChatMessage],
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
+        cancellation: &CancellationToken,
+        include_tools: bool,
+        include_subagents: bool,
+    ) -> Result<ProviderTurn, ProviderError> {
+        for attempt in 0..=PROVIDER_RETRY_COUNT {
+            match self
+                .stream_chat_async_once(
+                    messages,
+                    on_event,
+                    cancellation,
+                    include_tools,
+                    include_subagents,
+                )
+                .await
+            {
+                Err(error) if error.is_retryable() && attempt < PROVIDER_RETRY_COUNT => {
+                    if cancellation.is_cancelled() {
+                        return Err(ProviderError::cancelled(empty_turn()));
+                    }
+                    tokio::time::sleep(PROVIDER_RETRY_BACKOFF).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("provider retry loop must return");
+    }
+
+    async fn stream_chat_async_once(
         &self,
         messages: &[ChatMessage],
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
@@ -637,16 +577,21 @@ impl Provider {
             }
             match tokio::time::timeout(CANCELLATION_POLL_INTERVAL, request.as_mut()).await {
                 Ok(response) => {
-                    break response.map_err(|_| ProviderError::new("provider request failed"))?;
+                    break response.map_err(|error| {
+                        reqwest_failure("provider request failed", error, &self.api_key, true)
+                    })?;
                 }
                 Err(_) => continue,
             }
         };
         if !response.status().is_success() {
-            return Err(ProviderError::new(format!(
-                "provider returned HTTP status {}",
-                response.status().as_u16()
-            )));
+            let status = response.status().as_u16();
+            let error = if transient_http_status(status) {
+                ProviderError::retryable(format!("provider returned HTTP status {status}"))
+            } else {
+                ProviderError::new(format!("provider returned HTTP status {status}"))
+            };
+            return Err(error);
         }
 
         let mut accumulator = ProviderAccumulator::default();
@@ -658,7 +603,15 @@ impl Provider {
             let chunk =
                 match tokio::time::timeout(CANCELLATION_POLL_INTERVAL, response.chunk()).await {
                     Ok(chunk) => {
-                        chunk.map_err(|_| ProviderError::new("unable to read provider stream"))?
+                        let retry_before_payload = !decoder.result.received_payload;
+                        chunk.map_err(|error| {
+                            reqwest_failure(
+                                "provider stream read failed",
+                                error,
+                                &self.api_key,
+                                retry_before_payload,
+                            )
+                        })?
                     }
                     Err(_) => continue,
                 };
@@ -995,7 +948,7 @@ impl SseDecoder {
         F: FnMut(Value) -> Result<(), ProviderError>,
     {
         let line = std::str::from_utf8(raw_line)
-            .map_err(|_| ProviderError::new("unable to read provider stream"))?
+            .map_err(|_| ProviderError::new("provider stream contained invalid UTF-8"))?
             .trim_end_matches('\r');
         if line.is_empty() {
             return self.dispatch_data(on_data);
@@ -1070,7 +1023,15 @@ where
     let mut result = SseParseResult::default();
     let mut line = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     loop {
-        let (has_line, line_bytes) = read_sse_line(reader, &mut line)?;
+        let (has_line, line_bytes) = match read_sse_line(reader, &mut line) {
+            Ok(result) => result,
+            Err(mut error) => {
+                if result.received_payload {
+                    error.retryable = false;
+                }
+                return Err(error);
+            }
+        };
         if stream_bytes.saturating_add(line_bytes) > MAX_SSE_STREAM_BYTES {
             return Err(ProviderError::new(
                 "provider SSE stream exceeded the response limit",
@@ -1090,7 +1051,7 @@ where
         }
 
         let line = std::str::from_utf8(&line)
-            .map_err(|_| ProviderError::new("unable to read provider stream"))?
+            .map_err(|_| ProviderError::new("provider stream contained invalid UTF-8"))?
             .trim_end_matches('\r');
         if line.is_empty() {
             if dispatch_data(
@@ -1136,9 +1097,9 @@ fn read_sse_line<R: BufRead>(
     line.clear();
     let mut consumed_bytes = 0;
     loop {
-        let buffer = reader
-            .fill_buf()
-            .map_err(|_| ProviderError::new("unable to read provider stream"))?;
+        let buffer = reader.fill_buf().map_err(|error| {
+            ProviderError::retryable(format!("provider stream read failed: {error}"))
+        })?;
         if buffer.is_empty() {
             return Ok((!line.is_empty(), consumed_bytes));
         }
@@ -1211,11 +1172,11 @@ fn validate_finish_reason(choice: &Value) -> Result<Option<&str>, ProviderError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Cursor, Read, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Cursor, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn subagent_tool_descriptions_prefer_automatic_completion_over_polling() {
@@ -1244,6 +1205,22 @@ mod tests {
         assert!(check.contains("Do not poll repeatedly"));
         assert!(check.contains("automatically starts a follow-up main-agent turn"));
         assert!(check.contains("continue your own work instead"));
+
+        assert!(description("wait_subagent").contains("timeout only ends the wait"));
+        assert!(description("send_subagent").contains("next safe provider boundary"));
+        assert!(
+            description("cancel_subagent").contains("nearest safe provider or command boundary")
+        );
+    }
+
+    #[test]
+    fn retry_policy_only_marks_transient_http_statuses() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(transient_http_status(status));
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert!(!transient_http_status(status));
+        }
     }
 
     #[test]
@@ -1975,6 +1952,247 @@ mod tests {
             provider_error_message(&value),
             Some("provider error text exceeded the response limit")
         );
+    }
+
+    fn read_request_headers(stream: &TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone request"));
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request header");
+            if line == "\r\n" || line.is_empty() {
+                return;
+            }
+        }
+    }
+
+    fn response_body(text: &str) -> String {
+        let payload = serde_json::json!({
+            "choices": [{"delta": {"content": text}, "finish_reason": null}]
+        });
+        let finish = serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}]
+        });
+        format!("data: {payload}\n\ndata: {finish}\n\ndata: [DONE]\n\n")
+    }
+
+    fn provider_for(address: std::net::SocketAddr, read_timeout: Duration) -> (Provider, String) {
+        let environment = format!(
+            "LUCY_PROVIDER_STREAM_TEST_{}_{}",
+            std::process::id(),
+            address.port()
+        );
+        std::env::set_var(&environment, "provider-secret");
+        let settings = LlmSettings {
+            base_url: format!("http://{address}/v1"),
+            model: "model".to_owned(),
+            api_key_env: environment.clone(),
+            effort: None,
+        };
+        let mut provider = Provider::new(&settings).expect("provider");
+        provider.async_client = AsyncClient::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .read_timeout(read_timeout)
+            .build()
+            .expect("test async client");
+        (provider, environment)
+    }
+
+    #[test]
+    fn worker_stream_can_exceed_idle_interval_without_total_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("address");
+        let parts = (0..5)
+            .map(|index| {
+                let payload = serde_json::json!({
+                    "choices": [{
+                        "delta": {"content": format!("part-{index}")},
+                        "finish_reason": null
+                    }]
+                });
+                format!("data: {payload}\n\n")
+            })
+            .chain([
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "choices": [{"delta": {}, "finish_reason": "stop"}]
+                    })
+                ),
+                "data: [DONE]\n\n".to_owned(),
+            ])
+            .collect::<Vec<_>>();
+        let body = parts.concat();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request");
+            read_request_headers(&stream);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).expect("header");
+            stream.flush().expect("header flush");
+            for part in parts {
+                stream.write_all(part.as_bytes()).expect("SSE part");
+                stream.flush().expect("SSE flush");
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let (provider, environment) = provider_for(address, Duration::from_millis(80));
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+        let mut output = String::new();
+        let turn = provider
+            .stream_chat_cancellable_with_options(
+                &[ChatMessage::user("worker task".to_owned())],
+                &mut |text| {
+                    output.push_str(text);
+                    Ok(())
+                },
+                &cancellation,
+                true,
+                false,
+            )
+            .expect("long worker stream");
+
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        assert_eq!(turn.content, output);
+        assert!(output.contains("part-4"));
+        server.join().expect("server");
+        std::env::remove_var(environment);
+    }
+
+    #[test]
+    fn retries_a_pre_payload_stream_failure_once_and_classifies_it() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("address");
+        let body = response_body("retried");
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for attempt in 0..2 {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "provider did not retry");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                read_request_headers(&stream);
+                if attempt == 0 {
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+                    stream.write_all(header.as_bytes()).expect("failed header");
+                    stream.flush().expect("failed flush");
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(header.as_bytes()).expect("success header");
+                    stream.write_all(body.as_bytes()).expect("success body");
+                    stream.flush().expect("success flush");
+                }
+            }
+        });
+
+        let (provider, environment) = provider_for(address, Duration::from_secs(1));
+        let cancellation = CancellationToken::new();
+        let mut output = String::new();
+        let turn = provider
+            .stream_chat_cancellable_with_options(
+                &[ChatMessage::user("retry".to_owned())],
+                &mut |text| {
+                    output.push_str(text);
+                    Ok(())
+                },
+                &cancellation,
+                true,
+                false,
+            )
+            .expect("retry succeeds");
+
+        assert_eq!(turn.content, "retried");
+        assert_eq!(output, "retried");
+        server.join().expect("server");
+        std::env::remove_var(environment);
+    }
+
+    #[test]
+    fn does_not_retry_after_partial_provider_output() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("address");
+        let partial = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "choices": [{"delta": {"content": "partial"}, "finish_reason": null}]
+            })
+        );
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "provider request missing");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            read_request_headers(&stream);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                partial.len() + 10
+            );
+            stream.write_all(header.as_bytes()).expect("partial header");
+            stream.write_all(partial.as_bytes()).expect("partial body");
+            stream.flush().expect("partial flush");
+            thread::sleep(Duration::from_millis(150));
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+
+        let (provider, environment) = provider_for(address, Duration::from_secs(1));
+        let cancellation = CancellationToken::new();
+        let mut output = String::new();
+        let error = provider
+            .stream_chat_cancellable_with_options(
+                &[ChatMessage::user("partial".to_owned())],
+                &mut |text| {
+                    output.push_str(text);
+                    Ok(())
+                },
+                &cancellation,
+                true,
+                false,
+            )
+            .expect_err("partial stream must fail");
+
+        let message = error.to_string();
+        assert!(message.contains("provider stream read failed"));
+        assert!([
+            "(timeout)",
+            "(connection)",
+            "(body)",
+            "(decode)",
+            "(request)",
+            "(transport)",
+        ]
+        .iter()
+        .any(|kind| message.contains(kind)));
+        assert_eq!(output, "partial");
+        server.join().expect("server");
+        std::env::remove_var(environment);
     }
 
     #[test]

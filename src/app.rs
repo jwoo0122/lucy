@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::cancellation::CancellationToken;
 use crate::config::{Config, DEFAULT_API_KEY_ENV};
 use crate::context::{resolve_boot_context_with_api_key_env, InstructionSource, SkillEntry};
 use crate::model::{estimate_context_tokens, estimate_message_tokens, ChatMessage, ChatToolCall};
@@ -16,7 +17,7 @@ use crate::redaction::{
     conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key, redact_secret,
     redaction_marker,
 };
-use crate::session::Session;
+use crate::session::{ChildSession, ChildSessionStatus, Session};
 
 #[derive(Debug)]
 struct CliOptions {
@@ -352,6 +353,7 @@ where
         attached_agents,
         subagents: Arc::new(Mutex::new(HashMap::new())),
         completed_subagents: mpsc::channel(),
+        subagent_activity: mpsc::channel(),
     };
     if mode == FrontendMode::Tui {
         return match crate::tui::run(harness, resumed, output) {
@@ -384,6 +386,7 @@ where
     });
     let mut input_closed = false;
     while !input_closed || harness.has_running_subagents() {
+        while harness.next_subagent_activity().is_some() {}
         if let Some(completion) = harness.next_subagent_completion() {
             let notification = Harness::subagent_notification(&completion);
             if let Err(error) = harness.handle_message(&notification, &mut protocol, None) {
@@ -481,17 +484,94 @@ pub(crate) struct Harness {
         mpsc::Sender<SubagentCompletion>,
         mpsc::Receiver<SubagentCompletion>,
     ),
+    subagent_activity: (
+        mpsc::Sender<SubagentActivity>,
+        mpsc::Receiver<SubagentActivity>,
+    ),
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let controls = self
+            .subagents
+            .lock()
+            .ok()
+            .map(|states| {
+                states
+                    .values()
+                    .filter_map(|state| match state {
+                        SubagentState::Running(control) => Some(control.clone()),
+                        SubagentState::Completed(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for control in &controls {
+            control.shutdown.store(true, Ordering::Release);
+            control.cancellation.cancel();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for control in controls {
+            let (result_slot, wake) = &*control.done;
+            let Ok(result) = result_slot.lock() else {
+                continue;
+            };
+            if result.is_some() {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let _ = wake.wait_timeout(result, remaining);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SubagentCommand {
+    Message(String),
+}
+
+#[derive(Clone)]
+struct SubagentControl {
+    cancellation: CancellationToken,
+    commands: mpsc::Sender<SubagentCommand>,
+    done: Arc<(Mutex<Option<Value>>, Condvar)>,
+    shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 enum SubagentState {
-    Running,
+    Running(SubagentControl),
     Completed(Value),
 }
 
 pub(crate) struct SubagentCompletion {
     pub(crate) task_id: String,
     pub(crate) result: Value,
+}
+
+/// TUI-only worker activity. Not a public JSONL event.
+#[derive(Debug, Clone)]
+pub(crate) enum SubagentActivity {
+    AssistantDelta {
+        task_id: String,
+        text: String,
+    },
+    ToolCall {
+        task_id: String,
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        task_id: String,
+        id: String,
+        name: String,
+        result: Value,
+    },
+    Completed {
+        task_id: String,
+        result: Value,
+    },
 }
 
 fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
@@ -540,9 +620,14 @@ impl Harness {
         self.completed_subagents.1.try_recv().ok()
     }
 
+    pub(crate) fn next_subagent_activity(&mut self) -> Option<SubagentActivity> {
+        self.subagent_activity.1.try_recv().ok()
+    }
+
     pub(crate) fn subagent_notification(completion: &SubagentCompletion) -> String {
+        let status = terminal_status(&completion.result);
         format!(
-            "Background subagent {} completed. Deliver this result to the user and continue the task: {}",
+            "Background subagent {} {status}. Deliver this result to the user and continue the task: {}",
             completion.task_id,
             serde_json::to_string(&completion.result).unwrap_or_else(|_| "{\"error\":\"unable to encode subagent result\"}".to_owned())
         )
@@ -552,65 +637,141 @@ impl Harness {
         self.subagents.lock().is_ok_and(|states| {
             states
                 .values()
-                .any(|state| matches!(state, SubagentState::Running))
+                .any(|state| matches!(state, SubagentState::Running(_)))
         })
     }
 
     fn spawn_subagent(&self, task: String, model: Option<String>, effort: Option<String>) -> Value {
-        let mut subagents = match self.subagents.lock() {
-            Ok(subagents) => subagents,
-            Err(_) => return serde_json::json!({"error": "subagent registry unavailable"}),
-        };
-        let running = subagents
-            .values()
-            .filter(|state| matches!(state, SubagentState::Running))
-            .count();
-        if running >= MAX_CONCURRENT_SUBAGENTS {
+        let under_limit = self.subagents.lock().ok().is_some_and(|states| {
+            states
+                .values()
+                .filter(|state| matches!(state, SubagentState::Running(_)))
+                .count()
+                < MAX_CONCURRENT_SUBAGENTS
+        });
+        if !under_limit {
             return serde_json::json!({"error": format!("subagent concurrency limit is {MAX_CONCURRENT_SUBAGENTS}")});
         }
-        let task_id = format!(
-            "subagent-{}",
-            NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        subagents.insert(task_id.clone(), SubagentState::Running);
-        drop(subagents);
         let settings = self.session.llm.clone();
         let boot = self.session.boot_system_prompt.clone();
         let cwd = self.session.cwd.clone();
         let secret = self.provider.api_key().to_owned();
+        let child_session = match ChildSession::create(
+            &self.home,
+            &self.session.id,
+            &cwd,
+            boot.clone(),
+            settings.clone(),
+            task.clone(),
+            Some(&secret),
+        ) {
+            Ok(session) => session,
+            Err(error) => return serde_json::json!({"error": error.to_string()}),
+        };
+
+        let (commands, command_rx) = mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let done = Arc::new((Mutex::new(None), Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let control = SubagentControl {
+            cancellation: cancellation.clone(),
+            commands,
+            done: Arc::clone(&done),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let task_id = format!(
+            "subagent-{}",
+            NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let mut subagents = match self.subagents.lock() {
+                Ok(subagents) => subagents,
+                Err(_) => return serde_json::json!({"error": "subagent registry unavailable"}),
+            };
+            let running = subagents
+                .values()
+                .filter(|state| matches!(state, SubagentState::Running(_)))
+                .count();
+            if running >= MAX_CONCURRENT_SUBAGENTS {
+                return serde_json::json!({"error": format!("subagent concurrency limit is {MAX_CONCURRENT_SUBAGENTS}")});
+            }
+            subagents.insert(task_id.clone(), SubagentState::Running(control.clone()));
+        }
+
         let states = Arc::clone(&self.subagents);
         let completed = self.completed_subagents.0.clone();
+        let activity = self.subagent_activity.0.clone();
         let completion_id = task_id.clone();
+        let activity_id = task_id.clone();
         std::thread::spawn(move || {
-            let result = redact_json_value(
-                run_subagent(settings, boot, cwd, task, model, effort, None),
-                &secret,
+            let mut child_session = child_session;
+            let raw_result = run_subagent(
+                settings,
+                boot,
+                cwd,
+                task,
+                model,
+                effort,
+                SubagentRunOptions {
+                    cancellation: Some(cancellation),
+                    commands: command_rx,
+                    shutdown,
+                    activity: Some((activity_id, activity)),
+                },
+                &mut child_session,
             );
-            if let Ok(mut states) = states.lock() {
-                states.insert(
-                    completion_id.clone(),
-                    SubagentState::Completed(result.clone()),
-                );
-            }
+            let result = redact_json_value(raw_result, &secret);
+            let status = if result.get("interrupted").is_some() {
+                ChildSessionStatus::Interrupted
+            } else if result.get("cancelled").is_some() {
+                ChildSessionStatus::Canceled
+            } else if result.get("error").is_some() {
+                ChildSessionStatus::Failed
+            } else {
+                ChildSessionStatus::Completed
+            };
+            let reason = result
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let _ = child_session.append_status(status, reason, Some(result.clone()));
             let _ = completed.send(SubagentCompletion {
-                task_id: completion_id,
-                result,
+                task_id: completion_id.clone(),
+                result: result.clone(),
             });
+            if let Ok(mut states) = states.lock() {
+                states.insert(completion_id, SubagentState::Completed(result.clone()));
+            }
+            let (result_slot, wake) = &*done;
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = Some(result);
+                wake.notify_all();
+            }
         });
         serde_json::json!({"task_id": task_id, "status": "queued"})
     }
 
+    fn drain_completed_subagents(&mut self) -> Result<(), String> {
+        while let Some(completion) = self.next_subagent_completion() {
+            let notification = Self::subagent_notification(&completion);
+            self.session
+                .append_message(ChatMessage::user(redact_secret(
+                    &notification,
+                    Some(self.provider.api_key()),
+                )))
+                .map_err(|error| error.to_string())?;
+            let _ = self.subagent_activity.0.send(SubagentActivity::Completed {
+                task_id: completion.task_id,
+                result: completion.result,
+            });
+        }
+        Ok(())
+    }
+
     fn subagent_status(&self, arguments: &str) -> Value {
-        let task_id = match serde_json::from_str::<Value>(arguments)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("task_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }) {
-            Some(task_id) => task_id,
-            None => return serde_json::json!({"error": "check_subagent requires a task_id string"}),
+        let task_id = match parse_task_id(arguments) {
+            Ok(task_id) => task_id,
+            Err(error) => return serde_json::json!({"error": error}),
         };
         match self
             .subagents
@@ -618,11 +779,129 @@ impl Harness {
             .ok()
             .and_then(|states| states.get(&task_id).cloned())
         {
-            Some(SubagentState::Running) => {
+            Some(SubagentState::Running(_)) => {
                 serde_json::json!({"task_id": task_id, "status": "running"})
             }
             Some(SubagentState::Completed(result)) => {
-                serde_json::json!({"task_id": task_id, "status": "completed", "result": result})
+                serde_json::json!({"task_id": task_id, "status": terminal_status(&result), "result": result})
+            }
+            None => serde_json::json!({"task_id": task_id, "status": "unknown"}),
+        }
+    }
+
+    fn wait_subagent(&self, arguments: &str) -> Value {
+        let value = match serde_json::from_str::<Value>(arguments) {
+            Ok(value) => value,
+            Err(_) => {
+                return serde_json::json!({"error": "wait_subagent arguments must be an object"})
+            }
+        };
+        let task_id = match value.get("task_id").and_then(Value::as_str) {
+            Some(task_id) if !task_id.trim().is_empty() => task_id.trim().to_owned(),
+            _ => return serde_json::json!({"error": "wait_subagent requires a task_id string"}),
+        };
+        let timeout_ms = value
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(1, 600_000);
+        let state = self
+            .subagents
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&task_id).cloned());
+        let Some(state) = state else {
+            return serde_json::json!({"task_id": task_id, "status": "unknown"});
+        };
+        let SubagentState::Running(control) = state else {
+            if let SubagentState::Completed(result) = state {
+                return serde_json::json!({"task_id": task_id, "status": terminal_status(&result), "result": result});
+            }
+            unreachable!();
+        };
+        let (result_slot, wake) = &*control.done;
+        let mut result = match result_slot.lock() {
+            Ok(result) => result,
+            Err(_) => {
+                return serde_json::json!({"task_id": task_id, "status": "failed", "error": "subagent wait unavailable"})
+            }
+        };
+        if result.is_none() {
+            let (guard, timeout) = wake
+                .wait_timeout(result, std::time::Duration::from_millis(timeout_ms))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            result = guard;
+            if result.is_none() && timeout.timed_out() {
+                return serde_json::json!({"task_id": task_id, "status": "waiting", "timed_out": true});
+            }
+        }
+        match result.clone() {
+            Some(result) => {
+                serde_json::json!({"task_id": task_id, "status": terminal_status(&result), "result": result})
+            }
+            None => serde_json::json!({"task_id": task_id, "status": "waiting"}),
+        }
+    }
+
+    fn send_subagent(&self, arguments: &str) -> Value {
+        let value = match serde_json::from_str::<Value>(arguments) {
+            Ok(value) => value,
+            Err(_) => {
+                return serde_json::json!({"error": "send_subagent arguments must be an object"})
+            }
+        };
+        let task_id = match value.get("task_id").and_then(Value::as_str) {
+            Some(task_id) if !task_id.trim().is_empty() => task_id.trim().to_owned(),
+            _ => return serde_json::json!({"error": "send_subagent requires a task_id string"}),
+        };
+        let message = match value.get("message").and_then(Value::as_str) {
+            Some(message)
+                if !message.trim().is_empty() && message.len() <= MAX_SUBAGENT_TASK_BYTES =>
+            {
+                message.to_owned()
+            }
+            _ => {
+                return serde_json::json!({"error": "send_subagent message must be non-empty and bounded"})
+            }
+        };
+        let state = self
+            .subagents
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&task_id).cloned());
+        match state {
+            Some(SubagentState::Running(control)) => {
+                match control.commands.send(SubagentCommand::Message(message)) {
+                    Ok(()) => serde_json::json!({"task_id": task_id, "status": "queued"}),
+                    Err(_) => {
+                        serde_json::json!({"task_id": task_id, "status": "failed", "error": "subagent command channel closed"})
+                    }
+                }
+            }
+            Some(SubagentState::Completed(result)) => {
+                serde_json::json!({"task_id": task_id, "status": terminal_status(&result), "error": "subagent is not running"})
+            }
+            None => serde_json::json!({"task_id": task_id, "status": "unknown"}),
+        }
+    }
+
+    fn cancel_subagent(&self, arguments: &str) -> Value {
+        let task_id = match parse_task_id(arguments) {
+            Ok(task_id) => task_id,
+            Err(error) => return serde_json::json!({"error": error}),
+        };
+        let state = self
+            .subagents
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&task_id).cloned());
+        match state {
+            Some(SubagentState::Running(control)) => {
+                control.cancellation.cancel();
+                serde_json::json!({"task_id": task_id, "status": "cancellation_requested"})
+            }
+            Some(SubagentState::Completed(result)) => {
+                serde_json::json!({"task_id": task_id, "status": terminal_status(&result), "error": "subagent is not running"})
             }
             None => serde_json::json!({"task_id": task_id, "status": "unknown"}),
         }
@@ -735,6 +1014,7 @@ impl Harness {
 
         let mut compacted_for_turn = false;
         loop {
+            self.drain_completed_subagents()?;
             if cancellation.is_some_and(|token| token.is_cancelled()) {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
             }
@@ -841,7 +1121,15 @@ impl Harness {
             let canceled_after_stream = cancellation.is_some_and(|token| token.is_cancelled());
 
             if turn.tool_calls.iter().any(|call| {
-                call.name != "cmd" && call.name != "spawn_subagent" && call.name != "check_subagent"
+                !matches!(
+                    call.name.as_str(),
+                    "cmd"
+                        | "spawn_subagent"
+                        | "check_subagent"
+                        | "wait_subagent"
+                        | "send_subagent"
+                        | "cancel_subagent"
+                )
             }) {
                 if canceled_after_stream {
                     return self.interrupt(sink, PROVIDER_PHASE, &turn.content, &[], Vec::new());
@@ -902,6 +1190,12 @@ impl Harness {
                     }
                 } else if raw_call.name == "check_subagent" {
                     self.subagent_status(&raw_call.arguments)
+                } else if raw_call.name == "wait_subagent" {
+                    self.wait_subagent(&raw_call.arguments)
+                } else if raw_call.name == "send_subagent" {
+                    self.send_subagent(&raw_call.arguments)
+                } else if raw_call.name == "cancel_subagent" {
+                    self.cancel_subagent(&raw_call.arguments)
                 } else if cancellation.is_some_and(|token| token.is_cancelled()) {
                     serde_json::to_value(crate::command::canceled_result(
                         &safe_call.arguments,
@@ -993,6 +1287,7 @@ impl Harness {
                     return self.interrupt(sink, COMMAND_PHASE, "", &[], Vec::new());
                 }
             }
+            self.drain_completed_subagents()?;
         }
     }
 
@@ -1056,6 +1351,39 @@ impl Harness {
     }
 }
 
+fn parse_task_id(arguments: &str) -> Result<String, String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("task_id")
+                .and_then(Value::as_str)
+                .filter(|task_id| !task_id.trim().is_empty())
+                .map(|task_id| task_id.trim().to_owned())
+        })
+        .ok_or_else(|| "subagent requires a task_id string".to_owned())
+}
+
+fn subagent_canceled_result(shutdown: &AtomicBool) -> Value {
+    if shutdown.load(Ordering::Acquire) {
+        serde_json::json!({"interrupted": true, "reason": "process_shutdown"})
+    } else {
+        serde_json::json!({"cancelled": true})
+    }
+}
+
+fn terminal_status(result: &Value) -> &'static str {
+    if result.get("interrupted").is_some() {
+        "interrupted"
+    } else if result.get("cancelled").is_some() {
+        "canceled"
+    } else if result.get("error").is_some() {
+        "failed"
+    } else {
+        "completed"
+    }
+}
+
 fn parse_subagent_arguments(
     arguments: &str,
 ) -> Result<(String, Option<String>, Option<String>), String> {
@@ -1091,14 +1419,23 @@ fn parse_subagent_arguments(
     Ok((task, optional("model")?, optional("effort")?))
 }
 
+struct SubagentRunOptions {
+    cancellation: Option<CancellationToken>,
+    commands: mpsc::Receiver<SubagentCommand>,
+    shutdown: Arc<AtomicBool>,
+    activity: Option<(String, mpsc::Sender<SubagentActivity>)>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_subagent(
     mut settings: crate::config::LlmSettings,
-    boot_context: String,
+    _boot_context: String,
     cwd: std::path::PathBuf,
     task: String,
     model: Option<String>,
     effort: Option<String>,
-    cancellation: Option<crate::cancellation::CancellationToken>,
+    options: SubagentRunOptions,
+    child_session: &mut ChildSession,
 ) -> Value {
     if let Some(model) = model {
         settings.model = model;
@@ -1112,37 +1449,85 @@ fn run_subagent(
         Ok(provider) => provider,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let mut messages = vec![ChatMessage::system(boot_context), ChatMessage::user(task)];
-    let cancellation = cancellation.unwrap_or_default();
+    let secret = provider.api_key().to_owned();
+    if let Err(error) =
+        child_session.append_message(ChatMessage::user(redact_secret(&task, Some(&secret))))
+    {
+        return serde_json::json!({"error": error.to_string()});
+    }
+    let activity = options.activity;
+    let commands = options.commands;
+    let shutdown = options.shutdown;
+    let cancellation = options.cancellation.unwrap_or_default();
     loop {
-        if cancellation.is_cancelled() {
-            return serde_json::json!({"cancelled": true});
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                SubagentCommand::Message(message) => {
+                    let message = ChatMessage::user(redact_secret(&message, Some(&secret)));
+                    if let Err(error) = child_session.append_message(message) {
+                        return serde_json::json!({"error": error.to_string()});
+                    }
+                }
+            }
         }
-        let mut ignored = |_text: &str| Ok(());
+        if cancellation.is_cancelled() {
+            return subagent_canceled_result(&shutdown);
+        }
+        let messages = child_session.provider_messages();
+        let activity_for_stream = activity.clone();
+        let mut on_text = move |text: &str| -> std::io::Result<()> {
+            if let Some((task_id, sender)) = activity_for_stream.as_ref() {
+                let _ = sender.send(SubagentActivity::AssistantDelta {
+                    task_id: task_id.clone(),
+                    text: text.to_owned(),
+                });
+            }
+            Ok(())
+        };
         let turn = match provider.stream_chat_cancellable_with_options(
             &messages,
-            &mut ignored,
+            &mut on_text,
             &cancellation,
             true,
             false,
         ) {
             Ok(turn) => turn,
             Err(error) if error.is_cancelled() || cancellation.is_cancelled() => {
-                return serde_json::json!({"cancelled": true})
+                return subagent_canceled_result(&shutdown)
             }
             Err(error) => return serde_json::json!({"error": error.to_string()}),
         };
         if turn.tool_calls.iter().any(|call| call.name != "cmd") {
             return serde_json::json!({"error": "subagent requested an unsupported tool"});
         }
-        messages.push(ChatMessage::assistant(
-            turn.content.clone(),
-            turn.tool_calls.clone(),
-        ));
+        let safe_tool_calls = turn
+            .tool_calls
+            .iter()
+            .map(|call| safe_tool_call(call, &secret))
+            .collect::<Vec<_>>();
+        let mut assistant =
+            ChatMessage::assistant(redact_secret(&turn.content, Some(&secret)), safe_tool_calls);
+        assistant.reasoning_details = (!turn.reasoning_details.is_empty()).then(|| {
+            turn.reasoning_details
+                .iter()
+                .map(|detail| redact_json_value(detail.clone(), &secret))
+                .collect()
+        });
+        if let Err(error) = child_session.append_message(assistant) {
+            return serde_json::json!({"error": error.to_string()});
+        }
         if turn.tool_calls.is_empty() {
-            return serde_json::json!({"model": selected_model, "effort": selected_effort, "output": turn.content});
+            return serde_json::json!({"model": selected_model, "effort": selected_effort, "output": redact_secret(&turn.content, Some(&secret))});
         }
         for call in turn.tool_calls {
+            if let Some((task_id, sender)) = activity.as_ref() {
+                let _ = sender.send(SubagentActivity::ToolCall {
+                    task_id: task_id.clone(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: redact_secret(&call.arguments, Some(&secret)),
+                });
+            }
             let result = crate::command::execute_with_cancellation(
                 &call.arguments,
                 &cwd,
@@ -1150,13 +1535,34 @@ fn run_subagent(
                 Some(provider.api_key()),
                 Some(&cancellation),
             );
-            let content = match serde_json::to_string(&result) {
+            let result_value = redact_json_value(
+                serde_json::to_value(&result).unwrap_or_else(
+                    |_| serde_json::json!({"error":"unable to encode command result"}),
+                ),
+                &secret,
+            );
+            if let Some((task_id, sender)) = activity.as_ref() {
+                let _ = sender.send(SubagentActivity::ToolResult {
+                    task_id: task_id.clone(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: result_value.clone(),
+                });
+            }
+            let content = match serde_json::to_string(&result_value) {
                 Ok(content) => content,
                 Err(_) => {
                     return serde_json::json!({"error": "unable to encode subagent command result"})
                 }
             };
-            messages.push(ChatMessage::tool(call.id, call.name, content));
+            if let Err(error) =
+                child_session.append_message(ChatMessage::tool(call.id, call.name, content))
+            {
+                return serde_json::json!({"error": error.to_string()});
+            }
+            if cancellation.is_cancelled() {
+                return subagent_canceled_result(&shutdown);
+            }
         }
     }
 }
@@ -1354,11 +1760,31 @@ fn safe_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
                 object.len() == 1 && object.get("command").is_some_and(Value::is_string)
             }),
         "spawn_subagent" => parse_subagent_arguments(&call.arguments).is_ok(),
-        "check_subagent" => serde_json::from_str::<Value>(&call.arguments)
+        "check_subagent" | "cancel_subagent" => serde_json::from_str::<Value>(&call.arguments)
             .ok()
             .and_then(|value| value.as_object().cloned())
             .is_some_and(|object| {
                 object.len() == 1 && object.get("task_id").is_some_and(Value::is_string)
+            }),
+        "wait_subagent" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.get("task_id").is_some_and(Value::is_string)
+                    && object
+                        .get("timeout_ms")
+                        .is_none_or(|timeout| timeout.as_u64().is_some())
+                    && object
+                        .keys()
+                        .all(|key| key == "task_id" || key == "timeout_ms")
+            }),
+        "send_subagent" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.len() == 2
+                    && object.get("task_id").is_some_and(Value::is_string)
+                    && object.get("message").is_some_and(Value::is_string)
             }),
         _ => false,
     };
@@ -1694,19 +2120,40 @@ mod tests {
             api_key_env: key_env.clone(),
             effort: None,
         };
+        let cwd = std::env::current_dir().expect("worker cwd");
+        let home = std::env::temp_dir().join(format!("lucy-worker-session-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("worker home");
+        let mut child_session = ChildSession::create(
+            &home,
+            "parent-session",
+            &cwd,
+            "boot context".to_owned(),
+            settings.clone(),
+            "inspect many steps".to_owned(),
+            Some("provider-secret"),
+        )
+        .expect("child session");
+        let (_, commands) = mpsc::channel();
         let result = run_subagent(
             settings,
             "boot context".to_owned(),
-            std::env::current_dir().expect("worker cwd"),
+            cwd,
             "inspect many steps".to_owned(),
             None,
             None,
-            Some(CancellationToken::new()),
+            SubagentRunOptions {
+                cancellation: Some(CancellationToken::new()),
+                commands,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                activity: None,
+            },
+            &mut child_session,
         );
 
         assert_eq!(result["output"], "worker complete");
         assert_eq!(server.join().expect("worker server"), expected_requests);
         std::env::remove_var(key_env);
+        std::fs::remove_dir_all(home).expect("worker home cleanup");
     }
 
     fn normalized_provider_response(text: &str) -> String {
@@ -1831,6 +2278,7 @@ mod tests {
             attached_agents: Vec::new(),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             completed_subagents: mpsc::channel(),
+            subagent_activity: mpsc::channel(),
         };
         let cancellation = CancellationToken::new();
         let mut sink = Sink {
@@ -1866,6 +2314,76 @@ mod tests {
         assert!(!provider_text.contains("old request"));
         assert!(provider_text.contains("continue"));
 
+        std::env::remove_var(key_env);
+        std::fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn completed_subagents_are_persisted_before_the_next_parent_request() {
+        let key_env = format!("LUCY_PARENT_NOTIFICATION_KEY_{}", std::process::id());
+        std::env::set_var(&key_env, "provider-secret");
+        let home =
+            std::env::temp_dir().join(format!("lucy-parent-notification-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("home");
+        let cwd = std::env::current_dir().expect("cwd");
+        let settings = crate::config::LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: key_env.clone(),
+            effort: None,
+        };
+        let provider = Provider::new(&settings).expect("provider");
+        let session = Session::create_with_secret(
+            &home,
+            &cwd,
+            "prompt".to_owned(),
+            settings,
+            Some("provider-secret"),
+        )
+        .expect("session");
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let mut harness = Harness {
+            home: home.clone(),
+            session,
+            provider,
+            context_window: None,
+            attached_agents: Vec::new(),
+            subagents: Arc::new(Mutex::new(HashMap::new())),
+            completed_subagents: (completion_tx, completion_rx),
+            subagent_activity: mpsc::channel(),
+        };
+        harness
+            .completed_subagents
+            .0
+            .send(SubagentCompletion {
+                task_id: "subagent-1".to_owned(),
+                result: serde_json::json!({"output":"done"}),
+            })
+            .expect("completion");
+        harness
+            .drain_completed_subagents()
+            .expect("drain completion");
+
+        let last = harness
+            .session
+            .messages
+            .last()
+            .expect("parent notification");
+        assert_eq!(last.role, "user");
+        assert!(last
+            .content
+            .as_deref()
+            .is_some_and(|text| text.contains("subagent-1 completed")));
+        assert!(matches!(
+            harness.subagent_activity.1.try_recv(),
+            Ok(SubagentActivity::Completed { task_id, .. }) if task_id == "subagent-1"
+        ));
+        let raw = std::fs::read_to_string(&harness.session.path).expect("parent JSONL");
+        assert!(raw.contains("subagent-1 completed"));
+        assert!(!raw.contains("provider-secret"));
+
+        drop(harness);
         std::env::remove_var(key_env);
         std::fs::remove_dir_all(home).expect("cleanup");
     }

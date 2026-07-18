@@ -14,7 +14,7 @@ depends_on:
   - harness.configuration-and-provider
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-17"
+last_reviewed: "2026-07-19"
 ---
 
 # Session and boot context lifecycle
@@ -33,17 +33,20 @@ At new-session boot, Lucy MUST resolve and snapshot the configured system prompt
 
 Lucy MUST support append-only automatic compaction records without rewriting or deleting the earlier session history. When estimated context reaches at least 95% of the model window at a safe provider/cmd boundary, Lucy MUST use the configured model in a no-tools summary request, retain the most recent complete turns up to approximately 20,000 estimated tokens, and append a compaction record containing the summary, the retained-message boundary, and the pre-compaction token estimate. The active provider context after that boundary MUST be reconstructed as the boot system prompt, the compaction summary, and all retained/subsequent complete messages. Resume MUST apply the same latest compaction boundary. If summary generation or persistence fails, no compaction record or replacement boundary is appended; an ordinary user cancellation may still append the existing interruption record.
 
-Instruction discovery MUST include `~/.lucy/AGENTS.md` or `~/.lucy/CLAUDE.md` as the global source and `AGENTS.md`/`CLAUDE.md` along the path from Git root to cwd. For one directory, `AGENTS.md` takes precedence over `CLAUDE.md`. Files are merged from broadest to most specific. Symlinked instruction files MUST be ignored rather than followed.
+Child subagent sessions MUST use the same append-only JSONL storage and secret-safety rules as main sessions, with a separate file and a `parent_session_id` link in the child header. A child header MUST identify its `session_kind`, delegated task, cwd, and selected provider settings. Child records MUST retain the full child transcript, lifecycle transitions, terminal result/error, and interruption reason. A child process-shutdown interruption MUST be recorded as `interrupted` with reason `process_shutdown`; the first implementation MUST NOT resume a running child after a Lucy restart.
+
+Instruction discovery MUST include `$XDG_CONFIG_HOME/lucy/AGENTS.md` or `$XDG_CONFIG_HOME/lucy/CLAUDE.md` as the global source (falling back to `~/.config/lucy` when `XDG_CONFIG_HOME` is unset or empty) and `AGENTS.md`/`CLAUDE.md` along the path from Git root to cwd. For one directory, `AGENTS.md` takes precedence over `CLAUDE.md`. Files are merged from broadest to most specific. A final `AGENTS.md` or `CLAUDE.md` symlink MUST be followed when it resolves to a regular file, including a target outside the instruction directory; symlinked intermediate instruction directories MUST still be ignored.
 
 Skills MUST be discovered only from the standard `.agents/skills/<name>/SKILL.md` directories globally and along the project path. Symlinked skill directories and `SKILL.md` files MUST be ignored rather than followed. The boot prompt MUST include skill name, description, and path, but not full skill contents. The model loads a relevant skill through `cmd` when needed.
 
 ## Context and forces
 
-Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees.
+Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. The global instruction file shares Lucy's XDG configuration directory so user-owned configuration and global guidance move together.
 
 ## Invariants
 
 - Session records include the boot snapshot and all valid user, assistant, tool-call, and tool-result messages needed to reconstruct the active conversation.
+- Child session records include a parent-session link, immutable boot snapshot, delegated task, full valid transcript, and append-only lifecycle status records; child and parent files remain independently replayable.
 - Compaction records are valid JSONL, append-only, secret-safe, ordered at a complete turn boundary, and identify the summary, retained-message boundary, and token estimate. Historical messages remain available for replay even when they are omitted from the next provider context.
 - Resume and `provider_messages()` apply only the latest compaction boundary on the active session path; they do not send compacted-away raw messages in addition to the summary.
 - Interruption records are valid JSONL, append-only, secret-safe, ordered with surrounding messages, and explicitly identify user cancellation; they are replayed by the TUI.
@@ -52,7 +55,7 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 - A resumed session whose current provider key is already present in the raw file MUST be rejected and omitted from listing rather than sent or summarized; every decoded JSON value is scanned before typed deserialization, including unknown and nested fields.
 - Session appends MUST open the final path component without following symlinks, then verify the opened descriptor is a regular owner-only file before writing.
 - A resumed session sends the same boot snapshot that was recorded at session creation.
-- `AGENTS.md` wins over `CLAUDE.md` in the same directory; more specific directories are appended later.
+- `AGENTS.md` wins over `CLAUDE.md` in the same directory; the XDG Lucy config directory is the broadest global source and more specific project directories are appended later. Final instruction-file symlinks are read only through an opened regular-file descriptor, while intermediate directory symlinks remain excluded.
 - A skill catalog entry never claims to contain the full skill instructions.
 - Skill file contents loaded through `cmd` become ordinary tool results and are eligible for session persistence.
 
@@ -66,7 +69,7 @@ Users must start a new session to pick up edited ambient instructions. A resumed
 
 ## Enforcement
 
-Tests MUST create, persist, close, and resume a session; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence and skill catalog discovery; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled.
+Tests MUST create, persist, close, and resume a session; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, and skill catalog discovery; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled.
 
 ## Revisit when
 

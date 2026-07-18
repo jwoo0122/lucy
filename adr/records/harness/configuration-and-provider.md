@@ -7,13 +7,13 @@ applies_to:
   - "src/**"
   - "tests/**"
   - "README.md"
-summary: Lucy bootstraps a user-editable ~/.lucy/config.toml and reads provider credentials only from the environment.
+summary: Lucy bootstraps a user-editable XDG config file, migrates the legacy ~/.lucy/config.toml once when needed, and reads provider credentials only from the environment.
 constrains: []
 depends_on:
   - harness.agent-boundary-and-protocol
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-17"
+last_reviewed: "2026-07-19"
 ---
 
 # User-owned configuration and provider boundary
@@ -24,7 +24,7 @@ Where do Lucy's minimal system prompt and LLM connection settings live, and when
 
 ## Current decision
 
-Lucy MUST create `~/.lucy/config.toml` on first run when it does not exist, and MUST never overwrite an existing file during bootstrap or upgrade. The file MUST expose a user-editable `system_prompt` plus `[llm]` settings for `base_url`, `model`, `api_key_env`, and an optional `effort`.
+Lucy MUST create `$XDG_CONFIG_HOME/lucy/config.toml` on first run when it does not exist. When `XDG_CONFIG_HOME` is unset or empty, Lucy MUST use `~/.config/lucy/config.toml`. If that XDG destination does not exist and the legacy `~/.lucy/config.toml` exists, Lucy MUST securely migrate the legacy bytes to the destination before bootstrap. Lucy MUST never overwrite an existing XDG destination or legacy file during bootstrap or upgrade. The file MUST expose a user-editable `system_prompt` plus `[llm]` settings for `base_url`, `model`, `api_key_env`, and an optional `effort`.
 
 The generated prompt MUST be minimal and editable:
 
@@ -42,11 +42,13 @@ Lucy MUST resolve config and ambient context at new-session boot and persist the
 
 ## Context and forces
 
-Users need to inspect and change the minimal model guidance without recompiling Lucy. Cargo installation has no portable user-home post-install hook, so first-run bootstrap is the reliable installation-independent behavior. Credentials are secrets and should not enter durable user-controlled artifacts or the direct command environment. Command execution remains useful through the rest of the inherited process environment, without granting the shell the provider credential directly. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
+Users need to inspect and change the minimal model guidance without recompiling Lucy. Cargo installation has no portable user-home post-install hook, so first-run bootstrap is the reliable installation-independent behavior. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter durable user-controlled artifacts or the direct command environment. Command execution remains useful through the rest of the inherited process environment, without granting the shell the provider credential directly. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
 
 ## Invariants
 
-- Missing config is created once with safe parent-directory creation.
+- Missing XDG config is created once with safe parent-directory creation.
+- An unset, empty, or relative `XDG_CONFIG_HOME` resolves to `~/.config`; a non-empty absolute XDG home determines the configuration root.
+- When no XDG config exists, a regular non-symlink legacy `~/.lucy/config.toml` is migrated once without changing its bytes; an existing XDG config always wins.
 - Existing config bytes are not replaced by defaults.
 - The active API key never appears in error text, JSONL output, or newly written session JSONL; unsafe key values are rejected before output.
 - The configured provider API-key environment variable is removed from every Lucy child environment, including context-discovery helpers and `cmd` shells.
@@ -64,11 +66,11 @@ A compiled prompt would be simpler but violate user ownership. An installer-spec
 
 ## Consequences
 
-The first run mutates the user's home directory. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for v1.
+The first run mutates the user's XDG configuration directory (or `~/.config` by default). Upgrading an installation with only a legacy config moves that config to the XDG location; sessions remain in `~/.lucy/sessions`. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for v1.
 
 ## Enforcement
 
-Tests MUST cover first-run creation, no-overwrite behavior, config parsing, environment-key lookup, redaction, prompt snapshot stability, provider-catalog fallback behavior, settings persistence, resume-time model/effort reload, and provider-settings audit records.
+Tests MUST cover XDG and default-path first-run creation, legacy-config migration, no-overwrite behavior, config parsing, environment-key lookup, redaction, prompt snapshot stability, provider-catalog fallback behavior, settings persistence, resume-time model/effort reload, and provider-settings audit records.
 
 ## Revisit when
 

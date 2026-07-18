@@ -472,10 +472,10 @@ fn write_config_with_api_key_env(
     model: &str,
     api_key_env: &str,
 ) {
-    fs::create_dir_all(home.join(".lucy")).expect("Lucy directory");
+    fs::create_dir_all(home.join(".config/lucy")).expect("Lucy config directory");
     let escaped_prompt = prompt.replace('"', "\\\"");
     fs::write(
-        home.join(".lucy/config.toml"),
+        home.join(".config/lucy/config.toml"),
         format!(
             "system_prompt = \"{escaped_prompt}\"\n\n[llm]\nbase_url = \"{base_url}\"\nmodel = \"{model}\"\napi_key_env = \"{api_key_env}\"\n"
         ),
@@ -484,10 +484,10 @@ fn write_config_with_api_key_env(
 }
 
 fn write_config_with_effort(home: &Path, base_url: &str, prompt: &str, model: &str, effort: &str) {
-    fs::create_dir_all(home.join(".lucy")).expect("Lucy directory");
+    fs::create_dir_all(home.join(".config/lucy")).expect("Lucy config directory");
     let escaped_prompt = prompt.replace('"', "\\\"");
     fs::write(
-        home.join(".lucy/config.toml"),
+        home.join(".config/lucy/config.toml"),
         format!(
             "system_prompt = \"{escaped_prompt}\"\n\n[llm]\nbase_url = \"{base_url}\"\nmodel = \"{model}\"\napi_key_env = \"LUCY_API_KEY\"\neffort = \"{effort}\"\n"
         ),
@@ -522,6 +522,7 @@ fn run_lucy_with_key_env(
         .args(args)
         .current_dir(cwd)
         .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
         .env("LUCY_API_KEY", api_key)
         .env(api_key_env, api_key)
         .env("LUCY_TEST_KEY", api_key)
@@ -1521,9 +1522,9 @@ fn empty_non_sse_malformed_and_incomplete_successes_are_errors() {
 #[test]
 fn malformed_config_diagnostic_does_not_echo_source_or_api_key() {
     let (home, project) = temporary_tree("malformed-config-provider-secret");
-    fs::create_dir_all(home.join(".lucy")).expect("Lucy directory");
+    fs::create_dir_all(home.join(".config/lucy")).expect("Lucy config directory");
     fs::write(
-        home.join(".lucy/config.toml"),
+        home.join(".config/lucy/config.toml"),
         "system_prompt = \"provider-secret\n[llm]\nmodel = [\n",
     )
     .expect("malformed config");
@@ -1558,7 +1559,7 @@ fn version_prints_without_bootstrapping_configuration() {
         concat!("lucy ", env!("CARGO_PKG_VERSION"), "\n")
     );
     assert!(output.stderr.is_empty());
-    assert!(!home.join(".lucy/config.toml").exists());
+    assert!(!home.join(".config/lucy/config.toml").exists());
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -1599,7 +1600,7 @@ fn forced_jsonl_keeps_the_machine_protocol() {
 #[test]
 fn list_sessions_bootstraps_config_without_validating_provider_settings() {
     let (home, project) = temporary_tree("list-bootstrap");
-    let config_path = home.join(".lucy/config.toml");
+    let config_path = home.join(".config/lucy/config.toml");
     assert!(!config_path.exists());
 
     let output = run_lucy(&home, &project, &["--list-sessions"], "");
@@ -1625,7 +1626,7 @@ fn generated_config_is_not_written_when_it_contains_the_active_key() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("OPENROUTER_API_KEY"));
-    assert!(!home.join(".lucy/config.toml").exists());
+    assert!(!home.join(".config/lucy/config.toml").exists());
     fs::remove_dir_all(home).expect("cleanup");
 }
 
@@ -1798,7 +1799,7 @@ fn resume_rejects_malformed_current_config_without_leaking_secrets() {
         .to_owned();
 
     fs::write(
-        home.join(".lucy/config.toml"),
+        home.join(".config/lucy/config.toml"),
         "system_prompt = \"malformed provider-secret\n[llm]\nmodel = [\n",
     )
     .expect("malformed changed config");
@@ -1867,7 +1868,7 @@ fn missing_resume_is_a_stderr_failure_without_protocol_leak() {
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("provider-secret"));
     assert!(output.stdout.is_empty());
-    assert!(!home.join(".lucy/config.toml").exists());
+    assert!(!home.join(".config/lucy/config.toml").exists());
     fs::remove_dir_all(home).expect("cleanup");
 }
 
@@ -1882,7 +1883,7 @@ fn unknown_cli_argument_diagnostic_does_not_echo_value_before_bootstrap() {
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("provider-secret"));
     assert!(output.stdout.is_empty());
-    assert!(!home.join(".lucy/config.toml").exists());
+    assert!(!home.join(".config/lucy/config.toml").exists());
     fs::remove_dir_all(home).expect("cleanup");
 }
 
@@ -1894,7 +1895,7 @@ fn early_diagnostics_redact_environment_keys_before_config_loading() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
-        assert!(!home.join(".lucy/config.toml").exists());
+        assert!(!home.join(".config/lucy/config.toml").exists());
         fs::remove_dir_all(home).expect("cleanup");
     }
 }

@@ -44,6 +44,173 @@ impl From<io::Error> for SessionError {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildSessionStatus {
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "record")]
+enum ChildSessionRecord {
+    #[serde(rename = "subagent_session")]
+    Session {
+        version: u8,
+        session_id: String,
+        session_kind: String,
+        parent_session_id: String,
+        cwd: String,
+        boot_system_prompt: String,
+        llm: LlmSettings,
+        task: String,
+    },
+    #[serde(rename = "message")]
+    Message {
+        timestamp: u64,
+        message: ChatMessage,
+    },
+    #[serde(rename = "status")]
+    Status {
+        timestamp: u64,
+        status: ChildSessionStatus,
+        reason: Option<String>,
+        result: Option<Value>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ChildSession {
+    pub id: String,
+    pub path: PathBuf,
+    pub parent_session_id: String,
+    pub cwd: PathBuf,
+    pub boot_system_prompt: String,
+    pub llm: LlmSettings,
+    pub task: String,
+    pub messages: Vec<ChatMessage>,
+    pub status: ChildSessionStatus,
+    secret: Option<String>,
+}
+
+impl ChildSession {
+    pub fn create(
+        home: &Path,
+        parent_session_id: &str,
+        cwd: &Path,
+        boot_system_prompt: String,
+        llm: LlmSettings,
+        task: String,
+        secret: Option<&str>,
+    ) -> Result<Self, SessionError> {
+        let cwd = fs::canonicalize(cwd)
+            .map_err(|_| SessionError::new("unable to resolve subagent cwd"))?;
+        let directory = sessions_dir(home);
+        ensure_private_dir(&lucy_dir(home))?;
+        ensure_private_dir(&directory)?;
+        let id = format!("subagent-{}", new_session_id());
+        let path = directory.join(format!("{id}.jsonl"));
+        let record = ChildSessionRecord::Session {
+            version: 1,
+            session_id: id.clone(),
+            session_kind: "subagent".to_owned(),
+            parent_session_id: parent_session_id.to_owned(),
+            cwd: cwd.display().to_string(),
+            boot_system_prompt: boot_system_prompt.clone(),
+            llm: llm.clone(),
+            task: task.clone(),
+        };
+        if let Some(secret) = secret {
+            if child_record_contains_secret(&record, secret) {
+                return Err(SessionError::new("subagent session record rejected"));
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .map_err(|_| SessionError::new("unable to create subagent session file"))?;
+        ensure_private_file(&path)?;
+        write_json_record(&mut file, &record)?;
+        write_json_record(
+            &mut file,
+            &ChildSessionRecord::Status {
+                timestamp: now(),
+                status: ChildSessionStatus::Running,
+                reason: None,
+                result: None,
+            },
+        )?;
+        Ok(Self {
+            id,
+            path,
+            parent_session_id: parent_session_id.to_owned(),
+            cwd,
+            boot_system_prompt,
+            llm,
+            task,
+            messages: Vec::new(),
+            status: ChildSessionStatus::Running,
+            secret: secret.map(str::to_owned),
+        })
+    }
+
+    pub fn append_message(&mut self, message: ChatMessage) -> Result<(), SessionError> {
+        let record = ChildSessionRecord::Message {
+            timestamp: now(),
+            message: message.clone(),
+        };
+        if self
+            .secret
+            .as_deref()
+            .is_some_and(|secret| child_record_contains_secret(&record, secret))
+        {
+            return Err(SessionError::new("subagent session record rejected"));
+        }
+        let mut file = open_session_for_append(&self.path)?;
+        write_json_record(&mut file, &record)?;
+        self.messages.push(message);
+        Ok(())
+    }
+
+    pub fn append_status(
+        &mut self,
+        status: ChildSessionStatus,
+        reason: Option<String>,
+        result: Option<Value>,
+    ) -> Result<(), SessionError> {
+        let record = ChildSessionRecord::Status {
+            timestamp: now(),
+            status,
+            reason,
+            result,
+        };
+        if self
+            .secret
+            .as_deref()
+            .is_some_and(|secret| child_record_contains_secret(&record, secret))
+        {
+            return Err(SessionError::new("subagent session record rejected"));
+        }
+        let mut file = open_session_for_append(&self.path)?;
+        write_json_record(&mut file, &record)?;
+        self.status = status;
+        Ok(())
+    }
+
+    pub fn provider_messages(&self) -> Vec<ChatMessage> {
+        let mut messages = Vec::with_capacity(self.messages.len() + 1);
+        messages.push(ChatMessage::system(self.boot_system_prompt.clone()));
+        messages.extend(self.messages.iter().cloned());
+        messages
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "record")]
 enum SessionRecord {
@@ -1030,13 +1197,24 @@ fn open_session_for_append(path: &Path) -> Result<File, SessionError> {
     Ok(file)
 }
 
-fn write_record(file: &mut File, record: &SessionRecord) -> Result<(), SessionError> {
+fn write_json_record<T: Serialize>(file: &mut File, record: &T) -> Result<(), SessionError> {
     let line = serde_json::to_string(record)
         .map_err(|error| SessionError::new(format!("unable to encode session record: {error}")))?;
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
     file.flush()?;
     Ok(())
+}
+
+fn write_record(file: &mut File, record: &SessionRecord) -> Result<(), SessionError> {
+    write_json_record(file, record)
+}
+
+fn child_record_contains_secret<T: Serialize>(record: &T, secret: &str) -> bool {
+    !secret.is_empty()
+        && serde_json::to_vec(record)
+            .ok()
+            .is_some_and(|serialized| bytes_contain_secret(&serialized, secret))
 }
 
 const COMPACTION_SUMMARY_PREFIX: &str = "<context_compaction>\nThe earlier conversation was compacted. Treat the following summary as authoritative context for the continued turn.\n\n";
@@ -1481,6 +1659,55 @@ mod tests {
             .append_message(assistant)
             .expect_err("secret reasoning details");
         assert_eq!(error.to_string(), "session record rejected");
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn child_session_persists_parent_link_transcript_and_terminal_status() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let key_env = format!("LUCY_CHILD_SESSION_KEY_{}", std::process::id());
+        std::env::set_var(&key_env, "provider-secret");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: key_env.clone(),
+            effort: Some("medium".to_owned()),
+        };
+        let mut child = ChildSession::create(
+            &home,
+            "parent-session",
+            &cwd,
+            "boot context".to_owned(),
+            llm,
+            "inspect the worker".to_owned(),
+            Some("provider-secret"),
+        )
+        .expect("child session");
+        child
+            .append_message(ChatMessage::user("inspect the worker".to_owned()))
+            .expect("task message");
+        child
+            .append_message(ChatMessage::assistant("done".to_owned(), Vec::new()))
+            .expect("assistant message");
+        child
+            .append_status(
+                ChildSessionStatus::Completed,
+                None,
+                Some(serde_json::json!({"output":"done"})),
+            )
+            .expect("status");
+
+        let raw = fs::read_to_string(&child.path).expect("child JSONL");
+        assert!(raw.contains("\"record\":\"subagent_session\""));
+        assert!(raw.contains("\"parent_session_id\":\"parent-session\""));
+        assert!(raw.contains("\"session_kind\":\"subagent\""));
+        assert!(raw.contains("\"status\":\"completed\""));
+        assert!(!raw.contains("provider-secret"));
+        assert_eq!(child.provider_messages().len(), 3);
+        assert_eq!(child.status, ChildSessionStatus::Completed);
+
+        std::env::remove_var(key_env);
         fs::remove_dir_all(home).expect("remove temp home");
     }
 

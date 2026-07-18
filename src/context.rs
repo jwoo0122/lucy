@@ -13,6 +13,8 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::config_dir;
+
 #[derive(Debug)]
 pub struct ContextError(String);
 
@@ -87,7 +89,7 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
     let project_directories = ancestor_directories(&root, &cwd);
 
     let mut instruction_files = Vec::new();
-    if let Some(instruction) = preferred_instruction(&home.join(".lucy"))? {
+    if let Some(instruction) = preferred_instruction(&config_dir(home))? {
         instruction_files.push(instruction);
     }
     for directory in &project_directories {
@@ -198,6 +200,26 @@ fn open_directory_at(parent: RawFd, name: &OsStr) -> io::Result<Option<fs::File>
 }
 
 #[cfg(unix)]
+fn open_instruction_file_at(parent: RawFd, name: &OsStr) -> io::Result<Option<fs::File>> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_error| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if path_component_unavailable(&error) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
 fn open_file_at(parent: RawFd, name: &OsStr) -> io::Result<Option<fs::File>> {
     let name = CString::new(name.as_bytes())
         .map_err(|_error| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
@@ -258,6 +280,10 @@ impl ContextDirectory {
         Ok(Some(Self { file }))
     }
 
+    fn open_instruction_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
+        open_instruction_file_at(self.file.as_raw_fd(), name)
+    }
+
     fn open_regular_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
         open_file_at(self.file.as_raw_fd(), name)
     }
@@ -282,6 +308,10 @@ impl ContextDirectory {
 
     fn open_child_directory(&self, name: &OsStr) -> io::Result<Option<Self>> {
         Self::open(&self.path.join(name))
+    }
+
+    fn open_instruction_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
+        open_instruction_file(&self.path.join(name))
     }
 
     fn open_regular_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
@@ -399,6 +429,19 @@ fn read_directory_entries(file: &fs::File) -> io::Result<Vec<OsString>> {
 }
 
 #[cfg(not(unix))]
+fn open_instruction_file(path: &Path) -> io::Result<Option<fs::File>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(unix))]
 fn open_regular_file(path: &Path) -> io::Result<Option<fs::File>> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -437,7 +480,7 @@ fn preferred_instruction(directory: &Path) -> Result<Option<InstructionSource>, 
 
     for name in [OsStr::new("AGENTS.md"), OsStr::new("CLAUDE.md")] {
         let Some(file) = directory_fd
-            .open_regular_file(name)
+            .open_instruction_file(name)
             .map_err(|_error| ContextError::new("unable to inspect instruction context"))?
         else {
             continue;
@@ -693,9 +736,9 @@ mod tests {
     fn context_uses_precedence_and_specific_skill_override() {
         let (home, cwd) = temporary_tree();
         let project = home.join("project");
-        fs::create_dir_all(home.join(".lucy")).expect("global dir");
-        fs::write(home.join(".lucy").join("CLAUDE.md"), "global claude").expect("global");
-        fs::write(home.join(".lucy").join("AGENTS.md"), "global agents").expect("global agents");
+        fs::create_dir_all(config_dir(&home)).expect("global dir");
+        fs::write(config_dir(&home).join("CLAUDE.md"), "global claude").expect("global");
+        fs::write(config_dir(&home).join("AGENTS.md"), "global agents").expect("global agents");
         fs::write(project.join("CLAUDE.md"), "root claude").expect("root claude");
         fs::write(project.join("AGENTS.md"), "root agents").expect("root agents");
         fs::write(cwd.join("CLAUDE.md"), "nested claude").expect("nested claude");
@@ -724,6 +767,10 @@ mod tests {
 
         let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
         assert_eq!(context.instruction_files.len(), 3);
+        assert_eq!(
+            context.instruction_files[0].path,
+            config_dir(&home).join("AGENTS.md")
+        );
         assert!(context.instruction_files[0]
             .contents
             .contains("global agents"));
@@ -760,17 +807,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn context_ignores_symlinked_instruction_and_skill_sources() {
+    fn context_follows_symlinked_instruction_files_but_ignores_symlinked_skills() {
         let (home, cwd) = temporary_tree();
         let project = home.join("project");
-        fs::create_dir_all(home.join(".lucy")).expect("global directory");
+        fs::create_dir_all(config_dir(&home)).expect("global directory");
         let global_instruction_target = home.join("global-instructions.md");
         fs::write(&global_instruction_target, "symlinked global instructions")
             .expect("global target");
-        symlink(&global_instruction_target, home.join(".lucy/AGENTS.md"))
-            .expect("global instruction symlink");
-        fs::write(home.join(".lucy/CLAUDE.md"), "real global instructions")
-            .expect("global fallback");
+        symlink(
+            &global_instruction_target,
+            config_dir(&home).join("AGENTS.md"),
+        )
+        .expect("global instruction symlink");
+        fs::write(
+            config_dir(&home).join("CLAUDE.md"),
+            "real global instructions",
+        )
+        .expect("global fallback");
 
         let project_instruction_target = home.join("project-instructions.md");
         fs::write(
@@ -831,14 +884,29 @@ mod tests {
         symlink(&project_skill_target, project.join(".agents/skills")).expect("skill root symlink");
 
         let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
-        assert_eq!(context.instruction_files.len(), 1);
+        assert_eq!(context.instruction_files.len(), 2);
+        assert_eq!(
+            context.instruction_files[0].path,
+            config_dir(&home).join("AGENTS.md")
+        );
         assert_eq!(
             context.instruction_files[0].contents,
-            "real global instructions"
+            "symlinked global instructions"
+        );
+        assert_eq!(context.instruction_files[1].path, project.join("AGENTS.md"));
+        assert_eq!(
+            context.instruction_files[1].contents,
+            "symlinked project instructions"
         );
         assert_eq!(context.skills.len(), 1);
         assert_eq!(context.skills[0].name, "valid");
-        assert!(!context.system_prompt.contains("symlinked"));
+        assert!(context
+            .system_prompt
+            .contains("symlinked global instructions"));
+        assert!(context
+            .system_prompt
+            .contains("symlinked project instructions"));
+        assert!(!context.system_prompt.contains("real global instructions"));
         assert!(!context.system_prompt.contains("linked-directory"));
         assert!(!context.system_prompt.contains("linked-file"));
         assert!(!context.system_prompt.contains("project-only"));
@@ -851,9 +919,9 @@ mod tests {
     fn context_ignores_symlinked_intermediate_parents() {
         let (home, cwd) = temporary_tree();
         let linked_home_target = home.join("linked-home-target");
-        fs::create_dir_all(linked_home_target.join(".lucy")).expect("linked Lucy directory");
+        fs::create_dir_all(linked_home_target.join(".config/lucy")).expect("linked Lucy directory");
         fs::write(
-            linked_home_target.join(".lucy/AGENTS.md"),
+            linked_home_target.join(".config/lucy/AGENTS.md"),
             "symlinked intermediate instructions",
         )
         .expect("linked instructions");
