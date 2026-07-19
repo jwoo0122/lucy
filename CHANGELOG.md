@@ -6,6 +6,17 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0](https://github.com/jwoo0122/lucy/compare/v1.4.1...v1.5.0) - 2026-07-19
+
+### Added
+
+- refine ux 3
+- subprocess lifecycle
+
+### Fixed
+
+- tui
+
 ## [1.4.1](https://github.com/jwoo0122/lucy/compare/v1.4.0...v1.4.1) - 2026-07-18
 
 ### Fixed
