@@ -30,8 +30,8 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
-const SPAWN_SUBAGENT_DESCRIPTION: &str = "Start an isolated background task and immediately return its task ID. Continue your own work without waiting; when the worker finishes, Lucy automatically starts a follow-up main-agent turn and delivers the completion result. Do not poll with check_subagent unless you need an intermediate status. The worker has cmd but cannot delegate further.";
-const CHECK_SUBAGENT_DESCRIPTION: &str = "Inspect an in-process background subagent only when you need an intermediate status or an on-demand result. Do not poll repeatedly: when the worker finishes, Lucy automatically starts a follow-up main-agent turn and delivers the result, so continue your own work instead.";
+const SPAWN_SUBAGENT_DESCRIPTION: &str = "Start an isolated background task and immediately return its task ID. The worker always inherits the current session model and reasoning effort; callers cannot override either setting. Continue your own work without waiting; when the worker finishes, Lucy resumes the attached logical turn with a typed background result instead of creating user input or a separate user turn. Do not poll with check_subagent unless you need an intermediate status. The worker has cmd but cannot delegate further.";
+const CHECK_SUBAGENT_DESCRIPTION: &str = "Inspect an in-process background subagent only when you need an intermediate status or an on-demand result. Do not poll repeatedly: when the worker finishes, Lucy resumes the attached logical turn with its typed result, so continue your own work instead.";
 const WAIT_SUBAGENT_DESCRIPTION: &str = "Wait for a background subagent to reach a terminal state. A timeout only ends the wait; it does not cancel the subagent.";
 const SEND_SUBAGENT_DESCRIPTION: &str = "Queue an additional message for a running background subagent. It is delivered at the worker's next safe provider boundary.";
 const CANCEL_SUBAGENT_DESCRIPTION: &str =
@@ -246,7 +246,7 @@ fn chat_request(
             }
         })];
         if include_subagents {
-            tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":SPAWN_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
+            tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":SPAWN_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
             tools.push(json!({"type":"function","function":{"name":"check_subagent","description":CHECK_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
             tools.push(json!({"type":"function","function":{"name":"wait_subagent","description":WAIT_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["task_id"],"additionalProperties":false}}}));
             tools.push(json!({"type":"function","function":{"name":"send_subagent","description":SEND_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","message"],"additionalProperties":false}}}));
@@ -1198,12 +1198,21 @@ mod tests {
 
         let spawn = description("spawn_subagent");
         assert!(spawn.contains("Continue your own work without waiting"));
-        assert!(spawn.contains("automatically starts a follow-up main-agent turn"));
+        assert!(spawn.contains("resumes the attached logical turn"));
+        assert!(spawn.contains("instead of creating user input or a separate user turn"));
         assert!(spawn.contains("Do not poll with check_subagent"));
+        assert!(spawn.contains("always inherits the current session model and reasoning effort"));
+        assert!(spawn.contains("cannot override either setting"));
+        let spawn_properties = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "spawn_subagent")
+            .and_then(|tool| tool["function"]["parameters"]["properties"].as_object())
+            .expect("spawn_subagent properties");
+        assert_eq!(spawn_properties.keys().collect::<Vec<_>>(), vec!["task"]);
 
         let check = description("check_subagent");
         assert!(check.contains("Do not poll repeatedly"));
-        assert!(check.contains("automatically starts a follow-up main-agent turn"));
+        assert!(check.contains("resumes the attached logical turn"));
         assert!(check.contains("continue your own work instead"));
 
         assert!(description("wait_subagent").contains("timeout only ends the wait"));

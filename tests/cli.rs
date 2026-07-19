@@ -1984,9 +1984,7 @@ fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
 
 #[test]
 fn spawn_subagent_queues_immediately_and_automatically_delivers_completion() {
-    let arguments =
-        json!({"task": "inspect only this task", "model": "worker-model", "effort": "high"})
-            .to_string();
+    let arguments = json!({"task": "inspect only this task"}).to_string();
     let tool = json!({"id":"provider-id","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"delegate-1","type":"function","function":{"name":"spawn_subagent","arguments":arguments}}]},"finish_reason":"tool_calls"}]});
     let response = format!("data: {tool}\n\ndata: [DONE]\n\n");
     let server = MockServer::start(vec![
@@ -1996,7 +1994,13 @@ fn spawn_subagent_queues_immediately_and_automatically_delivers_completion() {
         normal_response("completion acknowledged"),
     ]);
     let (home, project) = temporary_tree("queued-subagent");
-    write_config(&home, &server.base_url, "base prompt", "parent-model");
+    write_config_with_effort(
+        &home,
+        &server.base_url,
+        "base prompt",
+        "parent-model",
+        "high",
+    );
     let output = run_lucy(
         &home,
         &project,
@@ -2024,8 +2028,15 @@ fn spawn_subagent_queues_immediately_and_automatically_delivers_completion() {
     let worker: Value = requests
         .iter()
         .map(|request| serde_json::from_str(request).expect("request JSON"))
-        .find(|request: &Value| request["model"] == "worker-model")
+        .find(|request: &Value| {
+            request["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["content"] == "inspect only this task")
+            })
+        })
         .expect("worker request");
+    assert_eq!(worker["model"], "parent-model");
     assert_eq!(worker["reasoning_effort"], "high");
     assert_eq!(
         worker["messages"]
@@ -2040,9 +2051,56 @@ fn spawn_subagent_queues_immediately_and_automatically_delivers_completion() {
         .expect("worker tools")
         .iter()
         .all(|tool| tool["function"]["name"] != "spawn_subagent"));
-    assert!(requests
+    let lifecycle = records
         .iter()
-        .any(|request| request.contains("Background subagent subagent-")
-            && request.contains("worker result")));
+        .filter(|record| {
+            matches!(
+                record["type"].as_str(),
+                Some("background_result_pending" | "background_result_delivered")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle.len(), 2);
+    assert_eq!(lifecycle[0]["type"], "background_result_pending");
+    assert_eq!(lifecycle[1]["type"], "background_result_delivered");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "turn_end")
+            .count(),
+        1
+    );
+    let resumed_parent = requests
+        .iter()
+        .map(|request| serde_json::from_str::<Value>(request).expect("request JSON"))
+        .find(|request| {
+            request["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "tool" && message["name"] == "background_result"
+                })
+            })
+        })
+        .expect("same-turn resumed parent request");
+    let messages = resumed_parent["messages"].as_array().expect("messages");
+    let synthetic = messages
+        .iter()
+        .position(|message| {
+            message["role"] == "assistant"
+                && message["tool_calls"][0]["function"]["name"] == "background_result"
+        })
+        .expect("synthetic assistant call");
+    assert_eq!(messages[synthetic + 1]["role"], "tool");
+    assert_eq!(messages[synthetic + 1]["name"], "background_result");
+    assert!(messages.iter().all(|message| {
+        message["role"] != "user"
+            || !message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("worker result"))
+    }));
+    assert!(resumed_parent["tools"]
+        .as_array()
+        .expect("model tools")
+        .iter()
+        .all(|tool| tool["function"]["name"] != "background_result"));
     fs::remove_dir_all(home).expect("cleanup");
 }

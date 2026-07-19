@@ -22,6 +22,22 @@ pub enum ProtocolEvent {
         name: String,
         result: Value,
     },
+    #[serde(rename = "background_result_pending")]
+    BackgroundResultPending {
+        completion_id: String,
+        task_id: String,
+        child_session_id: String,
+        status: String,
+        result: Value,
+        completed_at: u64,
+    },
+    #[serde(rename = "background_result_delivered")]
+    BackgroundResultDelivered {
+        completion_id: String,
+        task_id: String,
+        logical_turn_id: String,
+        delivery: String,
+    },
     #[serde(rename = "turn_end")]
     TurnEnd,
     #[serde(rename = "turn_interrupted")]

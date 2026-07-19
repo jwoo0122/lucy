@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use serde::Deserialize;
@@ -17,7 +17,9 @@ use crate::redaction::{
     conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key, redact_secret,
     redaction_marker,
 };
-use crate::session::{ChildSession, ChildSessionStatus, Session};
+use crate::session::{
+    BackgroundResultDelivery, BackgroundResultPending, ChildSession, ChildSessionStatus, Session,
+};
 
 #[derive(Debug)]
 struct CliOptions {
@@ -37,7 +39,6 @@ struct InputRecord {
 
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 const MAX_SUBAGENT_TASK_BYTES: usize = 64 * 1024;
-static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
 const USER_CANCEL_REASON: &str = "user_cancelled";
 const PROVIDER_PHASE: &str = "provider_stream";
 const COMMAND_PHASE: &str = "cmd";
@@ -385,15 +386,20 @@ where
         }
     });
     let mut input_closed = false;
-    while !input_closed || harness.has_running_subagents() {
+    loop {
         while harness.next_subagent_activity().is_some() {}
-        if let Some(completion) = harness.next_subagent_completion() {
-            let notification = Harness::subagent_notification(&completion);
-            if let Err(error) = harness.handle_message(&notification, &mut protocol, None) {
+        if let Err(error) = harness.collect_completed_subagents(&mut protocol) {
+            let error = redact_secret(&error, Some(harness.provider.api_key()));
+            let _ = protocol.error(&error);
+        }
+        if input_closed && !harness.has_running_subagents() {
+            // Completion publication precedes the registry's terminal transition,
+            // so this final drain emits every lifecycle event before EOF exit.
+            if let Err(error) = harness.collect_completed_subagents(&mut protocol) {
                 let error = redact_secret(&error, Some(harness.provider.api_key()));
                 let _ = protocol.error(&error);
             }
-            continue;
+            break;
         }
         let line = match input_rx.recv_timeout(std::time::Duration::from_millis(25)) {
             Ok(Ok(line)) => line,
@@ -500,7 +506,7 @@ impl Drop for Harness {
                 states
                     .values()
                     .filter_map(|state| match state {
-                        SubagentState::Running(control) => Some(control.clone()),
+                        SubagentState::Running { control, .. } => Some(control.clone()),
                         SubagentState::Completed(_) => None,
                     })
                     .collect::<Vec<_>>()
@@ -522,6 +528,11 @@ impl Drop for Harness {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let _ = wake.wait_timeout(result, remaining);
         }
+        while let Ok(completion) = self.completed_subagents.1.try_recv() {
+            let _ = self
+                .session
+                .append_background_result_pending(pending_from_completion(completion));
+        }
     }
 }
 
@@ -540,13 +551,22 @@ struct SubagentControl {
 
 #[derive(Clone)]
 enum SubagentState {
-    Running(SubagentControl),
+    Running {
+        control: SubagentControl,
+        attached_turn_id: String,
+    },
     Completed(Value),
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct SubagentCompletion {
+    pub(crate) completion_id: String,
     pub(crate) task_id: String,
+    pub(crate) child_session_id: String,
+    pub(crate) task: String,
+    pub(crate) status: ChildSessionStatus,
     pub(crate) result: Value,
+    pub(crate) completed_at: u64,
 }
 
 /// TUI-only worker activity. Normal worker messages and tool activity reuse
@@ -563,10 +583,6 @@ pub(crate) enum SubagentActivity {
     },
     ReasoningCompleted {
         task_id: String,
-    },
-    Completed {
-        task_id: String,
-        result: Value,
     },
 }
 
@@ -620,28 +636,27 @@ impl Harness {
         self.subagent_activity.1.try_recv().ok()
     }
 
-    pub(crate) fn subagent_notification(completion: &SubagentCompletion) -> String {
-        let status = terminal_status(&completion.result);
-        format!(
-            "Background subagent {} {status}. Deliver this result to the user and continue the task: {}",
-            completion.task_id,
-            serde_json::to_string(&completion.result).unwrap_or_else(|_| "{\"error\":\"unable to encode subagent result\"}".to_owned())
-        )
+    /// Transfer the TUI-only activity stream to the frontend so worker output
+    /// can be rendered while the harness thread is blocked in a provider turn.
+    /// The matching sender remains in the harness and is cloned into workers.
+    pub(crate) fn take_subagent_activity_receiver(&mut self) -> mpsc::Receiver<SubagentActivity> {
+        let (_, replacement) = mpsc::channel();
+        std::mem::replace(&mut self.subagent_activity.1, replacement)
     }
 
     fn has_running_subagents(&self) -> bool {
         self.subagents.lock().is_ok_and(|states| {
             states
                 .values()
-                .any(|state| matches!(state, SubagentState::Running(_)))
+                .any(|state| matches!(state, SubagentState::Running { .. }))
         })
     }
 
-    fn spawn_subagent(&self, task: String, model: Option<String>, effort: Option<String>) -> Value {
+    fn spawn_subagent(&self, task: String, logical_turn_id: &str) -> Value {
         let under_limit = self.subagents.lock().ok().is_some_and(|states| {
             states
                 .values()
-                .filter(|state| matches!(state, SubagentState::Running(_)))
+                .filter(|state| matches!(state, SubagentState::Running { .. }))
                 .count()
                 < MAX_CONCURRENT_SUBAGENTS
         });
@@ -675,10 +690,7 @@ impl Harness {
             done: Arc::clone(&done),
             shutdown: Arc::clone(&shutdown),
         };
-        let task_id = format!(
-            "subagent-{}",
-            NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed)
-        );
+        let task_id = child_session.id.clone();
         {
             let mut subagents = match self.subagents.lock() {
                 Ok(subagents) => subagents,
@@ -686,19 +698,27 @@ impl Harness {
             };
             let running = subagents
                 .values()
-                .filter(|state| matches!(state, SubagentState::Running(_)))
+                .filter(|state| matches!(state, SubagentState::Running { .. }))
                 .count();
             if running >= MAX_CONCURRENT_SUBAGENTS {
                 return serde_json::json!({"error": format!("subagent concurrency limit is {MAX_CONCURRENT_SUBAGENTS}")});
             }
-            subagents.insert(task_id.clone(), SubagentState::Running(control.clone()));
+            subagents.insert(
+                task_id.clone(),
+                SubagentState::Running {
+                    control: control.clone(),
+                    attached_turn_id: logical_turn_id.to_owned(),
+                },
+            );
         }
 
+        let child_session_id = child_session.id.clone();
         let states = Arc::clone(&self.subagents);
         let completed = self.completed_subagents.0.clone();
         let activity = self.subagent_activity.0.clone();
-        let completion_id = task_id.clone();
+        let completion_task_id = task_id.clone();
         let activity_id = task_id.clone();
+        let completion_task = task.clone();
         std::thread::spawn(move || {
             let mut child_session = child_session;
             let raw_result = run_subagent(
@@ -706,8 +726,6 @@ impl Harness {
                 boot,
                 cwd,
                 task,
-                model,
-                effort,
                 SubagentRunOptions {
                     cancellation: Some(cancellation),
                     commands: command_rx,
@@ -731,12 +749,21 @@ impl Harness {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let _ = child_session.append_status(status, reason, Some(result.clone()));
-            let _ = completed.send(SubagentCompletion {
-                task_id: completion_id.clone(),
+            let completion = SubagentCompletion {
+                completion_id: completion_id_for_child(&child_session_id),
+                task_id: completion_task_id.clone(),
+                child_session_id,
+                task: completion_task,
+                status,
                 result: result.clone(),
-            });
+                completed_at: unix_timestamp(),
+            };
+            let _ = completed.send(completion);
             if let Ok(mut states) = states.lock() {
-                states.insert(completion_id, SubagentState::Completed(result.clone()));
+                states.insert(
+                    completion_task_id.clone(),
+                    SubagentState::Completed(result.clone()),
+                );
             }
             let (result_slot, wake) = &*done;
             if let Ok(mut slot) = result_slot.lock() {
@@ -747,19 +774,144 @@ impl Harness {
         serde_json::json!({"task_id": task_id, "status": "queued"})
     }
 
-    fn drain_completed_subagents(&mut self) -> Result<(), String> {
-        while let Some(completion) = self.next_subagent_completion() {
-            let notification = Self::subagent_notification(&completion);
-            self.session
-                .append_message(ChatMessage::user(redact_secret(
-                    &notification,
-                    Some(self.provider.api_key()),
-                )))
-                .map_err(|error| error.to_string())?;
-            let _ = self.subagent_activity.0.send(SubagentActivity::Completed {
+    fn persist_completion<S: EventSink>(
+        &mut self,
+        completion: SubagentCompletion,
+        sink: &mut S,
+    ) -> Result<(), String> {
+        let pending = pending_from_completion(completion.clone());
+        if self
+            .session
+            .append_background_result_pending(pending)
+            .map_err(|error| error.to_string())?
+        {
+            sink.emit_event(&ProtocolEvent::BackgroundResultPending {
+                completion_id: completion.completion_id,
                 task_id: completion.task_id,
+                child_session_id: completion.child_session_id,
+                status: child_status_name(completion.status).to_owned(),
                 result: completion.result,
-            });
+                completed_at: completion.completed_at,
+            })
+            .map_err(|error| format!("unable to emit pending background result: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn collect_completed_subagents<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<usize, String> {
+        let mut count = 0;
+        while let Some(completion) = self.next_subagent_completion() {
+            self.persist_completion(completion, sink)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn deliver_pending_background_results<S: EventSink>(
+        &mut self,
+        logical_turn_id: &str,
+        sink: &mut S,
+    ) -> Result<usize, String> {
+        let pending = self.session.undelivered_background_results();
+        let mut delivered_count = 0;
+        for result in pending {
+            if self
+                .session
+                .append_background_result_delivered(
+                    &result.completion_id,
+                    logical_turn_id.to_owned(),
+                    BackgroundResultDelivery::Synthetic,
+                )
+                .map_err(|error| error.to_string())?
+            {
+                sink.emit_event(&ProtocolEvent::BackgroundResultDelivered {
+                    completion_id: result.completion_id,
+                    task_id: result.task_id,
+                    logical_turn_id: logical_turn_id.to_owned(),
+                    delivery: "synthetic".to_owned(),
+                })
+                .map_err(|error| format!("unable to emit delivered background result: {error}"))?;
+                delivered_count += 1;
+            }
+        }
+        Ok(delivered_count)
+    }
+
+    fn mark_wait_delivery<S: EventSink>(
+        &mut self,
+        task_id: &str,
+        logical_turn_id: &str,
+        sink: &mut S,
+    ) -> Result<(), String> {
+        self.collect_completed_subagents(sink)?;
+        let pending = self
+            .session
+            .undelivered_background_results()
+            .into_iter()
+            .find(|pending| pending.task_id == task_id);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        if self
+            .session
+            .append_background_result_delivered(
+                &pending.completion_id,
+                logical_turn_id.to_owned(),
+                BackgroundResultDelivery::WaitSubagent,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            sink.emit_event(&ProtocolEvent::BackgroundResultDelivered {
+                completion_id: pending.completion_id,
+                task_id: pending.task_id,
+                logical_turn_id: logical_turn_id.to_owned(),
+                delivery: "wait_subagent".to_owned(),
+            })
+            .map_err(|error| format!("unable to emit delivered background result: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn has_running_subagents_for_turn(&self, logical_turn_id: &str) -> bool {
+        self.subagents.lock().is_ok_and(|states| {
+            states.values().any(|state| {
+                matches!(
+                    state,
+                    SubagentState::Running { attached_turn_id, .. }
+                        if attached_turn_id == logical_turn_id
+                )
+            })
+        })
+    }
+
+    fn wait_for_attached_completion<S: EventSink>(
+        &mut self,
+        logical_turn_id: &str,
+        sink: &mut S,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), String> {
+        while self.has_running_subagents_for_turn(logical_turn_id) {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(());
+            }
+            match self
+                .completed_subagents
+                .1
+                .recv_timeout(std::time::Duration::from_millis(25))
+            {
+                Ok(completion) => {
+                    self.persist_completion(completion, sink)?;
+                    self.collect_completed_subagents(sink)?;
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("subagent completion channel closed".to_owned())
+                }
+            }
         }
         Ok(())
     }
@@ -775,7 +927,7 @@ impl Harness {
             .ok()
             .and_then(|states| states.get(&task_id).cloned())
         {
-            Some(SubagentState::Running(_)) => {
+            Some(SubagentState::Running { .. }) => {
                 serde_json::json!({"task_id": task_id, "status": "running"})
             }
             Some(SubagentState::Completed(result)) => {
@@ -785,7 +937,7 @@ impl Harness {
         }
     }
 
-    fn wait_subagent(&self, arguments: &str) -> Value {
+    fn wait_subagent(&self, arguments: &str, cancellation: Option<&CancellationToken>) -> Value {
         let value = match serde_json::from_str::<Value>(arguments) {
             Ok(value) => value,
             Err(_) => {
@@ -809,7 +961,7 @@ impl Harness {
         let Some(state) = state else {
             return serde_json::json!({"task_id": task_id, "status": "unknown"});
         };
-        let SubagentState::Running(control) = state else {
+        let SubagentState::Running { control, .. } = state else {
             if let SubagentState::Completed(result) = state {
                 return serde_json::json!({"task_id": task_id, "status": terminal_status(&result), "result": result});
             }
@@ -822,14 +974,20 @@ impl Harness {
                 return serde_json::json!({"task_id": task_id, "status": "failed", "error": "subagent wait unavailable"})
             }
         };
-        if result.is_none() {
-            let (guard, timeout) = wake
-                .wait_timeout(result, std::time::Duration::from_millis(timeout_ms))
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            result = guard;
-            if result.is_none() && timeout.timed_out() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while result.is_none() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return serde_json::json!({"task_id": task_id, "status": "parent_canceled"});
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 return serde_json::json!({"task_id": task_id, "status": "waiting", "timed_out": true});
             }
+            let interval = remaining.min(std::time::Duration::from_millis(25));
+            let (guard, _) = wake
+                .wait_timeout(result, interval)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            result = guard;
         }
         match result.clone() {
             Some(result) => {
@@ -866,7 +1024,7 @@ impl Harness {
             .ok()
             .and_then(|states| states.get(&task_id).cloned());
         match state {
-            Some(SubagentState::Running(control)) => {
+            Some(SubagentState::Running { control, .. }) => {
                 match control.commands.send(SubagentCommand::Message(message)) {
                     Ok(()) => serde_json::json!({"task_id": task_id, "status": "queued"}),
                     Err(_) => {
@@ -892,7 +1050,7 @@ impl Harness {
             .ok()
             .and_then(|states| states.get(&task_id).cloned());
         match state {
-            Some(SubagentState::Running(control)) => {
+            Some(SubagentState::Running { control, .. }) => {
                 control.cancellation.cancel();
                 serde_json::json!({"task_id": task_id, "status": "cancellation_requested"})
             }
@@ -992,6 +1150,12 @@ impl Harness {
         sink: &mut S,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Result<(), String> {
+        let logical_turn_id = format!("turn-{}-{}", self.session.id, self.session.history.len());
+        self.collect_completed_subagents(sink)?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
+        }
+        self.deliver_pending_background_results(&logical_turn_id, sink)?;
         let secret = self.provider.api_key().to_owned();
         let expanded = expand_skill_invocation(text, &self.session.skills)?;
         let user_message = ChatMessage::user(redact_secret(&expanded.text, Some(&secret)));
@@ -1010,10 +1174,11 @@ impl Harness {
 
         let mut compacted_for_turn = false;
         loop {
-            self.drain_completed_subagents()?;
-            if cancellation.is_some_and(|token| token.is_cancelled()) {
+            self.collect_completed_subagents(sink)?;
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
             }
+            self.deliver_pending_background_results(&logical_turn_id, sink)?;
             let mut messages = self.session.provider_messages();
             let tokens_before = estimate_context_tokens(&messages);
             if !compacted_for_turn && self.should_compact(&messages) {
@@ -1158,8 +1323,24 @@ impl Harness {
             }
 
             if safe_tool_calls.is_empty() {
-                if canceled_after_stream || cancellation.is_some_and(|token| !token.try_complete())
+                self.collect_completed_subagents(sink)?;
+                if canceled_after_stream
+                    || cancellation.is_some_and(CancellationToken::is_cancelled)
                 {
+                    return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
+                }
+                if self.deliver_pending_background_results(&logical_turn_id, sink)? > 0 {
+                    continue;
+                }
+                if self.has_running_subagents_for_turn(&logical_turn_id) {
+                    self.wait_for_attached_completion(&logical_turn_id, sink, cancellation)?;
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
+                    }
+                    self.deliver_pending_background_results(&logical_turn_id, sink)?;
+                    continue;
+                }
+                if cancellation.is_some_and(|token| !token.try_complete()) {
                     return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
                 }
                 sink.context_usage(estimate_context_tokens(&self.session.provider_messages()))
@@ -1181,13 +1362,13 @@ impl Harness {
                 let safe_call = &safe_tool_calls[index];
                 let result = if raw_call.name == "spawn_subagent" {
                     match parse_subagent_arguments(&raw_call.arguments) {
-                        Ok((task, model, effort)) => self.spawn_subagent(task, model, effort),
+                        Ok(task) => self.spawn_subagent(task, &logical_turn_id),
                         Err(error) => serde_json::json!({"error": error}),
                     }
                 } else if raw_call.name == "check_subagent" {
                     self.subagent_status(&raw_call.arguments)
                 } else if raw_call.name == "wait_subagent" {
-                    self.wait_subagent(&raw_call.arguments)
+                    self.wait_subagent(&raw_call.arguments, cancellation)
                 } else if raw_call.name == "send_subagent" {
                     self.send_subagent(&raw_call.arguments)
                 } else if raw_call.name == "cancel_subagent" {
@@ -1208,7 +1389,15 @@ impl Harness {
                     ))
                     .map_err(|error| format!("unable to encode cmd result: {error}"))?
                 };
-                let result = redact_json_value(result, &secret);
+                let mut result = redact_json_value(result, &secret);
+                if raw_call.name == "wait_subagent"
+                    && cancellation.is_some_and(CancellationToken::is_cancelled)
+                {
+                    result = serde_json::json!({
+                        "task_id": parse_task_id(&raw_call.arguments).ok(),
+                        "status": "parent_canceled"
+                    });
+                }
                 let tool_content = serde_json::to_string(&result)
                     .map_err(|error| format!("unable to encode tool result: {error}"))?;
                 let tool_message = ChatMessage::tool(
@@ -1282,8 +1471,17 @@ impl Harness {
                     }
                     return self.interrupt(sink, COMMAND_PHASE, "", &[], Vec::new());
                 }
+                if raw_call.name == "wait_subagent" && result.get("result").is_some() {
+                    if let Ok(task_id) = parse_task_id(&raw_call.arguments) {
+                        self.mark_wait_delivery(&task_id, &logical_turn_id, sink)?;
+                    }
+                }
             }
-            self.drain_completed_subagents()?;
+            self.collect_completed_subagents(sink)?;
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return self.interrupt(sink, COMMAND_PHASE, "", &[], Vec::new());
+            }
+            self.deliver_pending_background_results(&logical_turn_id, sink)?;
         }
     }
 
@@ -1368,6 +1566,40 @@ fn subagent_canceled_result(shutdown: &AtomicBool) -> Value {
     }
 }
 
+fn pending_from_completion(completion: SubagentCompletion) -> BackgroundResultPending {
+    BackgroundResultPending {
+        timestamp: 0,
+        completion_id: completion.completion_id,
+        task_id: completion.task_id,
+        child_session_id: completion.child_session_id,
+        task: completion.task,
+        status: completion.status,
+        result: completion.result,
+        completed_at: completion.completed_at,
+    }
+}
+
+fn completion_id_for_child(child_session_id: &str) -> String {
+    format!("completion-{child_session_id}")
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn child_status_name(status: ChildSessionStatus) -> &'static str {
+    match status {
+        ChildSessionStatus::Running => "running",
+        ChildSessionStatus::Completed => "completed",
+        ChildSessionStatus::Failed => "failed",
+        ChildSessionStatus::Canceled => "canceled",
+        ChildSessionStatus::Interrupted => "interrupted",
+    }
+}
+
 fn terminal_status(result: &Value) -> &'static str {
     if result.get("interrupted").is_some() {
         "interrupted"
@@ -1380,19 +1612,17 @@ fn terminal_status(result: &Value) -> &'static str {
     }
 }
 
-fn parse_subagent_arguments(
-    arguments: &str,
-) -> Result<(String, Option<String>, Option<String>), String> {
+fn parse_subagent_arguments(arguments: &str) -> Result<String, String> {
     let value: Value = serde_json::from_str(arguments)
         .map_err(|_| "spawn_subagent arguments must be a JSON object")?;
     let object = value
         .as_object()
         .ok_or("spawn_subagent arguments must be a JSON object")?;
-    if object
-        .keys()
-        .any(|key| key != "task" && key != "model" && key != "effort")
-    {
-        return Err("spawn_subagent arguments contain an unsupported field".to_owned());
+    if object.keys().any(|key| key != "task") {
+        return Err(
+            "spawn_subagent accepts only task; model and effort always inherit from the session"
+                .to_owned(),
+        );
     }
     let task = object
         .get("task")
@@ -1403,16 +1633,7 @@ fn parse_subagent_arguments(
     if task.is_empty() || task.len() > MAX_SUBAGENT_TASK_BYTES {
         return Err("spawn_subagent task must be non-empty and bounded".to_owned());
     }
-    let optional = |key: &str| -> Result<Option<String>, String> {
-        match object.get(key) {
-            None => Ok(None),
-            Some(Value::String(value)) if !value.trim().is_empty() => {
-                Ok(Some(value.trim().to_owned()))
-            }
-            _ => Err(format!("spawn_subagent {key} must be a non-empty string")),
-        }
-    };
-    Ok((task, optional("model")?, optional("effort")?))
+    Ok(task)
 }
 
 struct SubagentRunOptions {
@@ -1422,23 +1643,14 @@ struct SubagentRunOptions {
     activity: Option<(String, mpsc::Sender<SubagentActivity>)>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_subagent(
-    mut settings: crate::config::LlmSettings,
+    settings: crate::config::LlmSettings,
     _boot_context: String,
     cwd: std::path::PathBuf,
     task: String,
-    model: Option<String>,
-    effort: Option<String>,
     options: SubagentRunOptions,
     child_session: &mut ChildSession,
 ) -> Value {
-    if let Some(model) = model {
-        settings.model = model;
-    }
-    if let Some(effort) = effort {
-        settings.effort = Some(effort);
-    }
     let selected_model = settings.model.clone();
     let selected_effort = settings.effort.clone();
     let provider = match Provider::new(&settings) {
@@ -2055,6 +2267,21 @@ mod tests {
     }
 
     #[test]
+    fn spawn_subagent_accepts_only_a_task_and_rejects_setting_overrides() {
+        assert_eq!(
+            parse_subagent_arguments(r#"{"task":"inspect"}"#),
+            Ok("inspect".to_owned())
+        );
+        for arguments in [
+            r#"{"task":"inspect","model":"other-model"}"#,
+            r#"{"task":"inspect","effort":"high"}"#,
+        ] {
+            let error = parse_subagent_arguments(arguments).expect_err("override rejected");
+            assert!(error.contains("model and effort always inherit from the session"));
+        }
+    }
+
+    #[test]
     fn spawned_worker_has_no_tool_round_limit() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("worker listener");
         listener
@@ -2166,8 +2393,6 @@ mod tests {
             "boot context".to_owned(),
             cwd,
             "inspect many steps".to_owned(),
-            None,
-            None,
             SubagentRunOptions {
                 cancellation: Some(CancellationToken::new()),
                 commands,
@@ -2384,35 +2609,121 @@ mod tests {
             .completed_subagents
             .0
             .send(SubagentCompletion {
+                completion_id: "completion-1".to_owned(),
                 task_id: "subagent-1".to_owned(),
+                child_session_id: "child-1".to_owned(),
+                task: "inspect".to_owned(),
+                status: ChildSessionStatus::Completed,
                 result: serde_json::json!({"output":"done"}),
+                completed_at: 1,
             })
             .expect("completion");
+        struct TestSink(Vec<ProtocolEvent>);
+        impl EventSink for TestSink {
+            fn emit_event(&mut self, event: &ProtocolEvent) -> io::Result<()> {
+                self.0.push(event.clone());
+                Ok(())
+            }
+        }
+        let mut sink = TestSink(Vec::new());
         harness
-            .drain_completed_subagents()
-            .expect("drain completion");
+            .collect_completed_subagents(&mut sink)
+            .expect("collect completion");
 
-        let last = harness
-            .session
-            .messages
-            .last()
-            .expect("parent notification");
-        assert_eq!(last.role, "user");
-        assert!(last
-            .content
-            .as_deref()
-            .is_some_and(|text| text.contains("subagent-1 completed")));
-        assert!(matches!(
-            harness.subagent_activity.1.try_recv(),
-            Ok(SubagentActivity::Completed { task_id, .. }) if task_id == "subagent-1"
-        ));
+        assert!(
+            harness.session.messages.is_empty(),
+            "a terminal child result must never become parent user input"
+        );
+        assert!(harness.session.history.iter().any(|record| matches!(
+            record,
+            crate::session::SessionHistoryRecord::BackgroundResultPending(_)
+        )));
+        assert!(sink.0.iter().any(|event| matches!(
+            event,
+            ProtocolEvent::BackgroundResultPending { task_id, .. } if task_id == "subagent-1"
+        )));
+        harness
+            .mark_wait_delivery("subagent-1", "turn-1", &mut sink)
+            .expect("wait delivery");
+        assert_eq!(
+            harness
+                .deliver_pending_background_results("turn-1", &mut sink)
+                .expect("no synthetic duplicate"),
+            0
+        );
+        assert!(harness.session.provider_messages().iter().all(|message| {
+            message.name.as_deref() != Some(crate::session::BACKGROUND_RESULT_TOOL_NAME)
+        }));
         let raw = std::fs::read_to_string(&harness.session.path).expect("parent JSONL");
-        assert!(raw.contains("subagent-1 completed"));
+        assert!(raw.contains("background_result_pending"));
         assert!(!raw.contains("provider-secret"));
 
+        let (commands, _command_rx) = mpsc::channel();
+        let wait_control = SubagentControl {
+            cancellation: CancellationToken::new(),
+            commands,
+            done: Arc::new((Mutex::new(None), Condvar::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        harness.subagents.lock().expect("registry").insert(
+            "subagent-wait".to_owned(),
+            SubagentState::Running {
+                control: wait_control,
+                attached_turn_id: "turn-wait".to_owned(),
+            },
+        );
+        let parent_cancel = CancellationToken::new();
+        parent_cancel.cancel();
+        let started = std::time::Instant::now();
+        let wait_result = harness.wait_subagent(
+            r#"{"task_id":"subagent-wait","timeout_ms":600000}"#,
+            Some(&parent_cancel),
+        );
+        assert_eq!(wait_result["status"], "parent_canceled");
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        harness
+            .subagents
+            .lock()
+            .expect("registry")
+            .remove("subagent-wait");
+
+        harness
+            .completed_subagents
+            .0
+            .send(SubagentCompletion {
+                completion_id: "completion-shutdown".to_owned(),
+                task_id: "subagent-shutdown".to_owned(),
+                child_session_id: "child-shutdown".to_owned(),
+                task: "shutdown".to_owned(),
+                status: ChildSessionStatus::Interrupted,
+                result: serde_json::json!({"interrupted":true,"reason":"process_shutdown"}),
+                completed_at: 2,
+            })
+            .expect("shutdown completion");
+        let session_id = harness.session.id.clone();
         drop(harness);
+        let resumed = Session::resume(&home, &session_id).expect("resume parent");
+        assert!(resumed
+            .undelivered_background_results()
+            .iter()
+            .any(|pending| {
+                pending.completion_id == "completion-shutdown"
+                    && pending.status == ChildSessionStatus::Interrupted
+            }));
         std::env::remove_var(key_env);
         std::fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn completion_identity_is_derived_from_the_durable_child_session() {
+        assert_eq!(
+            completion_id_for_child("subagent-child-a"),
+            "completion-subagent-child-a"
+        );
+        assert_ne!(
+            completion_id_for_child("subagent-child-a"),
+            completion_id_for_child("subagent-child-b")
+        );
     }
 
     #[test]
