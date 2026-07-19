@@ -803,7 +803,11 @@ enum SubagentStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 enum SubagentStreamItem {
+    User(String),
     Assistant(String),
+    Reasoning {
+        complete: bool,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -1436,14 +1440,14 @@ impl UiState {
         self.subagents.push(SubagentTask {
             call_id: call_id.to_owned(),
             task_id: None,
-            task,
+            task: task.clone(),
             model,
             effort,
             status: SubagentStatus::Queued,
             result: None,
             creation_completed: false,
-            stream: Vec::new(),
-            stream_chars: 0,
+            stream: vec![SubagentStreamItem::User(task.clone())],
+            stream_chars: task.chars().count(),
         });
     }
 
@@ -1502,52 +1506,85 @@ impl UiState {
     }
 
     fn apply_subagent_activity(&mut self, activity: SubagentActivity) {
-        if let SubagentActivity::Completed { task_id, result } = activity {
-            self.complete_subagent(&task_id, result);
-            return;
-        }
-        let (task_id, item, chars) = match activity {
-            SubagentActivity::AssistantDelta { task_id, text } => {
-                let text = redact_secret(&text, Some(&self.secret));
-                let chars = text.chars().count();
-                (task_id, SubagentStreamItem::Assistant(text), chars)
+        match activity {
+            SubagentActivity::Completed { task_id, result } => {
+                self.complete_subagent(&task_id, result);
             }
-            SubagentActivity::ToolCall {
-                task_id,
-                id,
-                name,
-                arguments,
-            } => {
-                let arguments = redact_secret(&arguments, Some(&self.secret));
-                let chars = arguments.chars().count() + name.len() + id.len();
-                (
-                    task_id,
-                    SubagentStreamItem::ToolCall {
+            SubagentActivity::ReasoningStarted { task_id } => {
+                let already_reasoning = self
+                    .subagents
+                    .iter()
+                    .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
+                    .is_some_and(|task| {
+                        matches!(
+                            task.stream.last(),
+                            Some(SubagentStreamItem::Reasoning { complete: false })
+                        )
+                    });
+                if !already_reasoning {
+                    self.append_subagent_stream_item(
+                        task_id,
+                        SubagentStreamItem::Reasoning { complete: false },
+                        0,
+                    );
+                }
+            }
+            SubagentActivity::ReasoningCompleted { task_id } => {
+                if let Some(task) = self
+                    .subagents
+                    .iter_mut()
+                    .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
+                {
+                    if let Some(SubagentStreamItem::Reasoning { complete }) = task.stream.last_mut()
+                    {
+                        *complete = true;
+                    }
+                }
+            }
+            SubagentActivity::Event { task_id, event } => {
+                let (item, chars) = match event {
+                    ProtocolEvent::AssistantDelta { text } => {
+                        let text = redact_secret(&text, Some(&self.secret));
+                        let chars = text.chars().count();
+                        (SubagentStreamItem::Assistant(text), chars)
+                    }
+                    ProtocolEvent::ToolCall {
                         id,
                         name,
                         arguments,
-                    },
-                    chars,
-                )
+                    } => {
+                        let arguments = redact_secret(&arguments, Some(&self.secret));
+                        let chars = arguments.chars().count() + name.len() + id.len();
+                        (
+                            SubagentStreamItem::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            },
+                            chars,
+                        )
+                    }
+                    ProtocolEvent::ToolResult { id, name, result } => {
+                        let encoded = result.to_string();
+                        let chars = encoded.chars().count() + name.len() + id.len();
+                        (SubagentStreamItem::ToolResult { id, name, result }, chars)
+                    }
+                    ProtocolEvent::Session { .. }
+                    | ProtocolEvent::TurnEnd
+                    | ProtocolEvent::TurnInterrupted { .. }
+                    | ProtocolEvent::Error { .. } => return,
+                };
+                self.append_subagent_stream_item(task_id, item, chars);
             }
-            SubagentActivity::ToolResult {
-                task_id,
-                id,
-                name,
-                result,
-            } => {
-                let encoded = result.to_string();
-                let chars = encoded.chars().count() + name.len() + id.len();
-                (
-                    task_id,
-                    SubagentStreamItem::ToolResult { id, name, result },
-                    chars,
-                )
-            }
-            SubagentActivity::Completed { .. } => {
-                unreachable!("completed activity is handled above")
-            }
-        };
+        }
+    }
+
+    fn append_subagent_stream_item(
+        &mut self,
+        task_id: String,
+        item: SubagentStreamItem,
+        chars: usize,
+    ) {
         let Some(task) = self
             .subagents
             .iter_mut()
@@ -1555,7 +1592,8 @@ impl UiState {
         else {
             return;
         };
-        // Merge consecutive assistant deltas into one stream item.
+        // Provider text arrives in deltas. Keep the same assistant message
+        // together in the preview instead of producing one row per chunk.
         if let SubagentStreamItem::Assistant(delta) = &item {
             if let Some(SubagentStreamItem::Assistant(existing)) = task.stream.last_mut() {
                 existing.push_str(delta);
@@ -1641,7 +1679,10 @@ impl UiState {
 fn trim_subagent_stream(task: &mut SubagentTask) {
     while task.stream_chars > SUBAGENT_STREAM_MAX_CHARS && !task.stream.is_empty() {
         let removed = match task.stream.remove(0) {
-            SubagentStreamItem::Assistant(text) => text.chars().count(),
+            SubagentStreamItem::User(text) | SubagentStreamItem::Assistant(text) => {
+                text.chars().count()
+            }
+            SubagentStreamItem::Reasoning { .. } => 0,
             SubagentStreamItem::ToolCall {
                 id,
                 name,
@@ -1805,7 +1846,10 @@ fn subagent_stream_overlay_area(
 ) -> Option<Rect> {
     let focus = state.subagent_focus?;
     let task = state.subagents.get(focus)?;
-    let stream_rows = task.stream.len().clamp(1, SUBAGENT_STREAM_MAX_ROWS) as u16;
+    let inner_width = input_area.width.saturating_sub(2).max(1) as usize;
+    let stream_rows = subagent_stream_lines(task, inner_width, state)
+        .len()
+        .clamp(1, SUBAGENT_STREAM_MAX_ROWS) as u16;
     let height = stream_rows.saturating_add(2);
     let y = queue_area.y.saturating_sub(height);
     Some(Rect::new(input_area.x, y, input_area.width, height))
@@ -2361,37 +2405,48 @@ fn draw_subagent_stream_overlay(frame: &mut Frame<'_>, state: &UiState, area: Re
         .style(style)
         .border_style(style);
     let inner = block.inner(area);
-    let mut lines = Vec::new();
-    if task.stream.is_empty() {
-        lines.push(Line::styled("waiting for worker output", style));
-    } else {
-        for item in task
-            .stream
-            .iter()
-            .rev()
-            .take(SUBAGENT_STREAM_MAX_ROWS)
-            .rev()
-        {
-            let line = match item {
-                SubagentStreamItem::Assistant(text) => {
-                    format!("assistant  {}", single_line_preview(text))
-                }
-                SubagentStreamItem::ToolCall {
-                    name, arguments, ..
-                } => format!("→ {name}  {}", call_arguments(arguments)),
-                SubagentStreamItem::ToolResult { name, result, .. } => {
-                    format!("← {name}  {}", format_tool_result(result))
-                }
-            };
-            lines.push(Line::styled(
-                redact_secret(&line, Some(&state.secret)),
-                style,
-            ));
-        }
-    }
+    let width = inner.width.max(1) as usize;
+    let lines = subagent_stream_lines(task, width, state);
+    let lines = lines
+        .iter()
+        .rev()
+        .take(SUBAGENT_STREAM_MAX_ROWS)
+        .rev()
+        .map(|line| Line::styled(redact_secret(line, Some(&state.secret)), style))
+        .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines).style(style), inner);
+}
+
+fn subagent_stream_lines(task: &SubagentTask, width: usize, state: &UiState) -> Vec<String> {
+    let width = width.max(1);
+    if task.stream.is_empty() {
+        return vec!["waiting for worker output".to_owned()];
+    }
+
+    let mut lines = Vec::new();
+    for item in &task.stream {
+        let text = match item {
+            SubagentStreamItem::User(text) => format!("user      {text}"),
+            SubagentStreamItem::Assistant(text) => format!("assistant  {text}"),
+            SubagentStreamItem::Reasoning { complete } => {
+                if *complete {
+                    "reasoning  complete".to_owned()
+                } else {
+                    format!("reasoning  {}", tool_spinner_frame(state))
+                }
+            }
+            SubagentStreamItem::ToolCall {
+                name, arguments, ..
+            } => format!("→ {name}  {}", call_arguments(arguments)),
+            SubagentStreamItem::ToolResult { name, result, .. } => {
+                format!("← {name}  {}", format_tool_result(result))
+            }
+        };
+        lines.extend(wrap_text(&text, width));
+    }
+    lines
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -5326,9 +5381,11 @@ mod tests {
             stream: Vec::new(),
             stream_chars: 0,
         });
-        state.apply_subagent_activity(SubagentActivity::AssistantDelta {
+        state.apply_subagent_activity(SubagentActivity::Event {
             task_id: "subagent-1".to_owned(),
-            text: "worker output".to_owned(),
+            event: ProtocolEvent::AssistantDelta {
+                text: "worker output".to_owned(),
+            },
         });
         assert!(state.focus_subagent_list_from_input());
         let area = Rect::new(0, 0, 80, 20);
@@ -5356,6 +5413,96 @@ mod tests {
             terminal.backend().buffer()[(stream.x + 1, stream.y + 1)].bg,
             Color::Reset
         );
+    }
+
+    #[test]
+    fn subagent_preview_reuses_normalized_events_and_keeps_the_message_stream() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Running,
+            result: None,
+            creation_completed: true,
+            stream: Vec::new(),
+            stream_chars: 0,
+        });
+
+        state.apply_subagent_activity(SubagentActivity::Event {
+            task_id: "subagent-1".to_owned(),
+            event: ProtocolEvent::AssistantDelta {
+                text: "first message ".to_owned(),
+            },
+        });
+        state.apply_subagent_activity(SubagentActivity::Event {
+            task_id: "subagent-1".to_owned(),
+            event: ProtocolEvent::AssistantDelta {
+                text: "continued message".to_owned(),
+            },
+        });
+        state.apply_subagent_activity(SubagentActivity::Event {
+            task_id: "subagent-1".to_owned(),
+            event: ProtocolEvent::ToolCall {
+                id: "call-cmd".to_owned(),
+                name: "cmd".to_owned(),
+                arguments: serde_json::json!({"command":"pwd"}).to_string(),
+            },
+        });
+        state.apply_subagent_activity(SubagentActivity::Event {
+            task_id: "subagent-1".to_owned(),
+            event: ProtocolEvent::ToolResult {
+                id: "call-cmd".to_owned(),
+                name: "cmd".to_owned(),
+                result: serde_json::json!({"stdout":"command output","stderr":""}),
+            },
+        });
+
+        let task = &state.subagents[0];
+        let lines = subagent_stream_lines(task, 80, &state).join("\n");
+        assert!(lines.contains("first message continued message"));
+        assert!(lines.contains("→ cmd"));
+        assert!(lines.contains("← cmd"));
+        assert_eq!(
+            task.stream
+                .iter()
+                .filter(|item| matches!(item, SubagentStreamItem::Assistant(_)))
+                .count(),
+            1,
+            "assistant deltas remain one message in the preview"
+        );
+    }
+
+    #[test]
+    fn subagent_preview_shows_reasoning_state_and_initial_task_message() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Running,
+            result: None,
+            creation_completed: true,
+            stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
+            stream_chars: 7,
+        });
+
+        state.apply_subagent_activity(SubagentActivity::ReasoningStarted {
+            task_id: "subagent-1".to_owned(),
+        });
+        let before = subagent_stream_lines(&state.subagents[0], 80, &state).join("\n");
+        assert!(before.contains("user      Inspect"));
+        assert!(before.contains("reasoning"));
+
+        state.apply_subagent_activity(SubagentActivity::ReasoningCompleted {
+            task_id: "subagent-1".to_owned(),
+        });
+        let after = subagent_stream_lines(&state.subagents[0], 80, &state).join("\n");
+        assert!(after.contains("reasoning  complete"));
     }
 
     #[test]

@@ -549,24 +549,20 @@ pub(crate) struct SubagentCompletion {
     pub(crate) result: Value,
 }
 
-/// TUI-only worker activity. Not a public JSONL event.
+/// TUI-only worker activity. Normal worker messages and tool activity reuse
+/// the same normalized events as the main agent; the task id stays outside the
+/// event so the frontend can route it without changing the public JSONL schema.
 #[derive(Debug, Clone)]
 pub(crate) enum SubagentActivity {
-    AssistantDelta {
+    Event {
         task_id: String,
-        text: String,
+        event: ProtocolEvent,
     },
-    ToolCall {
+    ReasoningStarted {
         task_id: String,
-        id: String,
-        name: String,
-        arguments: String,
     },
-    ToolResult {
+    ReasoningCompleted {
         task_id: String,
-        id: String,
-        name: String,
-        result: Value,
     },
     Completed {
         task_id: String,
@@ -1475,18 +1471,38 @@ fn run_subagent(
         }
         let messages = child_session.provider_messages();
         let activity_for_stream = activity.clone();
-        let mut on_text = move |text: &str| -> std::io::Result<()> {
-            if let Some((task_id, sender)) = activity_for_stream.as_ref() {
-                let _ = sender.send(SubagentActivity::AssistantDelta {
-                    task_id: task_id.clone(),
-                    text: text.to_owned(),
-                });
+        let mut reasoning_active = false;
+        let mut on_event = move |event: ProviderStreamEvent| -> std::io::Result<()> {
+            let Some((task_id, sender)) = activity_for_stream.as_ref() else {
+                return Ok(());
+            };
+            match event {
+                ProviderStreamEvent::ReasoningStarted => {
+                    if !reasoning_active {
+                        reasoning_active = true;
+                        let _ = sender.send(SubagentActivity::ReasoningStarted {
+                            task_id: task_id.clone(),
+                        });
+                    }
+                }
+                ProviderStreamEvent::Text(text) => {
+                    if reasoning_active {
+                        reasoning_active = false;
+                        let _ = sender.send(SubagentActivity::ReasoningCompleted {
+                            task_id: task_id.clone(),
+                        });
+                    }
+                    let _ = sender.send(SubagentActivity::Event {
+                        task_id: task_id.clone(),
+                        event: ProtocolEvent::AssistantDelta { text },
+                    });
+                }
             }
             Ok(())
         };
-        let turn = match provider.stream_chat_cancellable_with_options(
+        let turn = match provider.stream_chat_cancellable_with_options_and_events(
             &messages,
-            &mut on_text,
+            &mut on_event,
             &cancellation,
             true,
             false,
@@ -1497,6 +1513,13 @@ fn run_subagent(
             }
             Err(error) => return serde_json::json!({"error": error.to_string()}),
         };
+        if reasoning_active {
+            if let Some((task_id, sender)) = activity.as_ref() {
+                let _ = sender.send(SubagentActivity::ReasoningCompleted {
+                    task_id: task_id.clone(),
+                });
+            }
+        }
         if turn.tool_calls.iter().any(|call| call.name != "cmd") {
             return serde_json::json!({"error": "subagent requested an unsupported tool"});
         }
@@ -1521,11 +1544,13 @@ fn run_subagent(
         }
         for call in turn.tool_calls {
             if let Some((task_id, sender)) = activity.as_ref() {
-                let _ = sender.send(SubagentActivity::ToolCall {
+                let _ = sender.send(SubagentActivity::Event {
                     task_id: task_id.clone(),
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: redact_secret(&call.arguments, Some(&secret)),
+                    event: ProtocolEvent::ToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: redact_secret(&call.arguments, Some(&secret)),
+                    },
                 });
             }
             let result = crate::command::execute_with_cancellation(
@@ -1542,11 +1567,13 @@ fn run_subagent(
                 &secret,
             );
             if let Some((task_id, sender)) = activity.as_ref() {
-                let _ = sender.send(SubagentActivity::ToolResult {
+                let _ = sender.send(SubagentActivity::Event {
                     task_id: task_id.clone(),
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    result: result_value.clone(),
+                    event: ProtocolEvent::ToolResult {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        result: result_value.clone(),
+                    },
                 });
             }
             let content = match serde_json::to_string(&result_value) {
