@@ -1,6 +1,6 @@
 # Lucy
 
-![Crates.io Version](https://img.shields.io/crates/v/lucy-cli) ![Homebrew tap version](https://img.shields.io/badge/dynamic/regex?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjwoo0122%2Fhomebrew-tap%2Frefs%2Fheads%2Fmaster%2FFormula%2Flucy.rb&search=refs%2Ftags%2Fv(%3F%3Cversion%3E%5Cd%2B(%3F%3A%5C.%5Cd%2B)%2B)&replace=%24%3Cversion%3E&label=homebrew)
+![Crates.io Version](https://img.shields.io/crates/v/lucy-cli)
 
 ![](./imgs/sample.png)
 
