@@ -1,5 +1,9 @@
 # Lucy
 
+![Crates.io Version](https://img.shields.io/crates/v/lucy-cli)
+
+![](./imgs/sample.png)
+
 ## Project purpose
 
 Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects one OpenAI-compatible Chat Completions provider and model-facing `cmd` and `spawn_subagent` tools, with both an interactive TUI and a JSONL interface for automation powered by the same turn engine.
