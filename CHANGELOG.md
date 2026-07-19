@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.1](https://github.com/jwoo0122/lucy/compare/v1.5.0...v1.5.1) - 2026-07-19
+
+### Fixed
+
+- refine ux
+
+### Other
+
+- add sample image ([#13](https://github.com/jwoo0122/lucy/pull/13))
+
 ## [1.5.0](https://github.com/jwoo0122/lucy/compare/v1.4.1...v1.5.0) - 2026-07-19
 
 ### Added
