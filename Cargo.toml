@@ -21,7 +21,9 @@ formula = "lucy"
 [dependencies]
 libc = "0.2"
 crossterm = "0.29"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1.52.3", features = ["rt", "time"] }
 unicode-width = "0.2.2"

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image as TuiImage, Resize};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -42,8 +46,13 @@ const TUI_MAX_WIDTH: u16 = 100;
 const WELCOME_MESSAGE: &str = "Coding Agent Harness LUCY";
 const WELCOME_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const WELCOME_TAGLINE: &str = "An ultra-thin harness for tomorrow's most powerful models";
-const WELCOME_START_COLOR: (u8, u8, u8) = (0, 180, 180);
-const WELCOME_END_COLOR: (u8, u8, u8) = (255, 215, 0);
+const WELCOME_IMAGE_BYTES: &[u8] = include_bytes!("../assets/greeting.png");
+const WELCOME_IMAGE_SIZE: Size = Size::new(80, 20);
+const WELCOME_IMAGE_MIN_SIZE: Size = Size::new(40, 10);
+const WELCOME_IMAGE_GAP: u16 = 1;
+const WELCOME_IMAGE_BRIGHTNESS_PERCENT: u16 = 85;
+const WELCOME_START_COLOR: (u8, u8, u8) = (180, 130, 245);
+const WELCOME_END_COLOR: (u8, u8, u8) = (0, 180, 180);
 const USER_BORDER_COLOR: Color = Color::Rgb(192, 154, 0);
 const USER_BORDER_GLYPH: &str = "▌";
 const TUI_GLOW_BACKGROUND_RGB: (u8, u8, u8) = (16, 18, 22);
@@ -59,19 +68,9 @@ const CONSOLE_BACKGROUND: Color = Color::Rgb(
     CONSOLE_BACKGROUND_RGB.2,
 );
 const CONSOLE_STATUS_COLOR: Color = Color::Rgb(144, 144, 148);
+const CONSOLE_ACCENT_LAVENDER: (u8, u8, u8) = (145, 70, 220);
 const CONSOLE_ACCENT_TEAL: (u8, u8, u8) = (0, 180, 180);
-const CONSOLE_ACCENT_GREEN: (u8, u8, u8) = (0, 200, 100);
-const CONSOLE_ACCENT_LIME: (u8, u8, u8) = (160, 220, 0);
-const CONSOLE_ACCENT_YELLOW: (u8, u8, u8) = (255, 215, 0);
-const CONSOLE_ACCENT_COLORS: [(u8, u8, u8); 6] = [
-    CONSOLE_ACCENT_TEAL,
-    CONSOLE_ACCENT_GREEN,
-    CONSOLE_ACCENT_LIME,
-    CONSOLE_ACCENT_YELLOW,
-    CONSOLE_ACCENT_LIME,
-    CONSOLE_ACCENT_GREEN,
-];
-const CONSOLE_ACCENT_SEGMENT_DURATION: Duration = Duration::from_secs(3);
+const CONSOLE_ACCENT_CYCLE_DURATION: Duration = Duration::from_secs(15);
 const CONSOLE_ACCENT_DESATURATION: f32 = 0.15;
 const CONSOLE_GLASS_DESATURATION: f32 = 0.65;
 const CONSOLE_GLASS_TINT: f32 = 0.24;
@@ -2002,12 +2001,34 @@ fn trim_subagent_stream(task: &mut SubagentTask) {
             continue;
         }
 
-        let text = truncate_subagent_stream_tail(
-            &subagent_stream_item_text(&item),
-            item_chars.saturating_sub(chars_to_drop).saturating_add(1),
-        );
-        task.stream_chars = task.stream_chars.saturating_add(text.chars().count());
-        task.stream.insert(0, SubagentStreamItem::Assistant(text));
+        match item {
+            SubagentStreamItem::User(text) => {
+                let text = truncate_subagent_stream_tail(
+                    &text,
+                    item_chars.saturating_sub(chars_to_drop).saturating_add(1),
+                );
+                task.stream_chars = task.stream_chars.saturating_add(text.chars().count());
+                task.stream.insert(0, SubagentStreamItem::User(text));
+            }
+            SubagentStreamItem::Assistant(text) => {
+                let text = truncate_subagent_stream_tail(
+                    &text,
+                    item_chars.saturating_sub(chars_to_drop).saturating_add(1),
+                );
+                task.stream_chars = task.stream_chars.saturating_add(text.chars().count());
+                task.stream.insert(0, SubagentStreamItem::Assistant(text));
+            }
+            // Never turn structured tool data into assistant text: doing so
+            // bypasses the shared tool renderer and exposes raw JSON in the
+            // worker overlay when its bounded history is trimmed.
+            SubagentStreamItem::Reasoning { .. }
+            | SubagentStreamItem::ToolCall { .. }
+            | SubagentStreamItem::ToolResult { .. } => {
+                task.stream
+                    .insert(0, SubagentStreamItem::Assistant("…".to_owned()));
+                task.stream_chars = task.stream_chars.saturating_add(1);
+            }
+        }
         return;
     }
 
@@ -2031,25 +2052,6 @@ fn subagent_stream_item_chars(item: &SubagentStreamItem) -> usize {
         } => id.len() + name.len() + arguments.chars().count(),
         SubagentStreamItem::ToolResult { id, name, result } => {
             id.len() + name.len() + result.to_string().chars().count()
-        }
-    }
-}
-
-fn subagent_stream_item_text(item: &SubagentStreamItem) -> String {
-    match item {
-        SubagentStreamItem::User(text) | SubagentStreamItem::Assistant(text) => text.clone(),
-        SubagentStreamItem::Reasoning { complete } => {
-            if *complete {
-                "Reasoning Complete".to_owned()
-            } else {
-                "Reasoning...".to_owned()
-            }
-        }
-        SubagentStreamItem::ToolCall {
-            name, arguments, ..
-        } => format!("{name}: {arguments}"),
-        SubagentStreamItem::ToolResult { name, result, .. } => {
-            format!("{name}: {result}")
         }
     }
 }
@@ -2671,17 +2673,28 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let visible_chat_area = chat_chunk;
 
     let width = chat_chunk.width;
+    let welcome_image_layout = if state.welcome_visible {
+        let welcome_lines = welcome_lines(&state.attached_agents);
+        welcome_image_layout(visible_chat_area, welcome_lines.len() as u16)
+    } else {
+        None
+    };
     if state.welcome_visible {
         let welcome_lines = welcome_lines(&state.attached_agents);
-        let welcome_height = (welcome_lines.len() as u16).min(visible_chat_area.height);
-        let welcome_area = Rect::new(
-            visible_chat_area.x,
-            visible_chat_area.y + visible_chat_area.height.saturating_sub(welcome_height) / 2,
-            visible_chat_area.width,
-            welcome_height,
-        );
-        let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
-        frame.render_widget(welcome, welcome_area);
+        if let Some(layout) = welcome_image_layout {
+            let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
+            frame.render_widget(welcome, layout.intro_area);
+        } else {
+            let welcome_height = (welcome_lines.len() as u16).min(visible_chat_area.height);
+            let welcome_area = Rect::new(
+                visible_chat_area.x,
+                visible_chat_area.y + visible_chat_area.height.saturating_sub(welcome_height) / 2,
+                visible_chat_area.width,
+                welcome_height,
+            );
+            let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
+            frame.render_widget(welcome, welcome_area);
+        }
     } else {
         let lines = transcript_lines(state, width);
         let available = visible_chat_area.height as usize;
@@ -2709,6 +2722,10 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     // layouts the row above the console belongs to the transcript instead.
     if chat_chunk.y.saturating_add(chat_chunk.height) < input_chunk.y {
         apply_console_top_reflection(frame, input_chunk, activity_elapsed, console_visibility);
+    }
+    if let Some(layout) = welcome_image_layout {
+        let image = welcome_image(layout.image_size);
+        frame.render_widget(TuiImage::new(image.as_ref()), layout.image_area);
     }
     if let Some(picker_area) = picker_area {
         draw_skill_picker(frame, state, picker_area);
@@ -3013,7 +3030,9 @@ fn subagent_stream_lines(task: &SubagentTask, width: usize, state: &UiState) -> 
             },
         })
         .collect::<Vec<_>>();
-    render_transcript_items(&stream, width.max(1), state, false)
+    // Worker content uses the same transcript formatting and suppression rules
+    // as the main stream; only the overlay viewport follows its own tail.
+    render_transcript_items(&stream, width.max(1), state, true)
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -3279,6 +3298,80 @@ fn draw_skill_picker(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WelcomeImageLayout {
+    image_area: Rect,
+    intro_area: Rect,
+    image_size: Size,
+}
+
+fn welcome_image_layout(area: Rect, intro_height: u16) -> Option<WelcomeImageLayout> {
+    let available_height = area
+        .height
+        .saturating_sub(intro_height.saturating_add(WELCOME_IMAGE_GAP));
+    let max_width = area.width.min(WELCOME_IMAGE_SIZE.width);
+    let max_height = available_height.min(WELCOME_IMAGE_SIZE.height);
+    let aspect_width = WELCOME_IMAGE_SIZE.width / WELCOME_IMAGE_SIZE.height;
+    let image_height = max_height.min(max_width / aspect_width);
+    let image_size = Size::new(image_height * aspect_width, image_height);
+    if image_size.width < WELCOME_IMAGE_MIN_SIZE.width
+        || image_size.height < WELCOME_IMAGE_MIN_SIZE.height
+    {
+        return None;
+    }
+
+    let group_height = image_size.height + WELCOME_IMAGE_GAP + intro_height;
+    let group_y = area.y + area.height.saturating_sub(group_height) / 2;
+    Some(WelcomeImageLayout {
+        image_area: Rect::new(
+            area.x + (area.width - image_size.width) / 2,
+            group_y,
+            image_size.width,
+            image_size.height,
+        ),
+        intro_area: Rect::new(
+            area.x,
+            group_y + image_size.height + WELCOME_IMAGE_GAP,
+            area.width,
+            intro_height,
+        ),
+        image_size,
+    })
+}
+
+type WelcomeImageCache = Mutex<HashMap<(u16, u16), Arc<Protocol>>>;
+
+fn welcome_image(size: Size) -> Arc<Protocol> {
+    static IMAGES: OnceLock<WelcomeImageCache> = OnceLock::new();
+    let images = IMAGES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut images = images
+        .lock()
+        .expect("welcome image cache should not be poisoned");
+    images
+        .entry((size.width, size.height))
+        .or_insert_with(|| {
+            let image = image::load_from_memory(WELCOME_IMAGE_BYTES)
+                .expect("embedded greeting PNG should decode");
+            let image = dim_welcome_image(image);
+            Arc::new(
+                Picker::halfblocks()
+                    .new_protocol(image, size, Resize::Fit(None))
+                    .expect("embedded greeting PNG should convert to halfblocks"),
+            )
+        })
+        .clone()
+}
+
+fn dim_welcome_image(image: image::DynamicImage) -> image::DynamicImage {
+    let mut image = image.to_rgba8();
+    for pixel in image.pixels_mut() {
+        for channel in pixel.0.iter_mut().take(3) {
+            *channel = (u16::from(*channel) * WELCOME_IMAGE_BRIGHTNESS_PERCENT / 100) as u8;
+        }
+    }
+    image::DynamicImage::ImageRgba8(image)
 }
 
 fn welcome_line() -> Line<'static> {
@@ -3864,7 +3957,7 @@ fn activity_rgb(color: Color) -> (u8, u8, u8) {
     match color {
         Color::Rgb(red, green, blue) => (red, green, blue),
         // The resting indicator uses ratatui's named cyan. Convert it to its
-        // ANSI RGB equivalent while blending into and out of the warm pulse.
+        // ANSI RGB equivalent while blending into and out of the accent cycle.
         Color::Cyan => (0, 255, 255),
         _ => unreachable!("activity transition colours are cyan or RGB"),
     }
@@ -3878,22 +3971,21 @@ fn console_reach_at(elapsed: Duration) -> f32 {
 }
 
 fn console_accent_cycle() -> Duration {
-    CONSOLE_ACCENT_SEGMENT_DURATION * CONSOLE_ACCENT_COLORS.len() as u32
+    CONSOLE_ACCENT_CYCLE_DURATION
 }
 
 fn console_accent_at(elapsed: Duration) -> Color {
-    let position = (elapsed.as_secs_f32() / console_accent_cycle().as_secs_f32()
-        * CONSOLE_ACCENT_COLORS.len() as f32)
-        .rem_euclid(CONSOLE_ACCENT_COLORS.len() as f32);
-    let from = position.floor() as usize % CONSOLE_ACCENT_COLORS.len();
-    let to = (from + 1) % CONSOLE_ACCENT_COLORS.len();
-    let progress = position.fract();
-    let from = CONSOLE_ACCENT_COLORS[from];
-    let to = CONSOLE_ACCENT_COLORS[to];
+    let cycle_progress =
+        (elapsed.as_secs_f32() / console_accent_cycle().as_secs_f32()).rem_euclid(1.0);
+    let progress = if cycle_progress <= 0.5 {
+        cycle_progress * 2.0
+    } else {
+        (1.0 - cycle_progress) * 2.0
+    };
     desaturate_console_accent(
-        interpolate_color(from.0, to.0, progress),
-        interpolate_color(from.1, to.1, progress),
-        interpolate_color(from.2, to.2, progress),
+        interpolate_color(CONSOLE_ACCENT_LAVENDER.0, CONSOLE_ACCENT_TEAL.0, progress),
+        interpolate_color(CONSOLE_ACCENT_LAVENDER.1, CONSOLE_ACCENT_TEAL.1, progress),
+        interpolate_color(CONSOLE_ACCENT_LAVENDER.2, CONSOLE_ACCENT_TEAL.2, progress),
     )
 }
 
@@ -4826,8 +4918,15 @@ mod tests {
 
         assert_eq!(GLOW_INTENSITY, 0.70);
         assert_eq!(GLOW_DESATURATION, 0.10);
-        for phase in 0..CONSOLE_ACCENT_COLORS.len() {
-            let elapsed = CONSOLE_ACCENT_SEGMENT_DURATION * phase as u32;
+        for (phase, elapsed) in [
+            Duration::ZERO,
+            console_accent_cycle() / 4,
+            console_accent_cycle() / 2,
+            console_accent_cycle() * 3 / 4,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let current_accent = glow_accent_at(elapsed);
             let previous_accent = glow_accent_with_desaturation_at(elapsed, 0.16);
             assert!(
@@ -5111,27 +5210,39 @@ mod tests {
     }
 
     #[test]
-    fn console_accent_uses_the_requested_teal_to_yellow_reverse_cycle() {
+    fn console_accent_uses_a_fifteen_second_lavender_to_teal_round_trip() {
+        assert_eq!(console_accent_cycle(), Duration::from_secs(15));
         assert_eq!(
-            console_accent_cycle(),
-            CONSOLE_ACCENT_SEGMENT_DURATION * CONSOLE_ACCENT_COLORS.len() as u32
+            console_accent_at(Duration::ZERO),
+            desaturate_console_accent(
+                CONSOLE_ACCENT_LAVENDER.0,
+                CONSOLE_ACCENT_LAVENDER.1,
+                CONSOLE_ACCENT_LAVENDER.2,
+            )
         );
-        let expected = [
-            CONSOLE_ACCENT_TEAL,
-            CONSOLE_ACCENT_GREEN,
-            CONSOLE_ACCENT_LIME,
-            CONSOLE_ACCENT_YELLOW,
-            CONSOLE_ACCENT_LIME,
-            CONSOLE_ACCENT_GREEN,
-            CONSOLE_ACCENT_TEAL,
-        ];
-        for (index, (red, green, blue)) in expected.into_iter().enumerate() {
-            assert_eq!(
-                console_accent_at(CONSOLE_ACCENT_SEGMENT_DURATION * index as u32),
-                desaturate_console_accent(red, green, blue),
-                "palette waypoint {index}"
-            );
-        }
+        assert_eq!(
+            console_accent_at(console_accent_cycle() / 2),
+            desaturate_console_accent(
+                CONSOLE_ACCENT_TEAL.0,
+                CONSOLE_ACCENT_TEAL.1,
+                CONSOLE_ACCENT_TEAL.2,
+            )
+        );
+        assert_eq!(
+            console_accent_at(console_accent_cycle()),
+            console_accent_at(Duration::ZERO)
+        );
+        let midpoint = console_accent_at(console_accent_cycle() / 4);
+        assert_ne!(
+            midpoint,
+            console_accent_at(Duration::ZERO),
+            "the glow transitions continuously instead of holding at lavender"
+        );
+        assert_ne!(
+            midpoint,
+            console_accent_at(console_accent_cycle() / 2),
+            "the glow transitions continuously instead of holding at teal"
+        );
     }
 
     #[test]
@@ -5141,10 +5252,17 @@ mod tests {
     }
 
     #[test]
-    fn console_palette_starts_teal_with_fifteen_percent_desaturation() {
+    fn console_palette_starts_lavender_with_fifteen_percent_desaturation() {
         assert_eq!(CONSOLE_BACKGROUND_RGB, (42, 42, 46));
         assert_eq!(CONSOLE_BACKGROUND, Color::Rgb(42, 42, 46));
-        assert_eq!(console_accent_at(Duration::ZERO), Color::Rgb(18, 171, 171));
+        assert_eq!(
+            console_accent_at(Duration::ZERO),
+            desaturate_console_accent(
+                CONSOLE_ACCENT_LAVENDER.0,
+                CONSOLE_ACCENT_LAVENDER.1,
+                CONSOLE_ACCENT_LAVENDER.2,
+            )
+        );
     }
 
     #[test]
@@ -5700,6 +5818,105 @@ mod tests {
                 WELCOME_END_COLOR.2,
             ))
         );
+    }
+
+    #[test]
+    fn welcome_image_brightness_is_reduced_without_changing_alpha() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([200, 100, 0, 37]),
+        ));
+        let dimmed = dim_welcome_image(image).to_rgba8();
+        assert_eq!(dimmed.get_pixel(0, 0).0, [170, 85, 0, 37]);
+    }
+
+    #[test]
+    fn spacious_welcome_uses_the_embedded_png() {
+        let image = welcome_image(WELCOME_IMAGE_SIZE);
+        assert_eq!(image.size(), WELCOME_IMAGE_SIZE);
+        let layout = welcome_image_layout(Rect::new(0, 0, 100, 40), 6).expect("image fits");
+        assert_eq!(layout.image_size, WELCOME_IMAGE_SIZE);
+        assert_eq!(layout.image_area, Rect::new(10, 6, 80, 20));
+        assert_eq!(layout.intro_area.y, layout.image_area.y + 21);
+    }
+
+    #[test]
+    fn cramped_welcome_falls_back_to_the_text_greeting() {
+        assert_eq!(welcome_image_layout(Rect::new(0, 0, 80, 16), 6), None);
+        assert_eq!(welcome_image_layout(Rect::new(0, 0, 39, 40), 6), None);
+        let scaled = welcome_image_layout(Rect::new(0, 0, 60, 25), 6).expect("scaled image fits");
+        assert_eq!(scaled.image_size, Size::new(60, 15));
+
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw text fallback");
+        let chat_area = ui_layout(&state, tui_viewport(area)).0;
+        let rows = (chat_area.y..chat_area.y + chat_area.height)
+            .map(|y| {
+                (chat_area.x..chat_area.x + chat_area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains(WELCOME_MESSAGE)));
+        assert!(!rows
+            .iter()
+            .any(|row| row.contains('▀') || row.contains('▄')));
+    }
+
+    #[test]
+    fn spacious_welcome_centers_the_embedded_png_in_the_chat_area() {
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let area = Rect::new(0, 0, 100, 50);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw welcome image");
+
+        let chat_area = ui_layout(&state, tui_viewport(area)).0;
+        let intro_lines = welcome_lines(&state.attached_agents);
+        let layout =
+            welcome_image_layout(chat_area, intro_lines.len() as u16).expect("image and intro fit");
+        assert_eq!(layout.image_size, WELCOME_IMAGE_SIZE);
+        let buffer = terminal.backend().buffer();
+        assert!(matches!(
+            buffer[(layout.image_area.x, layout.image_area.y)].symbol(),
+            "▀" | "▄"
+        ));
+        assert!(matches!(
+            buffer[(layout.image_area.x, layout.image_area.y)].fg,
+            Color::Rgb(..)
+        ));
+        assert!(matches!(
+            buffer[(layout.image_area.x, layout.image_area.y)].bg,
+            Color::Rgb(..)
+        ));
+        let first_fg = buffer[(layout.image_area.x, layout.image_area.y)].fg;
+        let first_bg = buffer[(layout.image_area.x, layout.image_area.y)].bg;
+        assert!(
+            (layout.image_area.y..layout.image_area.y + layout.image_area.height)
+                .flat_map(
+                    |y| (layout.image_area.x..layout.image_area.x + layout.image_area.width)
+                        .map(move |x| (x, y))
+                )
+                .any(|(x, y)| buffer[(x, y)].fg != first_fg || buffer[(x, y)].bg != first_bg)
+        );
+        let intro_rows = (layout.intro_area.y..layout.intro_area.y + layout.intro_area.height)
+            .map(|y| {
+                (layout.intro_area.x..layout.intro_area.x + layout.intro_area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(intro_rows.iter().any(|row| row.contains(WELCOME_MESSAGE)));
     }
 
     #[test]
@@ -7423,7 +7640,7 @@ mod tests {
         ];
         assert_eq!(
             lines,
-            render_transcript_items(&expected, 80, &state, false),
+            render_transcript_items(&expected, 80, &state, true),
             "worker events use the same transcript-item renderer as the main stream"
         );
         assert_eq!(
@@ -7501,7 +7718,7 @@ mod tests {
         assert_eq!(task.stream_chars, SUBAGENT_STREAM_MAX_CHARS);
         assert!(matches!(
             task.stream.as_slice(),
-            [SubagentStreamItem::Assistant(prefix), SubagentStreamItem::Assistant(text)]
+            [SubagentStreamItem::User(prefix), SubagentStreamItem::Assistant(text)]
                 if prefix.starts_with('…') && prefix.ends_with('a') && text == &latest
         ));
     }
@@ -7539,7 +7756,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_subagent_tool_result_keeps_the_latest_tail() {
+    fn oversized_subagent_tool_result_keeps_structured_truncation_marker() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
         state.subagents.push(SubagentTask {
             call_id: "call-worker".to_owned(),
@@ -7553,24 +7770,73 @@ mod tests {
             stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
             stream_chars: "Inspect".chars().count(),
         });
-        let tail = "latest command output";
         state.apply_subagent_activity(SubagentActivity::Event {
             task_id: "subagent-1".to_owned(),
             event: ProtocolEvent::ToolResult {
                 id: "call-cmd".to_owned(),
                 name: "cmd".to_owned(),
                 result: serde_json::json!({
-                    "stdout": format!("{}{}", "x".repeat(SUBAGENT_STREAM_MAX_CHARS), tail)
+                    "stdout": "x".repeat(SUBAGENT_STREAM_MAX_CHARS),
+                    "zz_raw_marker": "must stay structured"
                 }),
             },
         });
 
         let task = &state.subagents[0];
-        assert_eq!(task.stream_chars, SUBAGENT_STREAM_MAX_CHARS);
+        assert_eq!(task.stream_chars, 1);
         assert!(matches!(
             task.stream.as_slice(),
-            [SubagentStreamItem::Assistant(text)] if text.starts_with('…') && text.contains(tail)
+            [SubagentStreamItem::Assistant(text)] if text == "…"
         ));
+        let rendered = subagent_stream_lines(task, 80, &state)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered, "…");
+        assert!(!rendered.contains("zz_raw_marker"));
+    }
+
+    #[test]
+    fn oversized_subagent_tool_call_keeps_structured_truncation_marker() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.subagents.push(SubagentTask {
+            call_id: "call-worker".to_owned(),
+            task_id: Some("subagent-1".to_owned()),
+            task: "Inspect".to_owned(),
+            model: None,
+            effort: None,
+            status: SubagentStatus::Running,
+            result: None,
+            creation_completed: true,
+            stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
+            stream_chars: "Inspect".chars().count(),
+        });
+        state.apply_subagent_activity(SubagentActivity::Event {
+            task_id: "subagent-1".to_owned(),
+            event: ProtocolEvent::ToolCall {
+                id: "call-cmd".to_owned(),
+                name: "cmd".to_owned(),
+                arguments: format!(
+                    r#"{{"command":"{}","zz_raw_marker":"must stay structured"}}"#,
+                    "x".repeat(SUBAGENT_STREAM_MAX_CHARS)
+                ),
+            },
+        });
+
+        let task = &state.subagents[0];
+        assert_eq!(task.stream_chars, 1);
+        assert!(matches!(
+            task.stream.as_slice(),
+            [SubagentStreamItem::Assistant(text)] if text == "…"
+        ));
+        let rendered = subagent_stream_lines(task, 80, &state)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rendered, "…");
+        assert!(!rendered.contains("zz_raw_marker"));
     }
 
     #[test]
