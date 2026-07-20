@@ -58,16 +58,18 @@ const CONSOLE_BACKGROUND: Color = Color::Rgb(
     CONSOLE_BACKGROUND_RGB.1,
     CONSOLE_BACKGROUND_RGB.2,
 );
-const CONSOLE_STATUS_COLOR: Color = Color::Rgb(112, 112, 116);
-const CONSOLE_ACCENT_MAGENTA: (u8, u8, u8) = (220, 35, 175);
-const CONSOLE_ACCENT_RED: (u8, u8, u8) = (235, 45, 65);
-const CONSOLE_ACCENT_ORANGE: (u8, u8, u8) = (255, 130, 25);
-const CONSOLE_ACCENT_COLORS: [(u8, u8, u8); 5] = [
-    CONSOLE_ACCENT_MAGENTA,
-    CONSOLE_ACCENT_RED,
-    CONSOLE_ACCENT_ORANGE,
-    CONSOLE_ACCENT_RED,
-    CONSOLE_ACCENT_ORANGE,
+const CONSOLE_STATUS_COLOR: Color = Color::Rgb(144, 144, 148);
+const CONSOLE_ACCENT_TEAL: (u8, u8, u8) = (0, 180, 180);
+const CONSOLE_ACCENT_GREEN: (u8, u8, u8) = (0, 200, 100);
+const CONSOLE_ACCENT_LIME: (u8, u8, u8) = (160, 220, 0);
+const CONSOLE_ACCENT_YELLOW: (u8, u8, u8) = (255, 215, 0);
+const CONSOLE_ACCENT_COLORS: [(u8, u8, u8); 6] = [
+    CONSOLE_ACCENT_TEAL,
+    CONSOLE_ACCENT_GREEN,
+    CONSOLE_ACCENT_LIME,
+    CONSOLE_ACCENT_YELLOW,
+    CONSOLE_ACCENT_LIME,
+    CONSOLE_ACCENT_GREEN,
 ];
 const CONSOLE_ACCENT_SEGMENT_DURATION: Duration = Duration::from_secs(3);
 const CONSOLE_ACCENT_DESATURATION: f32 = 0.15;
@@ -75,12 +77,14 @@ const CONSOLE_GLASS_DESATURATION: f32 = 0.65;
 const CONSOLE_GLASS_TINT: f32 = 0.24;
 const CONSOLE_GLASS_WHITE_TINT: f32 = 0.03;
 const CONSOLE_GLASS_GLOW_THROUGH: f32 = 0.26;
+const CONSOLE_REFLECTION_TINT: f32 = 0.12;
+const CONSOLE_REFLECTION_WHITE_TINT: f32 = 0.20;
+const CONSOLE_REFLECTION_GLYPH: &str = "▁";
 const GLOW_HEIGHT: u16 = 12;
-const GLOW_HORIZONTAL_SPREAD: u16 = 20;
-const GLOW_INTENSITY: f32 = 0.62;
-const GLOW_DESATURATION: f32 = 0.20;
+const GLOW_HORIZONTAL_SPREAD: u16 = 24;
+const GLOW_INTENSITY: f32 = 0.70;
+const GLOW_DESATURATION: f32 = 0.10;
 const CONSOLE_BOUNDARY_CYCLE: Duration = Duration::from_millis(7000);
-const CONSOLE_HORIZONTAL_PHASE_SPAN: f32 = 0.18;
 const CONSOLE_REACH_MIN: f32 = 0.28;
 const CONSOLE_REACH_MAX: f32 = 0.38;
 const CONSOLE_VISIBILITY_TRANSITION: Duration = Duration::from_millis(600);
@@ -2701,6 +2705,11 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         activity_elapsed,
         console_visibility,
     );
+    // Keep the reflection in the existing transcript gap. On constrained
+    // layouts the row above the console belongs to the transcript instead.
+    if chat_chunk.y.saturating_add(chat_chunk.height) < input_chunk.y {
+        apply_console_top_reflection(frame, input_chunk, activity_elapsed, console_visibility);
+    }
     if let Some(picker_area) = picker_area {
         draw_skill_picker(frame, state, picker_area);
     }
@@ -3872,12 +3881,9 @@ fn console_accent_cycle() -> Duration {
     CONSOLE_ACCENT_SEGMENT_DURATION * CONSOLE_ACCENT_COLORS.len() as u32
 }
 
-fn console_accent_at(elapsed: Duration, column: u16, width: u16) -> Color {
-    let horizontal_position =
-        column.min(width.saturating_sub(1)) as f32 / width.saturating_sub(1).max(1) as f32;
+fn console_accent_at(elapsed: Duration) -> Color {
     let position = (elapsed.as_secs_f32() / console_accent_cycle().as_secs_f32()
-        * CONSOLE_ACCENT_COLORS.len() as f32
-        - horizontal_position * CONSOLE_HORIZONTAL_PHASE_SPAN * CONSOLE_ACCENT_COLORS.len() as f32)
+        * CONSOLE_ACCENT_COLORS.len() as f32)
         .rem_euclid(CONSOLE_ACCENT_COLORS.len() as f32);
     let from = position.floor() as usize % CONSOLE_ACCENT_COLORS.len();
     let to = (from + 1) % CONSOLE_ACCENT_COLORS.len();
@@ -3934,17 +3940,12 @@ fn glow_coverage_at(column: u16, row: u16, canvas: Rect, console_area: Rect) -> 
     falloff * falloff * (3.0 - 2.0 * falloff)
 }
 
-fn glow_accent_at(elapsed: Duration, column: u16, width: u16) -> Color {
-    glow_accent_with_desaturation_at(elapsed, column, width, GLOW_DESATURATION)
+fn glow_accent_at(elapsed: Duration) -> Color {
+    glow_accent_with_desaturation_at(elapsed, GLOW_DESATURATION)
 }
 
-fn glow_accent_with_desaturation_at(
-    elapsed: Duration,
-    column: u16,
-    width: u16,
-    desaturation: f32,
-) -> Color {
-    let (red, green, blue) = activity_rgb(console_accent_at(elapsed, column, width));
+fn glow_accent_with_desaturation_at(elapsed: Duration, desaturation: f32) -> Color {
+    let (red, green, blue) = activity_rgb(console_accent_at(elapsed));
     let neutral = ((u16::from(red) + u16::from(green) + u16::from(blue)) / 3) as u8;
     Color::Rgb(
         interpolate_color(red, neutral, desaturation),
@@ -3975,12 +3976,9 @@ fn glow_color_at(
 
     let intensity =
         (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * GLOW_INTENSITY * coverage * visibility;
-    let console_column = column
-        .saturating_sub(console_area.x.saturating_sub(canvas.x))
-        .min(console_area.width.saturating_sub(1));
     Some(blend_rgb(
         TUI_GLOW_BACKGROUND,
-        glow_accent_at(elapsed, console_column, console_area.width),
+        glow_accent_at(elapsed),
         intensity,
     ))
 }
@@ -4021,14 +4019,8 @@ fn apply_tui_glow(
     }
 }
 
-fn console_glass_color_at(
-    elapsed: Duration,
-    column: u16,
-    width: u16,
-    glow: Color,
-    visibility: f32,
-) -> Color {
-    let (red, green, blue) = activity_rgb(console_accent_at(elapsed, column, width));
+fn console_glass_color_at(elapsed: Duration, glow: Color, visibility: f32) -> Color {
+    let (red, green, blue) = activity_rgb(console_accent_at(elapsed));
     let neutral = ((u16::from(red) + u16::from(green) + u16::from(blue)) / 3) as u8;
     let glass_accent = Color::Rgb(
         interpolate_color(red, neutral, CONSOLE_GLASS_DESATURATION),
@@ -4049,6 +4041,47 @@ fn console_glass_color_at(
     blend_rgb(white_tinted, glow, CONSOLE_GLASS_GLOW_THROUGH * visibility)
 }
 
+/// Return the faint accent colour used by the external glass reflection.
+fn console_top_reflection_color_at(elapsed: Duration, background: Color, visibility: f32) -> Color {
+    let visibility = visibility.clamp(0.0, 1.0);
+    let reflected = blend_rgb(
+        background,
+        glow_accent_at(elapsed),
+        CONSOLE_REFLECTION_TINT * visibility,
+    );
+    blend_rgb(
+        reflected,
+        Color::Rgb(255, 255, 255),
+        CONSOLE_REFLECTION_WHITE_TINT * visibility,
+    )
+}
+
+/// Draw a one-eighth-cell reflection on the bottom edge of the row immediately
+/// above the console. This leaves the console's own background uniform while
+/// keeping the effect thin in terminals that render block glyphs.
+fn apply_console_top_reflection(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    elapsed: Duration,
+    visibility: f32,
+) {
+    if visibility <= 0.0 || area.y == 0 {
+        return;
+    }
+
+    let y = area.y - 1;
+    let buffer = frame.buffer_mut();
+    for x in area.x..area.x.saturating_add(area.width) {
+        let background = match buffer[(x, y)].bg {
+            Color::Rgb(_, _, _) => buffer[(x, y)].bg,
+            _ => TUI_GLOW_BACKGROUND,
+        };
+        buffer[(x, y)].set_symbol(CONSOLE_REFLECTION_GLYPH).set_fg(
+            console_top_reflection_color_at(elapsed, background, visibility),
+        );
+    }
+}
+
 /// Composite the dark, low-saturation glass only over the console rectangle.
 fn apply_console_background(frame: &mut Frame<'_>, area: Rect, elapsed: Duration, visibility: f32) {
     let buffer = frame.buffer_mut();
@@ -4058,13 +4091,7 @@ fn apply_console_background(frame: &mut Frame<'_>, area: Rect, elapsed: Duration
                 Color::Rgb(_, _, _) => buffer[(x, y)].bg,
                 _ => TUI_GLOW_BACKGROUND,
             };
-            buffer[(x, y)].set_bg(console_glass_color_at(
-                elapsed,
-                x.saturating_sub(area.x),
-                area.width,
-                glow,
-                visibility,
-            ));
+            buffer[(x, y)].set_bg(console_glass_color_at(elapsed, glow, visibility));
         }
     }
 }
@@ -4315,7 +4342,7 @@ mod tests {
         );
         assert_eq!(
             context_status_style(&state).fg,
-            Some(Color::Rgb(112, 112, 116))
+            Some(Color::Rgb(144, 144, 148))
         );
 
         state.context_tokens = 80_001;
@@ -4325,7 +4352,7 @@ mod tests {
         );
         assert_eq!(
             context_status_style(&state).fg,
-            Some(Color::Rgb(112, 112, 116)),
+            Some(Color::Rgb(144, 144, 148)),
             "crossing the compaction threshold does not recolor the status line"
         );
     }
@@ -4360,7 +4387,7 @@ mod tests {
         assert_eq!(context_status_text(&state), "Context: 1/? (?%) ??????????");
         assert_eq!(
             context_status_style(&state).fg,
-            Some(Color::Rgb(112, 112, 116))
+            Some(Color::Rgb(144, 144, 148))
         );
     }
 
@@ -4548,7 +4575,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(GLOW_HEIGHT, 12);
-        assert_eq!(GLOW_HORIZONTAL_SPREAD, 20);
+        assert_eq!(GLOW_HORIZONTAL_SPREAD, 24);
         assert_eq!(
             active_rows,
             (bottom - GLOW_HEIGHT..bottom).collect::<Vec<_>>()
@@ -4573,8 +4600,8 @@ mod tests {
             "the exposed glow grows wider toward the TUI bottom"
         );
         assert!(
-            glow_coverage_at(console.x + console.width + 19, bottom - 1, canvas, console) > 0.0,
-            "the glow extends farther horizontally than the prior eighteen-cell spread"
+            glow_coverage_at(console.x + console.width + 23, bottom - 1, canvas, console) > 0.0,
+            "the glow extends twenty-four cells beyond each console edge"
         );
     }
 
@@ -4641,7 +4668,7 @@ mod tests {
                 assert_eq!(buffer[exposed].bg, exposed_glow);
                 assert_eq!(
                     buffer[inside].bg,
-                    console_glass_color_at(elapsed, 0, console.width, inside_glow, 1.0)
+                    console_glass_color_at(elapsed, inside_glow, 1.0)
                 );
             })
             .expect("render glow and glass");
@@ -4770,13 +4797,13 @@ mod tests {
         let row = canvas.y + canvas.height - 1;
         let elapsed = Duration::ZERO;
         let coverage = glow_coverage_at(column, row, canvas, console);
-        assert_eq!(GLOW_INTENSITY, 0.62);
+        assert_eq!(GLOW_INTENSITY, 0.70);
         let current = glow_color_at(elapsed, column, canvas.width, row, canvas, console, 1.0)
             .expect("bottom-centre glow");
         let previous = blend_rgb(
             TUI_GLOW_BACKGROUND,
-            glow_accent_with_desaturation_at(elapsed, column - console.x, console.width, 0.35),
-            (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * 0.58 * coverage,
+            glow_accent_with_desaturation_at(elapsed, 0.16),
+            (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * 0.62 * coverage,
         );
 
         assert!(
@@ -4790,28 +4817,34 @@ mod tests {
     }
 
     #[test]
-    fn glow_tuning_is_slightly_dimmer_and_more_saturated_than_before() {
+    fn glow_tuning_is_brighter_and_more_saturated_than_before() {
         let canvas = Rect::new(0, 0, 160, 20);
         let console = Rect::new(40, 12, 80, 7);
         let column = console.x + console.width / 2;
         let row = canvas.y + canvas.height - 1;
         let coverage = glow_coverage_at(column, row, canvas, console);
 
-        assert_eq!(GLOW_INTENSITY, 0.62);
-        assert_eq!(GLOW_DESATURATION, 0.20);
+        assert_eq!(GLOW_INTENSITY, 0.70);
+        assert_eq!(GLOW_DESATURATION, 0.10);
         for phase in 0..CONSOLE_ACCENT_COLORS.len() {
             let elapsed = CONSOLE_ACCENT_SEGMENT_DURATION * phase as u32;
+            let current_accent = glow_accent_at(elapsed);
+            let previous_accent = glow_accent_with_desaturation_at(elapsed, 0.16);
+            assert!(
+                color_saturation(current_accent) > color_saturation(previous_accent),
+                "phase {phase}: reducing glow desaturation raises saturation"
+            );
             let current = glow_color_at(elapsed, column, canvas.width, row, canvas, console, 1.0)
                 .expect("bottom-centre glow");
             let previous = blend_rgb(
                 TUI_GLOW_BACKGROUND,
-                glow_accent_with_desaturation_at(elapsed, column - console.x, console.width, 0.28),
-                (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * 0.66 * coverage,
+                glow_accent_with_desaturation_at(elapsed, 0.16),
+                (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * 0.62 * coverage,
             );
 
             assert!(
-                color_luminance(current) < color_luminance(previous),
-                "phase {phase}: the rendered glow is slightly dimmer than the prior tuning"
+                color_luminance(current) > color_luminance(previous),
+                "phase {phase}: the rendered glow is brighter than the prior tuning"
             );
             assert!(
                 color_saturation(current) > color_saturation(previous),
@@ -4835,12 +4868,11 @@ mod tests {
             1.0,
         )
         .expect("visible glow");
-        let glass = console_glass_color_at(elapsed, 40, console.width, glow, 1.0);
-        let solid_glass =
-            console_glass_color_at(elapsed, 40, console.width, CONSOLE_BACKGROUND, 1.0);
+        let glass = console_glass_color_at(elapsed, glow, 1.0);
+        let solid_glass = console_glass_color_at(elapsed, CONSOLE_BACKGROUND, 1.0);
 
         assert_eq!(
-            console_glass_color_at(elapsed, 40, console.width, glow, 0.0),
+            console_glass_color_at(elapsed, glow, 0.0),
             CONSOLE_BACKGROUND
         );
         assert_ne!(glass, CONSOLE_BACKGROUND);
@@ -4867,10 +4899,176 @@ mod tests {
     }
 
     #[test]
+    fn console_top_reflection_is_a_thin_active_line_in_the_external_gap() {
+        assert_eq!(CONSOLE_REFLECTION_WHITE_TINT, 0.20);
+        let elapsed = Duration::ZERO;
+        let canvas = Rect::new(0, 0, 20, 8);
+        let console = Rect::new(2, 3, 16, 4);
+        let reflection_y = console.y - 1;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
+            canvas.width,
+            canvas.height,
+        ))
+        .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                apply_tui_glow(frame, canvas, console, elapsed, 1.0);
+                apply_console_top_reflection(frame, console, elapsed, 1.0);
+                apply_console_background(frame, console, elapsed, 1.0);
+            })
+            .expect("render external console reflection");
+
+        let reflection_glow = glow_color_at(
+            elapsed,
+            console.x,
+            canvas.width,
+            reflection_y,
+            canvas,
+            console,
+            1.0,
+        )
+        .expect("reflection row glow");
+        let accent_only_reflection = blend_rgb(
+            reflection_glow,
+            glow_accent_at(elapsed),
+            CONSOLE_REFLECTION_TINT,
+        );
+        let previous_reflection =
+            blend_rgb(accent_only_reflection, Color::Rgb(255, 255, 255), 0.10);
+        let reflection = console_top_reflection_color_at(elapsed, reflection_glow, 1.0);
+        let previous_luminance_lift =
+            color_luminance(previous_reflection) - color_luminance(accent_only_reflection);
+        let luminance_lift = color_luminance(reflection) - color_luminance(accent_only_reflection);
+        assert!(
+            luminance_lift * 100 >= previous_luminance_lift * 195
+                && luminance_lift * 100 <= previous_luminance_lift * 210,
+            "doubling the white tint doubles its reflection luminance contribution"
+        );
+        let console_glow = glow_color_at(
+            elapsed,
+            console.x,
+            canvas.width,
+            console.y,
+            canvas,
+            console,
+            1.0,
+        )
+        .expect("console glow");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(console.x, reflection_y)].symbol(),
+            CONSOLE_REFLECTION_GLYPH,
+            "the reflection is drawn in the row above the console"
+        );
+        assert_eq!(
+            buffer[(console.x, reflection_y)].fg,
+            console_top_reflection_color_at(elapsed, reflection_glow, 1.0),
+            "the thin reflection follows the glow accent"
+        );
+        assert_eq!(
+            buffer[(console.x, reflection_y - 1)].symbol(),
+            " ",
+            "only the closest external row is changed"
+        );
+        assert_eq!(
+            buffer[(console.x, console.y)].bg,
+            console_glass_color_at(elapsed, console_glow, 1.0),
+            "the console top row remains normal glass"
+        );
+
+        let mut idle_terminal = Terminal::new(ratatui::backend::TestBackend::new(
+            canvas.width,
+            canvas.height,
+        ))
+        .expect("idle test terminal");
+        idle_terminal
+            .draw(|frame| {
+                apply_tui_glow(frame, canvas, console, elapsed, 0.0);
+                apply_console_top_reflection(frame, console, elapsed, 0.0);
+                apply_console_background(frame, console, elapsed, 0.0);
+            })
+            .expect("render idle console");
+        assert_eq!(
+            idle_terminal.backend().buffer()[(console.x, reflection_y)].symbol(),
+            " ",
+            "idle consoles have no external reflection"
+        );
+
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let viewport = tui_viewport(Rect::new(0, 0, 80, 10));
+        let (chat, _, _, _, input_area, _) = ui_layout(&state, viewport);
+        assert_eq!(
+            chat.y + chat.height + 1,
+            input_area.y,
+            "the reflection uses the existing transcript gap rather than adding a row"
+        );
+    }
+
+    #[test]
+    fn console_reflection_skips_transcript_when_no_gap_fits() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.welcome_visible = false;
+        state
+            .transcript
+            .push(TranscriptItem::Info("protected transcript".to_owned()));
+        state.busy = true;
+        state.activity_transition = None;
+        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
+        let area = Rect::new(0, 0, 60, 7);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw constrained active console");
+
+        let (chat, _, _, _, console, _) = ui_layout(&state, tui_viewport(area));
+        assert_eq!(chat.y + chat.height, console.y, "there is no separator row");
+        assert_eq!(
+            terminal.backend().buffer()[(chat.x, chat.y)].symbol(),
+            "p",
+            "the active reflection does not overwrite the adjacent transcript"
+        );
+    }
+
+    #[test]
+    fn console_reflection_stays_behind_an_active_skill_picker() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false)
+            .with_skill_names(vec!["agent-browser".to_owned()]);
+        state.input = "/".to_owned();
+        state.input_changed();
+        state.busy = true;
+        state.activity_transition = None;
+        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
+        let area = Rect::new(0, 0, 40, 12);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw active picker");
+
+        let (_, picker, _, _, input, _) = ui_layout(&state, tui_viewport(area));
+        let picker = picker.expect("visible picker");
+        assert_eq!(picker.y + picker.height, input.y);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(picker.x, picker.y + picker.height - 1)].bg,
+            SKILL_PICKER_BACKGROUND,
+            "the picker covers the reflection row"
+        );
+        assert_ne!(
+            buffer[(picker.x, picker.y + picker.height - 1)].symbol(),
+            CONSOLE_REFLECTION_GLYPH,
+            "the reflection glyph does not show through the picker"
+        );
+    }
+
+    #[test]
     fn console_glass_white_film_brightens_only_visible_glass() {
         let elapsed = Duration::ZERO;
         let glow = Color::Rgb(80, 82, 86);
-        let (red, green, blue) = activity_rgb(console_accent_at(elapsed, 0, 1));
+        let (red, green, blue) = activity_rgb(console_accent_at(elapsed));
         let neutral = ((u16::from(red) + u16::from(green) + u16::from(blue)) / 3) as u8;
         let glass_accent = Color::Rgb(
             interpolate_color(red, neutral, CONSOLE_GLASS_DESATURATION),
@@ -4879,7 +5077,7 @@ mod tests {
         );
         let accent_tinted = blend_rgb(CONSOLE_BACKGROUND, glass_accent, CONSOLE_GLASS_TINT);
         let without_white_film = blend_rgb(accent_tinted, glow, CONSOLE_GLASS_GLOW_THROUGH);
-        let with_white_film = console_glass_color_at(elapsed, 0, 1, glow, 1.0);
+        let with_white_film = console_glass_color_at(elapsed, glow, 1.0);
         let expected = blend_rgb(
             blend_rgb(
                 accent_tinted,
@@ -4892,7 +5090,7 @@ mod tests {
 
         assert_eq!(CONSOLE_GLASS_WHITE_TINT, 0.03);
         assert_eq!(
-            console_glass_color_at(elapsed, 0, 1, glow, 0.0),
+            console_glass_color_at(elapsed, glow, 0.0),
             CONSOLE_BACKGROUND,
             "idle glass uses the configured console background"
         );
@@ -4913,22 +5111,23 @@ mod tests {
     }
 
     #[test]
-    fn console_accent_uses_the_requested_slow_five_leg_cycle() {
+    fn console_accent_uses_the_requested_teal_to_yellow_reverse_cycle() {
         assert_eq!(
             console_accent_cycle(),
             CONSOLE_ACCENT_SEGMENT_DURATION * CONSOLE_ACCENT_COLORS.len() as u32
         );
         let expected = [
-            CONSOLE_ACCENT_MAGENTA,
-            CONSOLE_ACCENT_RED,
-            CONSOLE_ACCENT_ORANGE,
-            CONSOLE_ACCENT_RED,
-            CONSOLE_ACCENT_ORANGE,
-            CONSOLE_ACCENT_MAGENTA,
+            CONSOLE_ACCENT_TEAL,
+            CONSOLE_ACCENT_GREEN,
+            CONSOLE_ACCENT_LIME,
+            CONSOLE_ACCENT_YELLOW,
+            CONSOLE_ACCENT_LIME,
+            CONSOLE_ACCENT_GREEN,
+            CONSOLE_ACCENT_TEAL,
         ];
         for (index, (red, green, blue)) in expected.into_iter().enumerate() {
             assert_eq!(
-                console_accent_at(CONSOLE_ACCENT_SEGMENT_DURATION * index as u32, 0, 1),
+                console_accent_at(CONSOLE_ACCENT_SEGMENT_DURATION * index as u32),
                 desaturate_console_accent(red, green, blue),
                 "palette waypoint {index}"
             );
@@ -4942,13 +5141,10 @@ mod tests {
     }
 
     #[test]
-    fn console_palette_is_brighter_and_fifteen_percent_less_saturated() {
+    fn console_palette_starts_teal_with_fifteen_percent_desaturation() {
         assert_eq!(CONSOLE_BACKGROUND_RGB, (42, 42, 46));
         assert_eq!(CONSOLE_BACKGROUND, Color::Rgb(42, 42, 46));
-        assert_eq!(
-            console_accent_at(Duration::ZERO, 0, 1),
-            Color::Rgb(208, 51, 170)
-        );
+        assert_eq!(console_accent_at(Duration::ZERO), Color::Rgb(18, 171, 171));
     }
 
     #[test]
@@ -4959,27 +5155,58 @@ mod tests {
     }
 
     #[test]
-    fn console_accent_transition_flows_smoothly_from_left_to_right() {
+    fn console_accent_transition_changes_all_tui_glow_in_sync() {
         let elapsed = console_accent_cycle() / 4;
-        let width = 20;
-        let left = console_accent_at(elapsed, 0, width);
-        let middle = console_accent_at(elapsed, width / 2, width);
-        let right = console_accent_at(elapsed, width - 1, width);
+        let canvas = Rect::new(0, 0, 80, 20);
+        let console = Rect::new(20, 12, 40, 7);
+        let row = canvas.y + canvas.height - 1;
+        let left = glow_color_at(elapsed, console.x, canvas.width, row, canvas, console, 1.0)
+            .expect("left-side glow");
+        let right = glow_color_at(
+            elapsed,
+            console.x + console.width - 1,
+            canvas.width,
+            row,
+            canvas,
+            console,
+            1.0,
+        )
+        .expect("right-side glow");
+        let intensity = (console_reach_at(elapsed) / CONSOLE_REACH_MAX)
+            * GLOW_INTENSITY
+            * glow_coverage_at(console.x, row, canvas, console);
 
-        assert_ne!(left, middle);
-        assert_ne!(middle, right);
-        let (_, left_green, _) = activity_rgb(left);
-        let (_, middle_green, _) = activity_rgb(middle);
-        let (_, right_green, _) = activity_rgb(right);
-        assert!(left_green > middle_green && middle_green > right_green);
         assert_eq!(
-            console_accent_at(
-                elapsed + console_accent_cycle().mul_f32(CONSOLE_HORIZONTAL_PHASE_SPAN),
-                width - 1,
-                width,
-            ),
+            blend_rgb(TUI_GLOW_BACKGROUND, glow_accent_at(elapsed), intensity),
             left,
-            "the same accent color travels from left to right over the phase span"
+            "the left edge uses the shared accent phase"
+        );
+        assert_eq!(left, right, "the glow has no horizontal color phase");
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
+            canvas.width,
+            canvas.height,
+        ))
+        .expect("test terminal");
+        terminal
+            .draw(|frame| {
+                apply_tui_glow(frame, canvas, console, elapsed, 1.0);
+                apply_console_top_reflection(frame, console, elapsed, 1.0);
+                apply_console_background(frame, console, elapsed, 1.0);
+            })
+            .expect("render synchronized TUI glow");
+        let buffer = terminal.backend().buffer();
+        let left_x = console.x;
+        let right_x = console.x + console.width - 1;
+        assert_eq!(
+            buffer[(left_x, console.y)].bg,
+            buffer[(right_x, console.y)].bg,
+            "the glass uses the shared accent phase"
+        );
+        assert_eq!(
+            buffer[(left_x, console.y - 1)].fg,
+            buffer[(right_x, console.y - 1)].fg,
+            "the reflection uses the shared accent phase"
         );
     }
 
@@ -6277,7 +6504,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(idle_row, idle);
         for x in idle_columns {
-            assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(112, 112, 116));
+            assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(144, 144, 148));
         }
 
         state.set_status("working");
@@ -6303,7 +6530,7 @@ mod tests {
             "the busy status line renders over bright glass"
         );
         for x in status_columns {
-            assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(112, 112, 116));
+            assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(144, 144, 148));
         }
     }
 
@@ -6468,7 +6695,8 @@ mod tests {
             .expect("draw busy console");
 
         let viewport = tui_viewport(area);
-        let input_area = ui_layout(&state, viewport).4;
+        let (chat_area, _, _, _, input_area, _) = ui_layout(&state, viewport);
+        let reflection_y = input_area.y - 1;
         let glow_floor_y = area.y + area.height - 1;
         let edge_y = input_area.y + input_area.height - 1;
         let floor = input_area.x + input_area.width / 2;
@@ -6476,8 +6704,15 @@ mod tests {
         let left_outer = left_edge - 1;
         let right_edge = input_area.x + input_area.width - 1;
         let right_outer = right_edge + 1;
-        let widening_sample = input_area.x - 18;
+        let widening_sample = input_area.x - 22;
         let buffer = terminal.backend().buffer();
+        assert_eq!(chat_area.y + chat_area.height + 1, input_area.y);
+        assert_eq!(
+            buffer[(floor, reflection_y)].symbol(),
+            CONSOLE_REFLECTION_GLYPH,
+            "the active console reflects along the bottom of the existing gap row"
+        );
+        assert_ne!(buffer[(floor, reflection_y)].fg, Color::Reset);
         assert_ne!(buffer[(floor, glow_floor_y)].bg, Color::Reset);
         assert_ne!(buffer[(left_outer, edge_y)].bg, Color::Reset);
         assert_ne!(buffer[(right_outer, edge_y)].bg, Color::Reset);
@@ -6581,8 +6816,7 @@ mod tests {
             let y = section.y;
             let glow = glow_color_at(elapsed, x, area.width, y, area, input, visibility)
                 .unwrap_or(TUI_GLOW_BACKGROUND);
-            let expected =
-                console_glass_color_at(elapsed, x - input.x, input.width, glow, visibility);
+            let expected = console_glass_color_at(elapsed, glow, visibility);
             assert!(
                 color_distance(buffer[(x, y)].bg, expected) <= 3,
                 "section ({x}, {y}) must retain the same glass surface as the console"
