@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.0](https://github.com/jwoo0122/lucy/compare/v1.5.5...v1.6.0) - 2026-07-21
+
+### Added
+
+- show text-based logo with gradient on greeting screen ([#18](https://github.com/jwoo0122/lucy/pull/18))
+
 ## [1.5.5](https://github.com/jwoo0122/lucy/compare/v1.5.4...v1.5.5) - 2026-07-21
 
 ### Fixed
