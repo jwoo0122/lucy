@@ -1,6 +1,14 @@
-# Lucy
+<p align="center">
+  <img src="./site/logo.png" alt="Lucy" width="80">
+</p>
 
-![Crates.io Version](https://img.shields.io/crates/v/lucy-cli)
+<h1 align="center">Lucy</h1>
+
+<p align="center">An ultra-thin harness for tomorrow's most powerful models</p>
+
+<p align="center">
+  <img src="https://img.shields.io/crates/v/lucy-cli" alt="Crates.io Version">
+</p>
 
 ![](./imgs/sample.png)
 
