@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.1](https://github.com/jwoo0122/lucy/compare/v1.6.0...v1.6.1) - 2026-07-21
+
+### Fixed
+
+- enable Shift+Enter detection inside tmux via modifyOtherKeys ([#19](https://github.com/jwoo0122/lucy/pull/19))
+
 ## [1.6.0](https://github.com/jwoo0122/lucy/compare/v1.5.5...v1.6.0) - 2026-07-21
 
 ### Added
