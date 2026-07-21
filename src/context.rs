@@ -64,6 +64,7 @@ fn default_model_invocable() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootContext {
     pub system_prompt: String,
+    pub cwd: PathBuf,
     pub instruction_files: Vec<InstructionSource>,
     pub skills: Vec<SkillEntry>,
 }
@@ -98,6 +99,13 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
         }
     }
 
+    let mut readme_files = Vec::new();
+    for directory in &project_directories {
+        if let Some(readme) = readme_for_directory(directory)? {
+            readme_files.push(readme);
+        }
+    }
+
     // More-specific project locations override an earlier skill with the
     // same declared name.
     let mut skills = BTreeMap::new();
@@ -106,10 +114,17 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
         discover_skills(&directory.join(".agents").join("skills"), &mut skills)?;
     }
     let skills = skills.into_values().collect::<Vec<_>>();
-    let system_prompt = build_system_prompt(configured_prompt, &instruction_files, &skills);
+    let system_prompt = build_system_prompt(
+        configured_prompt,
+        &cwd,
+        &instruction_files,
+        &readme_files,
+        &skills,
+    );
 
     Ok(BootContext {
         system_prompt,
+        cwd,
         instruction_files,
         skills,
     })
@@ -495,6 +510,37 @@ fn preferred_instruction(directory: &Path) -> Result<Option<InstructionSource>, 
     Ok(None)
 }
 
+const README_CHAR_LIMIT: usize = 1000;
+
+fn truncate_readme(contents: &str) -> String {
+    let trimmed = contents.trim_end();
+    if trimmed.chars().count() <= README_CHAR_LIMIT {
+        return trimmed.to_owned();
+    }
+    let truncated: String = trimmed.chars().take(README_CHAR_LIMIT).collect();
+    format!("{truncated}\n\n[README truncated; showing first 1000 characters]")
+}
+
+fn readme_for_directory(directory: &Path) -> Result<Option<InstructionSource>, ContextError> {
+    let Some(directory_fd) = ContextDirectory::open(directory)
+        .map_err(|_error| ContextError::new("unable to inspect instruction context"))?
+    else {
+        return Ok(None);
+    };
+    let Some(file) = directory_fd
+        .open_instruction_file(OsStr::new("README.md"))
+        .map_err(|_error| ContextError::new("unable to inspect instruction context"))?
+    else {
+        return Ok(None);
+    };
+    let contents = read_open_file(file)
+        .map_err(|_error| ContextError::new("unable to read instruction context"))?;
+    Ok(Some(InstructionSource {
+        path: directory.join("README.md"),
+        contents: truncate_readme(&contents),
+    }))
+}
+
 fn discover_skills(
     skills_root: &Path,
     skills: &mut BTreeMap<String, SkillEntry>,
@@ -662,15 +708,25 @@ fn escape_xml(text: &str) -> String {
 
 fn build_system_prompt(
     configured_prompt: &str,
+    cwd: &Path,
     instruction_files: &[InstructionSource],
+    readme_files: &[InstructionSource],
     skills: &[SkillEntry],
 ) -> String {
     let mut sections = vec![configured_prompt.trim_end().to_owned()];
+    sections.push(format!("## Working directory\n{}", cwd.display()));
     for instruction in instruction_files {
         sections.push(format!(
             "## Instructions from {}\n{}",
             instruction.path.display(),
             instruction.contents.trim_end()
+        ));
+    }
+    for readme in readme_files {
+        sections.push(format!(
+            "## README from {}\n{}",
+            readme.path.display(),
+            readme.contents.trim_end()
         ));
     }
     let invocable_skills = skills
@@ -788,6 +844,10 @@ mod tests {
             .system_prompt
             .contains(&nested_skill.display().to_string()));
         assert!(!context.system_prompt.contains("# nested"));
+        assert!(context.system_prompt.contains("## Working directory"));
+        assert!(context
+            .system_prompt
+            .contains(&context.cwd.display().to_string()));
 
         fs::remove_dir_all(home).expect("remove tree");
     }
@@ -962,7 +1022,7 @@ mod tests {
             contents: "instructions".to_owned(),
             model_invocable: false,
         };
-        let prompt = build_system_prompt("configured", &[], &[hidden]);
+        let prompt = build_system_prompt("configured", Path::new("/"), &[], &[], &[hidden]);
         assert!(!prompt.contains("private-skill"));
         assert_eq!(escape_xml("a<&>\"'"), "a&lt;&amp;&gt;&quot;&apos;");
     }
@@ -976,6 +1036,61 @@ mod tests {
         let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
         assert!(context.skills.is_empty());
         assert!(!context.system_prompt.contains("invalid"));
+        fs::remove_dir_all(home).expect("remove tree");
+    }
+
+    #[test]
+    fn system_prompt_includes_cwd() {
+        let (home, cwd) = temporary_tree();
+        let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
+        assert!(context.system_prompt.contains("## Working directory"));
+        assert!(context
+            .system_prompt
+            .contains(&context.cwd.display().to_string()));
+        fs::remove_dir_all(home).expect("remove tree");
+    }
+
+    #[test]
+    fn readme_full_content_in_system_prompt() {
+        let (home, cwd) = temporary_tree();
+        fs::write(cwd.join("README.md"), "# Project\n\nShort readme.").expect("readme");
+        let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
+        assert!(context.system_prompt.contains("## README from"));
+        assert!(context.system_prompt.contains("# Project"));
+        assert!(context.system_prompt.contains("Short readme."));
+        assert!(!context.system_prompt.contains("[README truncated"));
+        fs::remove_dir_all(home).expect("remove tree");
+    }
+
+    #[test]
+    fn readme_truncated_when_too_long() {
+        let (home, cwd) = temporary_tree();
+        let content = "a".repeat(1000) + "b";
+        fs::write(cwd.join("README.md"), &content).expect("readme");
+        let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
+        assert!(context
+            .system_prompt
+            .contains("[README truncated; showing first 1000 characters]"));
+        fs::remove_dir_all(home).expect("remove tree");
+    }
+
+    #[test]
+    fn readme_from_multiple_ancestor_directories() {
+        let (home, cwd) = temporary_tree();
+        let project = home.join("project");
+        fs::write(project.join("README.md"), "root readme").expect("root readme");
+        fs::write(cwd.join("README.md"), "nested readme").expect("nested readme");
+        let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
+        assert!(context.system_prompt.contains("root readme"));
+        assert!(context.system_prompt.contains("nested readme"));
+        fs::remove_dir_all(home).expect("remove tree");
+    }
+
+    #[test]
+    fn no_readme_works_without_error() {
+        let (home, cwd) = temporary_tree();
+        let context = resolve_boot_context(&home, &cwd, "configured").expect("context");
+        assert!(!context.system_prompt.contains("## README from"));
         fs::remove_dir_all(home).expect("remove tree");
     }
 }
