@@ -46,9 +46,13 @@ const TUI_MAX_WIDTH: u16 = 100;
 const WELCOME_MESSAGE: &str = "Coding Agent Harness LUCY";
 const WELCOME_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const WELCOME_TAGLINE: &str = "An ultra-thin harness for tomorrow's most powerful models";
-const WELCOME_IMAGE_BYTES: &[u8] = include_bytes!("../assets/greeting.png");
-const WELCOME_IMAGE_SIZE: Size = Size::new(80, 20);
-const WELCOME_IMAGE_MIN_SIZE: Size = Size::new(40, 10);
+const GREETING_IMAGE_BYTES: &[u8] = include_bytes!("../assets/greeting.png");
+const GREETING_IMAGE_SIZE: Size = Size::new(80, 20);
+const GREETING_IMAGE_MIN_SIZE: Size = Size::new(40, 10);
+const LOGO_TEXT: &str = include_str!("../logo.txt");
+/// Gradient endpoints sampled from the logo.png that logo.txt replaces.
+const LOGO_START_COLOR: (u8, u8, u8) = (165, 200, 250);
+const LOGO_END_COLOR: (u8, u8, u8) = (221, 144, 234);
 const WELCOME_IMAGE_GAP: u16 = 1;
 const WELCOME_IMAGE_BRIGHTNESS_PERCENT: u16 = 85;
 const WELCOME_START_COLOR: (u8, u8, u8) = (180, 130, 245);
@@ -2693,14 +2697,28 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
             let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
             frame.render_widget(welcome, layout.intro_area);
         } else {
-            let welcome_height = (welcome_lines.len() as u16).min(visible_chat_area.height);
+            let logo = logo_lines();
+            let logo_gap = 2u16;
+            let total_height = logo.len() as u16 + logo_gap + welcome_lines.len() as u16;
+            // Show the logo only when the chat area can fit the logo, gap,
+            // and welcome text; otherwise fall back to text-only.
+            let lines = if total_height <= visible_chat_area.height {
+                let mut all = logo;
+                all.push(Line::raw(""));
+                all.push(Line::raw(""));
+                all.extend(welcome_lines);
+                all
+            } else {
+                welcome_lines
+            };
+            let welcome_height = (lines.len() as u16).min(visible_chat_area.height);
             let welcome_area = Rect::new(
                 visible_chat_area.x,
                 visible_chat_area.y + visible_chat_area.height.saturating_sub(welcome_height) / 2,
                 visible_chat_area.width,
                 welcome_height,
             );
-            let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
+            let welcome = Paragraph::new(lines).alignment(Alignment::Center);
             frame.render_widget(welcome, welcome_area);
         }
     } else {
@@ -3323,13 +3341,13 @@ fn welcome_image_layout(area: Rect, intro_height: u16) -> Option<WelcomeImageLay
     let available_height = area
         .height
         .saturating_sub(intro_height.saturating_add(WELCOME_IMAGE_GAP));
-    let max_width = area.width.min(WELCOME_IMAGE_SIZE.width);
-    let max_height = available_height.min(WELCOME_IMAGE_SIZE.height);
-    let aspect_width = WELCOME_IMAGE_SIZE.width / WELCOME_IMAGE_SIZE.height;
+    let max_width = area.width.min(GREETING_IMAGE_SIZE.width);
+    let max_height = available_height.min(GREETING_IMAGE_SIZE.height);
+    let aspect_width = GREETING_IMAGE_SIZE.width / GREETING_IMAGE_SIZE.height;
     let image_height = max_height.min(max_width / aspect_width);
     let image_size = Size::new(image_height * aspect_width, image_height);
-    if image_size.width < WELCOME_IMAGE_MIN_SIZE.width
-        || image_size.height < WELCOME_IMAGE_MIN_SIZE.height
+    if image_size.width < GREETING_IMAGE_MIN_SIZE.width
+        || image_size.height < GREETING_IMAGE_MIN_SIZE.height
     {
         return None;
     }
@@ -3364,7 +3382,7 @@ fn welcome_image(size: Size) -> Arc<Protocol> {
     images
         .entry((size.width, size.height))
         .or_insert_with(|| {
-            let image = image::load_from_memory(WELCOME_IMAGE_BYTES)
+            let image = image::load_from_memory(GREETING_IMAGE_BYTES)
                 .expect("embedded greeting PNG should decode");
             let image = dim_welcome_image(image);
             Arc::new(
@@ -3384,6 +3402,37 @@ fn dim_welcome_image(image: image::DynamicImage) -> image::DynamicImage {
         }
     }
     image::DynamicImage::ImageRgba8(image)
+}
+
+fn logo_lines() -> Vec<Line<'static>> {
+    let max_width = LOGO_TEXT
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    LOGO_TEXT
+        .lines()
+        .map(|line| {
+            let spans: Vec<Span> = line
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    let progress = if max_width <= 1 {
+                        0.0
+                    } else {
+                        index as f32 / (max_width - 1) as f32
+                    };
+                    let color = Color::Rgb(
+                        interpolate_color(LOGO_START_COLOR.0, LOGO_END_COLOR.0, progress),
+                        interpolate_color(LOGO_START_COLOR.1, LOGO_END_COLOR.1, progress),
+                        interpolate_color(LOGO_START_COLOR.2, LOGO_END_COLOR.2, progress),
+                    );
+                    Span::styled(character.to_string(), Style::default().fg(color))
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn welcome_line() -> Line<'static> {
@@ -5845,10 +5894,10 @@ mod tests {
 
     #[test]
     fn spacious_welcome_uses_the_embedded_png() {
-        let image = welcome_image(WELCOME_IMAGE_SIZE);
-        assert_eq!(image.size(), WELCOME_IMAGE_SIZE);
+        let image = welcome_image(GREETING_IMAGE_SIZE);
+        assert_eq!(image.size(), GREETING_IMAGE_SIZE);
         let layout = welcome_image_layout(Rect::new(0, 0, 100, 40), 6).expect("image fits");
-        assert_eq!(layout.image_size, WELCOME_IMAGE_SIZE);
+        assert_eq!(layout.image_size, GREETING_IMAGE_SIZE);
         assert_eq!(layout.image_area, Rect::new(10, 6, 80, 20));
         assert_eq!(layout.intro_area.y, layout.image_area.y + 21);
     }
@@ -5883,7 +5932,16 @@ mod tests {
     }
 
     #[test]
-    fn greeting_image_is_hidden_without_the_env_flag_and_shown_when_enabled() {
+    fn logo_text_renders_by_default_and_greeting_image_replaces_it_when_enabled() {
+        let logo = logo_lines();
+        let logo_row_count = LOGO_TEXT.lines().count();
+        assert_eq!(logo.len(), logo_row_count);
+        // Every non-space character should carry a gradient color.
+        assert!(logo.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.chars().any(|ch| ch != ' ')
+                && matches!(span.style.fg, Some(Color::Rgb(..)))
+        }));
+
         let state = UiState::from_history(&[], "secret", "model", None, false);
         let area = Rect::new(0, 0, 100, 50);
         let mut terminal =
@@ -5891,52 +5949,54 @@ mod tests {
                 .expect("test terminal");
         let chat_area = ui_layout(&state, tui_viewport(area)).0;
         let intro_lines = welcome_lines(&state.attached_agents);
-        let layout =
-            welcome_image_layout(chat_area, intro_lines.len() as u16).expect("image and intro fit");
+        let greeting_layout =
+            welcome_image_layout(chat_area, intro_lines.len() as u16).expect("greeting fits");
 
-        // Without the flag the greeting image must not render.
+        // Without the flag the logo text renders (no halfblock image cells).
         std::env::remove_var("LUCY_GREETING_IMAGE");
         terminal
             .draw(|frame| draw(frame, &state))
-            .expect("draw without greeting flag");
+            .expect("draw logo text");
         let buffer = terminal.backend().buffer();
-        assert!(!matches!(
-            buffer[(layout.image_area.x, layout.image_area.y)].symbol(),
-            "▀" | "▄"
-        ));
+        let rows = (chat_area.y..chat_area.y + chat_area.height)
+            .map(|y| {
+                (chat_area.x..chat_area.x + chat_area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows
+            .iter()
+            .any(|row| row.contains(':') || row.contains('-') || row.contains('=')));
+        assert!(!rows
+            .iter()
+            .any(|row| row.contains('▀') || row.contains('▄')));
+        assert!(rows.iter().any(|row| row.contains(WELCOME_MESSAGE)));
 
-        // With the flag set the greeting image renders.
+        // With the flag set the greeting image renders instead of the logo.
         std::env::set_var("LUCY_GREETING_IMAGE", "true");
         terminal
             .draw(|frame| draw(frame, &state))
-            .expect("draw with greeting flag");
+            .expect("draw greeting");
         let buffer = terminal.backend().buffer();
-        assert_eq!(layout.image_size, WELCOME_IMAGE_SIZE);
+        assert_eq!(greeting_layout.image_size, GREETING_IMAGE_SIZE);
         assert!(matches!(
-            buffer[(layout.image_area.x, layout.image_area.y)].symbol(),
+            buffer[(greeting_layout.image_area.x, greeting_layout.image_area.y)].symbol(),
             "▀" | "▄"
         ));
         assert!(matches!(
-            buffer[(layout.image_area.x, layout.image_area.y)].fg,
+            buffer[(greeting_layout.image_area.x, greeting_layout.image_area.y)].fg,
             Color::Rgb(..)
         ));
         assert!(matches!(
-            buffer[(layout.image_area.x, layout.image_area.y)].bg,
+            buffer[(greeting_layout.image_area.x, greeting_layout.image_area.y)].bg,
             Color::Rgb(..)
         ));
-        let first_fg = buffer[(layout.image_area.x, layout.image_area.y)].fg;
-        let first_bg = buffer[(layout.image_area.x, layout.image_area.y)].bg;
-        assert!(
-            (layout.image_area.y..layout.image_area.y + layout.image_area.height)
-                .flat_map(
-                    |y| (layout.image_area.x..layout.image_area.x + layout.image_area.width)
-                        .map(move |x| (x, y))
-                )
-                .any(|(x, y)| buffer[(x, y)].fg != first_fg || buffer[(x, y)].bg != first_bg)
-        );
-        let intro_rows = (layout.intro_area.y..layout.intro_area.y + layout.intro_area.height)
+        let intro_rows = (greeting_layout.intro_area.y
+            ..greeting_layout.intro_area.y + greeting_layout.intro_area.height)
             .map(|y| {
-                (layout.intro_area.x..layout.intro_area.x + layout.intro_area.width)
+                (greeting_layout.intro_area.x
+                    ..greeting_layout.intro_area.x + greeting_layout.intro_area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
