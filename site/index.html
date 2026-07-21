@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucy — Local Coding Agent Harness</title>
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --bg-elevated: #12121a;
+    --neon-cyan: #00f0ff;
+    --neon-magenta: #ff2bd6;
+    --neon-green: #00ff9f;
+    --text: #d4d4e8;
+    --text-dim: #6b6b85;
+    --border: #1e1e2e;
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-sans: 'Space Grotesk', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+    overflow-x: hidden;
+  }
+
+  /* subtle grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  main { position: relative; z-index: 1; }
+
+  .container { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+  /* hero */
+  .hero {
+    padding: 140px 0 80px;
+  }
+
+  .hero-logo {
+    width: 72px;
+    height: 72px;
+    margin-bottom: 24px;
+    border-radius: 16px;
+  }
+
+  .hero h1 {
+    font-family: var(--font-sans);
+    font-size: 64px;
+    font-weight: 700;
+    letter-spacing: -0.04em;
+    background: linear-gradient(135deg, var(--neon-cyan), var(--neon-magenta));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    line-height: 1;
+    margin-bottom: 16px;
+  }
+
+  .hero p {
+    font-size: 20px;
+    color: var(--text-dim);
+    max-width: 520px;
+  }
+
+  /* command section */
+  .cmd-section {
+    padding: 0 0 80px;
+  }
+
+  .cmd-block {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 0 30px rgba(0, 240, 255, 0.08);
+  }
+
+  .cmd-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .cmd-header .dot {
+    width: 11px; height: 11px; border-radius: 50%;
+  }
+  .cmd-header .dot.r { background: #ff5f57; }
+  .cmd-header .dot.y { background: #febc2e; }
+  .cmd-header .dot.g { background: #28c840; }
+  .cmd-header .title {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-left: 8px;
+  }
+
+  .cmd-body {
+    padding: 28px;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .cmd-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    flex: 1;
+  }
+
+  .cmd-prompt { color: var(--neon-green); }
+  .cmd-text { color: var(--text); }
+  .cmd-cursor {
+    display: inline-block;
+    width: 9px;
+    height: 18px;
+    background: var(--neon-cyan);
+    animation: blink 1s step-end infinite;
+    margin-left: 2px;
+    vertical-align: middle;
+  }
+
+  .copy-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+    flex-shrink: 0;
+  }
+
+  .copy-btn:hover {
+    border-color: var(--neon-cyan);
+    color: var(--neon-cyan);
+  }
+
+  .copy-btn.copied {
+    border-color: var(--neon-green);
+    color: var(--neon-green);
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .cmd-section .label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--neon-magenta);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-bottom: 16px;
+  }
+
+  /* features */
+  .features {
+    padding: 0 0 80px;
+  }
+
+  .section-label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--neon-magenta);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-bottom: 40px;
+  }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 20px;
+  }
+
+  .feature-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 28px;
+  }
+
+  .feature-card .icon {
+    font-family: var(--font-mono);
+    font-size: 24px;
+    color: var(--neon-cyan);
+    margin-bottom: 12px;
+  }
+
+  .feature-card h3 {
+    font-size: 17px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    color: var(--text);
+  }
+
+  .feature-card p {
+    font-size: 14px;
+    color: var(--text-dim);
+  }
+
+
+  /* footer */
+  footer {
+    border-top: 1px solid var(--border);
+    padding: 40px 0;
+  }
+
+  footer .container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  footer .brand {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    color: var(--neon-cyan);
+  }
+
+  footer .links {
+    display: flex;
+    gap: 24px;
+  }
+
+  footer a {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-dim);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+
+  footer a:hover { color: var(--neon-cyan); }
+
+  @media (max-width: 600px) {
+    .hero { padding: 90px 0 60px; }
+    .hero h1 { font-size: 44px; }
+    .hero-logo { width: 56px; height: 56px; }
+    .hero p { font-size: 17px; }
+    .cmd-body { flex-direction: column; align-items: flex-start; gap: 16px; }
+    .copy-btn { align-self: flex-end; }
+    footer .container { flex-direction: column; text-align: center; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <!-- Hero -->
+  <section class="hero">
+    <div class="container">
+      <img class="hero-logo" src="logo.png" alt="Lucy">
+      <h1>Lucy</h1>
+      <p>An ultra-thin harness for tomorrow's most powerful models.</p>
+    </div>
+  </section>
+
+  <!-- Command -->
+  <section class="cmd-section">
+    <div class="container">
+      <div class="label">// Quick Start</div>
+      <div class="cmd-block">
+        <div class="cmd-header">
+          <span class="dot r"></span>
+          <span class="dot y"></span>
+          <span class="dot g"></span>
+          <span class="title">terminal — zsh</span>
+        </div>
+        <div class="cmd-body">
+          <div class="cmd-line">
+            <span class="cmd-prompt">$</span>
+            <span class="cmd-text">&nbsp;brew install jwoo0122/tap/lucy && lucy</span>
+            <span class="cmd-cursor"></span>
+          </div>
+          <button class="copy-btn" onclick="copyCommand(this)">copy</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section class="features">
+    <div class="container">
+      <div class="section-label">// What's Inside</div>
+      <div class="feature-grid">
+        <div class="feature-card">
+          <div class="icon">$</div>
+          <h3>cmd</h3>
+          <p>Trusted finite shell commands from the session's starting directory, with time and output limits.</p>
+        </div>
+        <div class="feature-card">
+          <div class="icon">▶▶</div>
+          <h3>spawn_subagent</h3>
+          <p>Up to four isolated background workers running in parallel, with lifecycle control and live stream access.</p>
+        </div>
+        <div class="feature-card">
+          <div class="icon">◷</div>
+          <h3>Capability Discovery <span style="opacity:0.5;font-weight:400;">(soon)</span></h3>
+          <p>Automatic discovery and attachment of available capabilities. Coming soon to expand what Lucy can do out of the box.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="container">
+      <div class="brand">Lucy</div>
+      <div class="links">
+        <a href="https://github.com/jwoo0122/lucy">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+</main>
+<script>
+  function copyCommand(btn) {
+    navigator.clipboard.writeText('brew install jwoo0122/tap/lucy && lucy').then(function() {
+      btn.textContent = 'copied';
+      btn.classList.add('copied');
+      setTimeout(function() {
+        btn.textContent = 'copy';
+        btn.classList.remove('copied');
+      }, 1500);
+    });
+  }
+</script>
+</body>
+</html>
