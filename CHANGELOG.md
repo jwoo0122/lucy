@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.7.0](https://github.com/jwoo0122/lucy/compare/v1.6.1...v1.7.0) - 2026-07-21
+
+### Added
+
+- *(context)* add cwd and README.md to boot context ([#20](https://github.com/jwoo0122/lucy/pull/20))
+
 ## [1.6.1](https://github.com/jwoo0122/lucy/compare/v1.6.0...v1.6.1) - 2026-07-21
 
 ### Fixed
