@@ -354,6 +354,14 @@ fn event_loop<W: Write>(
             state.apply_subagent_activity(activity);
         }
 
+        // Ratatui flushes the buffer diff (which issues MoveTo for every
+        // changed cell) before it hides or shows the cursor. If the hardware
+        // cursor is visible during that flush it briefly appears at each
+        // changed cell — most noticeable across the animated glow region in
+        // busy state. Hide it first so the flush phase never shows it; Ratatui
+        // will re-show it at the prompt position after flush when needed.
+        let _ = execute!(terminal.backend_mut(), Hide);
+
         terminal
             .draw(|frame| draw(frame, state))
             .map_err(|error| format!("unable to render TUI: {error}"))?;
