@@ -31,4 +31,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
+        env:
+          # Keep tests isolated from runner-level XDG configuration.
+          XDG_CONFIG_HOME: ""
         run: cargo test --locked
