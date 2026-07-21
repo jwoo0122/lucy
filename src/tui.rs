@@ -185,7 +185,8 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
     // distinguishable from plain Enter. Only push it on terminals known to
     // support it; otherwise the enhancement sequence would leak as literal
     // text on screen.
-    if supports_keyboard_enhancement() {
+    let keyboard_enhanced = supports_keyboard_enhancement();
+    if keyboard_enhanced {
         let _ = execute!(
             backend,
             PushKeyboardEnhancementFlags(
@@ -193,7 +194,24 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
                     | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
             )
         );
+    }
+    // tmux does not proxy the kitty keyboard protocol, but it does
+    // recognize modifyOtherKeys (CSI > 4;1m). Enable it so tmux sends
+    // extended key sequences in CSI u format, which crossterm parses
+    // when PushKeyboardEnhancementFlags has been sent.
+    let in_tmux = is_inside_tmux();
+    if in_tmux {
+        let _ = backend
+            .write_all(b"\x1b[>4;1m")
+            .and_then(|_| backend.flush());
+    }
+    // `backend` borrows from `terminal_guard`; all writes are done so
+    // the borrow has ended and we can now set the guard flags.
+    if keyboard_enhanced {
         terminal_guard.keyboard_enhancement = true;
+    }
+    if in_tmux {
+        terminal_guard.modify_other_keys = true;
     }
     let worker = thread::spawn(move || worker_loop(&mut harness, request_rx, message_tx, resumed));
 
@@ -638,6 +656,7 @@ fn wait_for_worker(worker: JoinHandle<()>, grace: Duration) {
 struct TerminalGuard<W: Write> {
     terminal: Option<Terminal<CrosstermBackend<W>>>,
     keyboard_enhancement: bool,
+    modify_other_keys: bool,
 }
 
 impl<W: Write> TerminalGuard<W> {
@@ -645,6 +664,7 @@ impl<W: Write> TerminalGuard<W> {
         Self {
             terminal: Some(terminal),
             keyboard_enhancement: false,
+            modify_other_keys: false,
         }
     }
 
@@ -660,6 +680,12 @@ impl<W: Write> Drop for TerminalGuard<W> {
         let Some(mut terminal) = self.terminal.take() else {
             return;
         };
+        if self.modify_other_keys {
+            let _ = terminal
+                .backend_mut()
+                .write_all(b"\x1b[>4;0m")
+                .and_then(|_| terminal.backend_mut().flush());
+        }
         if self.keyboard_enhancement {
             let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
         }
@@ -692,10 +718,27 @@ fn supports_keyboard_enhancement() -> bool {
     {
         return true;
     }
-    matches!(
+    if matches!(
         program.as_str(),
         "ghostty" | "kitty" | "wezterm" | "alacritty" | "foot" | "footclient" | "iterm.app"
-    )
+    ) {
+        return true;
+    }
+    // tmux does not support the kitty keyboard protocol (CSI > flags u)
+    // passthrough, but it does support modifyOtherKeys (CSI > 4;1m). Push
+    // kitty flags anyway so crossterm parses CSI u format sequences, and
+    // separately enable modifyOtherKeys so tmux sends extended keys.
+    if program == "tmux" {
+        return true;
+    }
+    false
+}
+
+/// Whether the process is running inside a tmux session.
+fn is_inside_tmux() -> bool {
+    std::env::var("TERM_PROGRAM")
+        .map(|value| value.eq_ignore_ascii_case("tmux"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8693,5 +8736,22 @@ mod skill_picker_tests {
         assert_eq!(buffer[(2, 3)].symbol(), "/");
         assert_eq!(buffer[(2, 3)].fg, QUEUED_MESSAGE_COLOR);
         assert!(!buffer[(2, 3)].modifier.contains(Modifier::BOLD));
+    }
+}
+
+#[cfg(test)]
+mod tmux_keyboard_tests {
+    use super::*;
+
+    #[test]
+    fn is_inside_tmux_detection() {
+        std::env::set_var("TERM_PROGRAM", "tmux");
+        assert!(is_inside_tmux());
+        std::env::set_var("TERM_PROGRAM", "TMUX");
+        assert!(is_inside_tmux());
+        std::env::set_var("TERM_PROGRAM", "ghostty");
+        assert!(!is_inside_tmux());
+        std::env::remove_var("TERM_PROGRAM");
+        assert!(!is_inside_tmux());
     }
 }
