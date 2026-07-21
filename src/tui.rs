@@ -2673,7 +2673,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     let visible_chat_area = chat_chunk;
 
     let width = chat_chunk.width;
-    let welcome_image_layout = if state.welcome_visible {
+    let welcome_image_layout = if state.welcome_visible && greeting_image_enabled() {
         let welcome_lines = welcome_lines(&state.attached_agents);
         welcome_image_layout(visible_chat_area, welcome_lines.len() as u16)
     } else {
@@ -3298,6 +3298,10 @@ fn draw_skill_picker(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             Rect::new(inner.x, inner.y + 1 + row as u16, inner.width, 1),
         );
     }
+}
+
+fn greeting_image_enabled() -> bool {
+    std::env::var("LUCY_GREETING_IMAGE").as_deref() == Ok("true")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5871,22 +5875,35 @@ mod tests {
     }
 
     #[test]
-    fn spacious_welcome_centers_the_embedded_png_in_the_chat_area() {
+    fn greeting_image_is_hidden_without_the_env_flag_and_shown_when_enabled() {
         let state = UiState::from_history(&[], "secret", "model", None, false);
         let area = Rect::new(0, 0, 100, 50);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                 .expect("test terminal");
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw welcome image");
-
         let chat_area = ui_layout(&state, tui_viewport(area)).0;
         let intro_lines = welcome_lines(&state.attached_agents);
         let layout =
             welcome_image_layout(chat_area, intro_lines.len() as u16).expect("image and intro fit");
-        assert_eq!(layout.image_size, WELCOME_IMAGE_SIZE);
+
+        // Without the flag the greeting image must not render.
+        std::env::remove_var("LUCY_GREETING_IMAGE");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw without greeting flag");
         let buffer = terminal.backend().buffer();
+        assert!(!matches!(
+            buffer[(layout.image_area.x, layout.image_area.y)].symbol(),
+            "▀" | "▄"
+        ));
+
+        // With the flag set the greeting image renders.
+        std::env::set_var("LUCY_GREETING_IMAGE", "true");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw with greeting flag");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(layout.image_size, WELCOME_IMAGE_SIZE);
         assert!(matches!(
             buffer[(layout.image_area.x, layout.image_area.y)].symbol(),
             "▀" | "▄"
@@ -5917,6 +5934,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(intro_rows.iter().any(|row| row.contains(WELCOME_MESSAGE)));
+
+        std::env::remove_var("LUCY_GREETING_IMAGE");
     }
 
     #[test]
