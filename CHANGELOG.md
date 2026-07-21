@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.4](https://github.com/jwoo0122/lucy/compare/v1.5.3...v1.5.4) - 2026-07-21
+
+### Fixed
+
+- hide cursor before flush to prevent flicker across glow region ([#15](https://github.com/jwoo0122/lucy/pull/15))
+
+### Other
+
+- isolate test configuration path ([#14](https://github.com/jwoo0122/lucy/pull/14))
+
 ## [1.5.3](https://github.com/jwoo0122/lucy/compare/v1.5.2...v1.5.3) - 2026-07-20
 
 ### Fixed
