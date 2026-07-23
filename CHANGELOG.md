@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.0](https://github.com/jwoo0122/lucy/compare/v1.7.0...v1.8.0) - 2026-07-23
+
+### Added
+
+- add Codex subscription authentication ([#22](https://github.com/jwoo0122/lucy/pull/22))
+
+### Other
+
+- add logo to readme ([#21](https://github.com/jwoo0122/lucy/pull/21))
+
 ## [1.7.0](https://github.com/jwoo0122/lucy/compare/v1.6.1...v1.7.0) - 2026-07-21
 
 ### Added
