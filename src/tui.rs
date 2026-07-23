@@ -256,7 +256,7 @@ fn worker_loop(
             let _ = messages.send(WorkerMessage::SubagentActivity(activity));
         }
         if let Err(error) = harness.collect_completed_subagents(&mut sink) {
-            let message = redact_secret(&error, Some(harness.provider.api_key()));
+            let message = redact_secret(&error, Some(&harness.provider.api_key()));
             let _ = sink.emit_event(&ProtocolEvent::Error { message });
         }
         let request = match requests.recv_timeout(EVENT_POLL) {
@@ -266,7 +266,7 @@ fn worker_loop(
                     let _ = messages.send(WorkerMessage::SubagentActivity(activity));
                 }
                 if let Err(error) = harness.collect_completed_subagents(&mut sink) {
-                    let message = redact_secret(&error, Some(harness.provider.api_key()));
+                    let message = redact_secret(&error, Some(&harness.provider.api_key()));
                     let _ = sink.emit_event(&ProtocolEvent::Error { message });
                 }
                 continue;
@@ -281,7 +281,7 @@ fn worker_loop(
                     user_text: Some(text.clone()),
                 });
                 if let Err(error) = harness.handle_message(&text, &mut sink, Some(&cancel)) {
-                    let message = redact_secret(&error, Some(harness.provider.api_key()));
+                    let message = redact_secret(&error, Some(&harness.provider.api_key()));
                     let _ = sink.emit_event(&ProtocolEvent::Error { message });
                 }
                 let _ = messages.send(WorkerMessage::Finished);

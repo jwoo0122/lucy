@@ -14,7 +14,7 @@
 
 ## Project purpose
 
-Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects one OpenAI-compatible Chat Completions provider and model-facing `cmd` and `spawn_subagent` tools, with both an interactive TUI and a JSONL interface for automation powered by the same turn engine.
+Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects an OpenRouter/OpenAI-compatible provider or a Codex subscription provider and exposes model-facing `cmd` and `spawn_subagent` tools, with both an interactive TUI and a JSONL interface for automation powered by the same turn engine.
 
 ## Installation
 
@@ -32,17 +32,38 @@ cargo install lucy-cli
 
 Prebuilt archives are available from the [GitHub Releases](https://github.com/jwoo0122/lucy/releases) page. After extracting the archive, place the `lucy` executable on your `PATH`.
 
-On first run, Lucy creates `$XDG_CONFIG_HOME/lucy/config.toml` (or `~/.config/lucy/config.toml` when `XDG_CONFIG_HOME` is unset or empty). Existing `~/.lucy/config.toml` files are migrated once; sessions remain under `~/.lucy/sessions`. Set `llm.model` and the environment variable that holds the API key. OpenRouter is the default provider, but any OpenAI-compatible endpoint can be configured.
+On first run, Lucy creates `$XDG_CONFIG_HOME/lucy/config.toml` (or `~/.config/lucy/config.toml` when `XDG_CONFIG_HOME` is unset or empty). Existing `~/.lucy/config.toml` files are migrated once; sessions remain under `~/.lucy/sessions`. Set `llm.model` and choose either OpenRouter API-key authentication or Codex subscription authentication. Existing configs without `[auth]` continue to use the legacy OpenRouter-compatible settings.
 
 ```toml
+[auth]
+provider = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+
 [llm]
 base_url = "https://openrouter.ai/api/v1"
 model = "your-model"
-api_key_env = "OPENROUTER_API_KEY"
 ```
 
 ```sh
 export OPENROUTER_API_KEY="..."
+```
+
+To use a ChatGPT plan through the Codex provider, log in separately. Tokens are stored in Lucy's private credential store, not in `config.toml` or sessions:
+
+```sh
+lucy codex login
+# ... use a Codex model in config.toml ...
+lucy codex logout
+```
+
+Use this configuration for Codex:
+
+```toml
+[auth]
+provider = "codex_subscription"
+
+[llm]
+model = "gpt-5.3-codex"
 ```
 
 ## Usage
@@ -75,4 +96,4 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
 - **Context and skills:** Collects global `$XDG_CONFIG_HOME/lucy/AGENTS.md` (or `~/.config/lucy/AGENTS.md`) plus project `AGENTS.md`/`CLAUDE.md` instructions and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
 - **Automatic context compaction:** At 95% estimated context usage, safely summarizes older complete turns with the configured model, retains recent context, and resumes the active turn without rewriting session history.
-- **Credential protection:** Reads API keys only from environment variables and prevents them from being written to configuration, sessions, the public protocol, or diagnostics.
+- **Credential protection:** Keeps OpenRouter API keys out of configuration, sessions, the public protocol, diagnostics, and child environments; Codex subscription tokens are stored privately, refreshed as needed, and never exposed to model tools or persisted sessions.

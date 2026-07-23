@@ -10,14 +10,20 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const GENERATED_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+pub const CODEX_SUBSCRIPTION_PROVIDER: &str = "codex_subscription";
+pub const OPENROUTER_PROVIDER: &str = "openrouter";
+pub const CODEX_API_KEY_ENV_SENTINEL: &str = "LUCY_CODEX_SUBSCRIPTION_TOKEN";
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, use cmd to read a relevant skill's SKILL.md.";
 
 const GENERATED_CONFIG: &str = r#"system_prompt = "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, use cmd to read a relevant skill's SKILL.md."
 
+[auth]
+provider = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+
 [llm]
 base_url = "https://openrouter.ai/api/v1"
 model = ""
-api_key_env = "OPENROUTER_API_KEY"
 # Optional reasoning effort sent as the OpenAI Chat Completions "reasoning_effort"
 # field, e.g. "low", "medium", "high". Omit or leave unset to send no effort.
 # Use a value your provider and model support; an unsupported value fails at runtime.
@@ -52,7 +58,31 @@ pub struct Config {
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
     #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
     pub llm: LlmConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub provider: AuthProvider,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthProvider {
+    #[default]
+    Openrouter,
+    CodexSubscription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSettings {
+    pub provider: AuthProvider,
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -80,7 +110,17 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
+            auth: AuthConfig::default(),
             llm: LlmConfig::default(),
+        }
+    }
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            provider: AuthProvider::Openrouter,
+            api_key_env: None,
         }
     }
 }
@@ -190,22 +230,66 @@ impl Config {
         ensure_private_file(&path).map_err(|_| ConfigError::new("unable to secure config.toml"))
     }
 
+    pub fn resolved_auth(&self) -> Result<AuthSettings, ConfigError> {
+        let legacy_api_key_env = self.llm.api_key_env.as_deref().map(str::trim);
+        let configured_api_key_env = self.auth.api_key_env.as_deref().map(str::trim);
+        if configured_api_key_env.is_some_and(str::is_empty) {
+            return Err(ConfigError::new("auth.api_key_env must not be empty"));
+        }
+        if legacy_api_key_env.is_some_and(str::is_empty) {
+            return Err(ConfigError::new("llm.api_key_env must not be empty"));
+        }
+        match self.auth.provider {
+            AuthProvider::Openrouter => {
+                if configured_api_key_env.is_some()
+                    && legacy_api_key_env.is_some()
+                    && configured_api_key_env != legacy_api_key_env
+                {
+                    return Err(ConfigError::new(
+                        "auth.api_key_env and llm.api_key_env must match",
+                    ));
+                }
+                let api_key_env = configured_api_key_env
+                    .or(legacy_api_key_env)
+                    .unwrap_or(DEFAULT_API_KEY_ENV)
+                    .to_owned();
+                if api_key_env == CODEX_API_KEY_ENV_SENTINEL {
+                    return Err(ConfigError::new(
+                        "auth.api_key_env is reserved for Codex subscription authentication",
+                    ));
+                }
+                Ok(AuthSettings {
+                    provider: AuthProvider::Openrouter,
+                    api_key_env: Some(api_key_env),
+                })
+            }
+            AuthProvider::CodexSubscription => {
+                if configured_api_key_env.is_some() || legacy_api_key_env.is_some() {
+                    return Err(ConfigError::new(
+                        "codex_subscription cannot be combined with an API-key environment",
+                    ));
+                }
+                Ok(AuthSettings {
+                    provider: AuthProvider::CodexSubscription,
+                    api_key_env: None,
+                })
+            }
+        }
+    }
+
     pub fn resolved_llm(&self) -> Result<LlmSettings, ConfigError> {
         let base_url = self.llm.base_url.trim().to_owned();
         if base_url.is_empty() {
             return Err(ConfigError::new("llm.base_url must not be empty"));
         }
 
-        let api_key_env = self
-            .llm
-            .api_key_env
-            .as_deref()
-            .unwrap_or(DEFAULT_API_KEY_ENV)
-            .trim()
-            .to_owned();
-        if api_key_env.is_empty() {
-            return Err(ConfigError::new("llm.api_key_env must not be empty"));
-        }
+        let auth = self.resolved_auth()?;
+        let api_key_env = match auth.provider {
+            AuthProvider::Openrouter => auth
+                .api_key_env
+                .unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_owned()),
+            AuthProvider::CodexSubscription => CODEX_API_KEY_ENV_SENTINEL.to_owned(),
+        };
 
         let effort = self.llm.effort.as_deref().map(str::trim).map(str::to_owned);
 
@@ -362,8 +446,9 @@ mod tests {
         let first = Config::load_or_create(&home).expect("create config");
         assert_eq!(first.llm.model, "");
         assert_eq!(first.llm.base_url, DEFAULT_BASE_URL);
+        assert_eq!(first.auth.provider, AuthProvider::Openrouter);
         assert_eq!(
-            first.llm.api_key_env.as_deref(),
+            first.auth.api_key_env.as_deref(),
             Some(GENERATED_API_KEY_ENV)
         );
 
@@ -502,6 +587,7 @@ mod tests {
     fn omitted_api_key_environment_uses_openai_default() {
         let config = Config {
             system_prompt: "prompt".to_owned(),
+            auth: AuthConfig::default(),
             llm: LlmConfig {
                 base_url: "http://localhost".to_owned(),
                 model: "model".to_owned(),
@@ -516,9 +602,66 @@ mod tests {
     }
 
     #[test]
+    fn auth_provider_rejects_mixed_credentials() {
+        let config = Config {
+            system_prompt: "prompt".to_owned(),
+            auth: AuthConfig {
+                provider: AuthProvider::CodexSubscription,
+                api_key_env: None,
+            },
+            llm: LlmConfig {
+                base_url: DEFAULT_BASE_URL.to_owned(),
+                model: "model".to_owned(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
+                effort: None,
+            },
+        };
+        let error = config.resolved_auth().expect_err("mixed auth");
+        assert_eq!(
+            error.to_string(),
+            "codex_subscription cannot be combined with an API-key environment"
+        );
+    }
+
+    #[test]
+    fn openrouter_rejects_the_codex_auth_sentinel_environment() {
+        let config = Config {
+            system_prompt: "prompt".to_owned(),
+            auth: AuthConfig {
+                provider: AuthProvider::Openrouter,
+                api_key_env: Some(CODEX_API_KEY_ENV_SENTINEL.to_owned()),
+            },
+            llm: LlmConfig::default(),
+        };
+        assert!(config.resolved_auth().is_err());
+    }
+
+    #[test]
+    fn codex_auth_resolves_without_an_api_key_environment() {
+        let config = Config {
+            system_prompt: "prompt".to_owned(),
+            auth: AuthConfig {
+                provider: AuthProvider::CodexSubscription,
+                api_key_env: None,
+            },
+            llm: LlmConfig {
+                base_url: DEFAULT_BASE_URL.to_owned(),
+                model: "model".to_owned(),
+                api_key_env: None,
+                effort: None,
+            },
+        };
+        assert_eq!(
+            config.resolved_auth().expect("codex auth").provider,
+            AuthProvider::CodexSubscription
+        );
+    }
+
+    #[test]
     fn resolved_effort_passes_through_and_trims() {
         let config = |effort: Option<&str>| Config {
             system_prompt: "prompt".to_owned(),
+            auth: AuthConfig::default(),
             llm: LlmConfig {
                 base_url: "http://localhost".to_owned(),
                 model: "model".to_owned(),
