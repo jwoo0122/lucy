@@ -7,6 +7,7 @@ use reqwest::Client as AsyncClient;
 use serde_json::{json, Value};
 
 use crate::cancellation::CancellationToken;
+use crate::codex_provider::CodexProvider;
 use crate::config::LlmSettings;
 use crate::model::{ChatMessage, ChatToolCall};
 use crate::redaction::{conflicts_with_protected_literal, redact_secret, redaction_marker};
@@ -46,7 +47,7 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             cancelled: false,
@@ -64,7 +65,7 @@ impl ProviderError {
         }
     }
 
-    fn cancelled(partial: ProviderTurn) -> Self {
+    pub(crate) fn cancelled(partial: ProviderTurn) -> Self {
         Self {
             message: "provider stream canceled".to_owned(),
             cancelled: true,
@@ -169,6 +170,7 @@ pub struct Provider {
     effort: Option<String>,
     api_key_env: String,
     api_key: String,
+    codex: Option<CodexProvider>,
 }
 
 fn model_efforts(entry: &Value) -> Option<Vec<String>> {
@@ -331,11 +333,43 @@ impl Provider {
             effort,
             api_key_env: settings.api_key_env.clone(),
             api_key,
+            codex: None,
         })
     }
 
-    pub fn api_key(&self) -> &str {
-        &self.api_key
+    pub fn new_codex(
+        home: &std::path::Path,
+        settings: &LlmSettings,
+    ) -> Result<Self, ProviderError> {
+        let codex = CodexProvider::new(home, settings)?;
+        let api_key = codex.api_key().to_owned();
+        let client = Client::builder()
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+            .timeout(PROVIDER_TIMEOUT)
+            .build()
+            .map_err(|_| ProviderError::new("unable to initialize HTTP client"))?;
+        let async_client = AsyncClient::builder()
+            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+            .read_timeout(PROVIDER_TIMEOUT)
+            .build()
+            .map_err(|_| ProviderError::new("unable to initialize HTTP client"))?;
+        Ok(Self {
+            client,
+            async_client,
+            endpoint: crate::codex_provider::CODEX_ENDPOINT.to_owned(),
+            model: settings.model.clone(),
+            effort: settings.effort.clone(),
+            api_key_env: codex.api_key_env().to_owned(),
+            api_key,
+            codex: Some(codex),
+        })
+    }
+
+    pub fn api_key(&self) -> String {
+        self.codex
+            .as_ref()
+            .map(CodexProvider::active_access)
+            .unwrap_or_else(|| self.api_key.clone())
     }
 
     pub fn api_key_env(&self) -> &str {
@@ -343,6 +377,9 @@ impl Provider {
     }
 
     pub(crate) fn models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
+        if let Some(codex) = &self.codex {
+            return Ok(codex.models());
+        }
         let base_url = self
             .endpoint
             .strip_suffix("/chat/completions")
@@ -398,6 +435,9 @@ impl Provider {
     /// context window. Providers that do not expose context metadata simply
     /// return `None`; this lookup is only used by the interactive statusline.
     pub(crate) fn context_window(&self) -> Option<usize> {
+        if let Some(codex) = &self.codex {
+            return codex.context_window();
+        }
         let base_url = self.endpoint.strip_suffix("/chat/completions")?;
         let response = self
             .client
@@ -493,6 +533,16 @@ impl Provider {
         include_tools: bool,
         include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
+        if let Some(codex) = &self.codex {
+            let mut on_event = |event| on_event(event);
+            return codex.stream_chat(
+                messages,
+                &mut on_event,
+                cancellation,
+                include_tools,
+                include_subagents,
+            );
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

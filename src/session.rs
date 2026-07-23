@@ -481,6 +481,14 @@ impl Session {
     }
 
     pub fn resume(home: &Path, id: &str) -> Result<Self, SessionError> {
+        Self::resume_with_secret(home, id, None)
+    }
+
+    pub fn resume_with_secret(
+        home: &Path,
+        id: &str,
+        external_secret: Option<&str>,
+    ) -> Result<Self, SessionError> {
         validate_session_id(id)?;
         let directory = sessions_dir(home);
         let lucy_directory = lucy_dir(home);
@@ -501,7 +509,9 @@ impl Session {
         ensure_private_file(&path)?;
         let raw =
             fs::read(&path).map_err(|_error| SessionError::new("unable to read session file"))?;
-        let active_secret = session_header_secret(&raw);
+        let active_secret = external_secret
+            .map(str::to_owned)
+            .or_else(|| session_header_secret(&raw));
         if let Some(secret) = active_secret.as_deref() {
             if conflicts_with_protected_literal(secret) || bytes_contain_secret(&raw, secret) {
                 return Err(session_header_rejected(secret));
@@ -721,6 +731,24 @@ impl Session {
             history,
             secret: active_secret,
         })
+    }
+
+    pub fn validate_provider_settings(
+        &self,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let record = SessionRecord::ProviderSettings {
+            timestamp: now(),
+            model: model.to_owned(),
+            effort: effort.map(str::to_owned),
+        };
+        if let Some(secret) = self.secret.as_deref() {
+            if record_contains_secret(&record, secret) {
+                return Err(session_record_rejected(secret));
+            }
+        }
+        Ok(())
     }
 
     pub fn append_provider_settings(
@@ -1053,6 +1081,13 @@ impl Session {
     }
 
     pub fn list(home: &Path) -> Result<Vec<SessionMetadata>, SessionError> {
+        Self::list_with_secret(home, None)
+    }
+
+    pub fn list_with_secret(
+        home: &Path,
+        external_secret: Option<&str>,
+    ) -> Result<Vec<SessionMetadata>, SessionError> {
         let directory = sessions_dir(home);
         let lucy_directory = lucy_dir(home);
         ensure_not_symlink(&lucy_directory)?;
@@ -1090,7 +1125,7 @@ impl Session {
             let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            let Ok(session) = Self::resume(home, id) else {
+            let Ok(session) = Self::resume_with_secret(home, id, external_secret) else {
                 continue;
             };
             metadata.push(SessionMetadata {

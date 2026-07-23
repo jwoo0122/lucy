@@ -7,7 +7,7 @@ applies_to:
   - "src/**"
   - "tests/**"
   - "README.md"
-summary: Lucy bootstraps a user-editable XDG config file, migrates the legacy ~/.lucy/config.toml once when needed, and reads provider credentials only from the environment.
+summary: Lucy bootstraps a user-editable XDG config file, migrates the legacy ~/.lucy/config.toml once when needed, and selects mutually exclusive OpenRouter API-key or Codex subscription authentication.
 constrains: []
 depends_on:
   - harness.agent-boundary-and-protocol
@@ -20,11 +20,11 @@ last_reviewed: "2026-07-19"
 
 ## Decision question
 
-Where do Lucy's minimal system prompt and LLM connection settings live, and when do they take effect?
+Where do Lucy's minimal system prompt, provider settings, and provider credentials live, and when do they take effect?
 
 ## Current decision
 
-Lucy MUST create `$XDG_CONFIG_HOME/lucy/config.toml` on first run when it does not exist. When `XDG_CONFIG_HOME` is unset or empty, Lucy MUST use `~/.config/lucy/config.toml`. If that XDG destination does not exist and the legacy `~/.lucy/config.toml` exists, Lucy MUST securely migrate the legacy bytes to the destination before bootstrap. Lucy MUST never overwrite an existing XDG destination or legacy file during bootstrap or upgrade. The file MUST expose a user-editable `system_prompt` plus `[llm]` settings for `base_url`, `model`, `api_key_env`, and an optional `effort`.
+Lucy MUST create `$XDG_CONFIG_HOME/lucy/config.toml` on first run when it does not exist. When `XDG_CONFIG_HOME` is unset or empty, Lucy MUST use `~/.config/lucy/config.toml`. If that XDG destination does not exist and the legacy `~/.lucy/config.toml` exists, Lucy MUST securely migrate the legacy bytes to the destination before bootstrap. Lucy MUST never overwrite an existing XDG destination or legacy file during bootstrap or upgrade. The file MUST expose a user-editable `system_prompt`, `[auth]` provider selection, and `[llm]` settings for `base_url`, `model`, and an optional `effort`. The `openrouter` auth provider MAY define an API-key environment variable; the `codex_subscription` provider MUST NOT use an API-key environment variable.
 
 The generated prompt MUST be minimal and editable:
 
@@ -32,9 +32,9 @@ The generated prompt MUST be minimal and editable:
 - it should use the provided tools to achieve the user's requirements;
 - it should read a relevant skill's `SKILL.md` with `cmd` when needed.
 
-The generated config SHOULD use OpenRouter's OpenAI-compatible endpoint as its example/default base URL, while all compatible endpoints remain configurable. The generated model value MUST be empty so Lucy does not guess a time-sensitive provider model; starting a session without a model MUST fail with a clear configuration error. API credentials MUST be read from the configured environment variable and MUST NOT be stored in config, session files, protocol events, or diagnostics. A credential containing JSON syntax/control characters, only decimal digits, or a complete fixed protocol/storage literal MUST be rejected before it can enter serialized output; these values cannot be safely redacted while preserving the schema. Newly created session headers MUST also reject any cwd or LLM setting containing the active credential. The generated OpenRouter example uses `OPENROUTER_API_KEY`; the runtime default credential variable is `OPENAI_API_KEY` when `api_key_env` is omitted.
+The generated config SHOULD use OpenRouter's OpenAI-compatible endpoint as its example/default base URL. The Codex subscription endpoint is provider-owned and is not user-configurable in normal configuration. The generated model value MUST be empty so Lucy does not guess a time-sensitive provider model; starting a session without a model MUST fail with a clear configuration error. OpenRouter API credentials MUST be read from the configured environment variable. Codex subscription credentials MUST be read from Lucy's private credential store and refreshed as needed. Neither credential type MUST be stored in config, session files, protocol events, or diagnostics. A credential containing JSON syntax/control characters, only decimal digits, or a complete fixed protocol/storage literal MUST be rejected before it can enter serialized output; these values cannot be safely redacted while preserving the schema. Newly created session headers MUST also reject any cwd or LLM setting containing the active credential. The generated OpenRouter example uses `OPENROUTER_API_KEY`; the runtime default credential variable is `OPENAI_API_KEY` when the legacy `api_key_env` is omitted. Existing configs without `[auth]` MUST remain OpenRouter-compatible.
 
-When `effort` is set to a non-empty value, Lucy MUST send it verbatim as the OpenAI Chat Completions `reasoning_effort` request field; when it is unset or omitted, Lucy MUST NOT send the field. Lucy MUST NOT validate `effort` against a fixed enum — compatibility is the user's responsibility, and a value the configured provider or model rejects is a runtime provider error, not a boot failure. An empty or whitespace-only `effort` MUST fail boot with a configuration error. The resolved `effort` is sent with each request when set.
+When `effort` is set to a non-empty value, an OpenAI-compatible provider MUST send it verbatim as the Chat Completions `reasoning_effort` request field; a Codex subscription provider MUST map it to its Responses request shape; when it is unset or omitted, Lucy MUST NOT send the field. Lucy MUST NOT validate `effort` against a fixed enum — compatibility is the user's responsibility, and a value the configured provider or model rejects is a runtime provider error, not a boot failure. An empty or whitespace-only `effort` MUST fail boot with a configuration error. The resolved `effort` is sent with each request when set.
 
 `config.toml` is the source of truth for model and effort whenever a session starts or resumes. The interactive TUI MUST provide an idle-only `/settings` menu that reads the configured provider catalog, supports typed model filtering plus keyboard selection, and writes selected model/effort values back to config before applying them to the current session. Catalog capability metadata MAY provide a finite effort picker; when it does not, the UI MUST accept a user-entered effort value. A resumed session MUST reload the current config model and effort rather than reuse the header values. The session header and every interactive setting transition MUST retain a secret-safe timestamped provider-settings audit record so historical requests remain attributable without making the header authoritative.
 
@@ -42,7 +42,7 @@ Lucy MUST resolve config and ambient context at new-session boot and persist the
 
 ## Context and forces
 
-Users need to inspect and change the minimal model guidance without recompiling Lucy. Cargo installation has no portable user-home post-install hook, so first-run bootstrap is the reliable installation-independent behavior. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter durable user-controlled artifacts or the direct command environment. Command execution remains useful through the rest of the inherited process environment, without granting the shell the provider credential directly. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
+Users need to inspect and change the minimal model guidance without recompiling Lucy. Cargo installation has no portable user-home post-install hook, so first-run bootstrap is the reliable installation-independent behavior. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter config, session artifacts, protocol output, diagnostics, or the direct command environment. Subscription refresh requires a private credential store outside config. Command execution remains useful through the rest of the inherited process environment, without granting the shell the provider credential directly. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
 
 ## Invariants
 
@@ -51,13 +51,17 @@ Users need to inspect and change the minimal model guidance without recompiling 
 - When no XDG config exists, a regular non-symlink legacy `~/.lucy/config.toml` is migrated once without changing its bytes; an existing XDG config always wins.
 - Existing config bytes are not replaced by defaults.
 - The active API key never appears in error text, JSONL output, or newly written session JSONL; unsafe key values are rejected before output.
-- The configured provider API-key environment variable is removed from every Lucy child environment, including context-discovery helpers and `cmd` shells.
+- The configured OpenRouter API-key environment variable is removed from every Lucy child environment, including context-discovery helpers and `cmd` shells. Codex subscription tokens MUST never be placed in child environments.
 - Early fallback diagnostics scrub every non-empty inherited environment value, including short values; missing-key diagnostics do not echo the configured environment-variable name.
 - A resumed session whose current key is already present in its raw file is rejected rather than sent to the provider or exposed by listing.
 - The session header and every provider-settings audit record are secret-safe; an effort containing the active provider key is rejected like other provider-setting values.
 - Model and effort are reloaded from `config.toml` on every new or resumed session; the session audit trail records rather than overrides those selections.
 - `/settings` is available only when the TUI has no active turn, and provider catalog failures must not expose credentials.
 - Config parse errors identify the setting/file without echoing secret values.
+- `auth.provider` values are mutually exclusive: OpenRouter requires API-key auth and Codex subscription requires stored OAuth auth.
+- `lucy codex login` and `lucy codex logout` manage only Codex subscription credentials and do not start a model session.
+- Codex access-token refresh is single-flight per process, persists rotated refresh tokens, and retries one unauthorized request at most once.
+- Codex provider requests use a dedicated Responses adapter and are normalized into Lucy-owned events; they do not reuse the OpenRouter Chat Completions endpoint.
 - A session's resolved prompt remains stable across resume.
 
 ## Alternatives and trade-offs
@@ -66,7 +70,7 @@ A compiled prompt would be simpler but violate user ownership. An installer-spec
 
 ## Consequences
 
-The first run mutates the user's XDG configuration directory (or `~/.config` by default). Upgrading an installation with only a legacy config moves that config to the XDG location; sessions remain in `~/.lucy/sessions`. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for v1.
+The first run mutates the user's XDG configuration directory (or `~/.config` by default). `lucy codex login` additionally creates or updates a private Codex credential store. Upgrading an installation with only a legacy config moves that config to the XDG location; sessions remain in `~/.lucy/sessions`. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for generic providers, but the Codex subscription adapter MUST own the headers required by its authenticated Responses endpoint.
 
 ## Enforcement
 
@@ -74,4 +78,4 @@ Tests MUST cover XDG and default-path first-run creation, legacy-config migratio
 
 ## Revisit when
 
-Reconsider this decision if Lucy gains managed credentials, multiple profiles, project-local configuration, installer-specific distribution, or provider-specific features that cannot fit the OpenAI-compatible request shape.
+Reconsider this decision if Lucy gains managed credentials, multiple profiles, project-local configuration, installer-specific distribution, or a supported provider-specific credential/API contract that materially differs from the Codex adapter.

@@ -6,8 +6,8 @@ decisions:
     scope: harness
     decision_type: boundary
     summary: Lucy is a local macOS/Linux harness with a default TUI, an automatic/explicit
-      JSONL mode, one OpenAI-compatible provider, `cmd`, and a bounded `spawn_subagent`
-      model tool.
+      JSONL mode, OpenRouter and Codex subscription provider adapters, `cmd`, and
+      a bounded `spawn_subagent` model tool.
     applies_to:
       - Cargo.toml
       - src/**
@@ -42,8 +42,8 @@ decisions:
     scope: harness
     decision_type: configuration
     summary: Lucy bootstraps a user-editable XDG config file, migrates the legacy
-      ~/.lucy/config.toml once when needed, and reads provider credentials only from
-      the environment.
+      ~/.lucy/config.toml once when needed, and selects mutually exclusive OpenRouter
+      API-key or Codex subscription authentication.
     applies_to:
       - src/**
       - tests/**
