@@ -6,8 +6,8 @@ decisions:
     scope: harness
     decision_type: boundary
     summary: Lucy is a local macOS/Linux harness with a default TUI, an automatic/explicit
-      JSONL session protocol, one OpenAI-compatible provider, and the model-facing
-      cmd tool.
+      JSONL session protocol, OpenAI-compatible and Codex subscription providers, and
+      the model-facing cmd tool.
     applies_to:
       - Cargo.toml
       - src/**

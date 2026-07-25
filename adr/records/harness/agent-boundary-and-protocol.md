@@ -8,7 +8,7 @@ applies_to:
   - "src/**"
   - "tests/**"
   - "README.md"
-summary: Lucy is a local macOS/Linux harness with a default TUI, an automatic/explicit JSONL session protocol, one OpenAI-compatible provider, and the model-facing cmd tool.
+summary: Lucy is a local macOS/Linux harness with a default TUI, an automatic/explicit JSONL session protocol, OpenAI-compatible and Codex subscription providers, and the model-facing cmd tool.
 constrains: []
 depends_on: []
 supersedes: []
@@ -26,7 +26,7 @@ What public boundary and capability surface does the Lucy harness expose to inte
 
 Lucy MUST run as a local macOS/Linux process and MUST retain its newline-delimited JSON machine protocol. When both standard input and standard output are terminals, an invocation without a mode flag MUST start the TUI. When either stream is not a terminal, the invocation MUST use JSONL automatically. `--jsonl` MUST force JSONL and `--tui` MUST force the interactive frontend; the latter requires a usable terminal. The TUI is a frontend over the same normalized event and turn engine, not a new provider or tool boundary. Its slash picker MUST combine discovered skill names with Lucy-owned `/settings` and `/exit` commands without persisting or expanding those commands as skills. `/settings` MUST ignore trailing arguments and open the idle-only settings menu; `/exit` MUST terminate an idle TUI session.
 
-Lucy MUST expose only `cmd` as a model-facing tool and MUST NOT provide built-in `read`, `write`, `edit`, delegation, lifecycle, or other file-operation tools. Lucy MUST NOT be a network service in v1. The LLM integration MUST target the OpenAI-compatible Chat Completions API, while keeping the base URL configurable.
+Lucy MUST expose only `cmd` as a model-facing tool and MUST NOT provide built-in `read`, `write`, `edit`, delegation, lifecycle, or other file-operation tools. Lucy MUST NOT be a network service in v1. The LLM integration MUST support the configurable OpenAI-compatible Chat Completions API and MAY use the explicit authenticated Codex subscription adapter. Provider-specific authentication MUST remain outside the model-facing protocol.
 
 The JSONL interface MUST accept newline-delimited `{"type":"message","text":"..."}` records and MUST emit only newline-delimited normalized events on stdout, with diagnostics on stderr. A normal client interaction MUST expose a `session` event, streamed assistant deltas, normalized `cmd` calls/results, and one `turn_end` event. A client MAY close stdin after one message; Lucy MUST finish that turn and exit after EOF. A client MAY resume a named session with `--session <id>` and send another message. Session identity and process lifetime are caller-managed; Lucy MUST NOT infer parent/child relationships between sessions.
 
@@ -59,7 +59,7 @@ A library, HTTP server, or raw provider-stream pass-through would increase coupl
 
 ## Consequences
 
-Interactive users receive a terminal chat experience, while scripts and other agents retain an explicit and automatic JSONL path. Clients must implement a small event consumer and retain session IDs when they want continuity. Multiple Lucy processes may operate on different sessions without Lucy coordinating them. Concurrent writes to one session remain outside the lifecycle guarantee. Provider credentials are inherited by `cmd` children as part of the trusted terminal environment, so users must treat model commands as credential-bearing processes.
+Interactive users receive a terminal chat experience, while scripts and other agents retain an explicit and automatic JSONL path. Clients must implement a small event consumer and retain session IDs when they want continuity. Multiple Lucy processes may operate on different sessions without Lucy coordinating them. Concurrent writes to one session remain outside the lifecycle guarantee. OpenRouter credentials remain environment-based, while Codex subscription credentials remain in Lucy’s private credential store and are not exposed to model commands.
 
 ## Enforcement
 
@@ -67,4 +67,4 @@ Integration tests MUST exercise TTY and non-TTY mode selection, JSONL input/outp
 
 ## Revisit when
 
-Reconsider this decision if callers require concurrent sessions in one process, a remote deployment, multiple providers with incompatible tool protocols, first-class file operations, a durable cross-session relationship protocol, or a different interactive frontend boundary.
+Reconsider this decision if callers require concurrent sessions in one process, a remote deployment, additional providers with incompatible tool protocols, first-class file operations, a durable cross-session relationship protocol, or a different interactive frontend boundary.

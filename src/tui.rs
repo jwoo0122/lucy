@@ -124,7 +124,7 @@ const SETTINGS_MIN_HEIGHT: u16 = 8;
 const SETTINGS_MAX_HEIGHT: u16 = 22;
 
 pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> Result<(), String> {
-    let secret = harness.provider.api_key().to_owned();
+    let secret = harness.provider.api_key();
     let context_window = harness
         .context_window
         .or_else(|| harness.provider.context_window());
@@ -255,7 +255,7 @@ fn worker_loop(
                     user_text: Some(text.clone()),
                 });
                 if let Err(error) = harness.handle_message(&text, &mut sink, Some(&cancel)) {
-                    let message = redact_secret(&error, Some(harness.provider.api_key()));
+                    let message = redact_secret(&error, Some(harness.provider.api_key().as_str()));
                     let _ = sink.emit_event(&ProtocolEvent::Error { message });
                 }
                 let _ = messages.send(WorkerMessage::Finished);

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::cancellation::CancellationToken;
-use crate::config::{Config, DEFAULT_API_KEY_ENV};
+use crate::config::{AuthProvider, Config, LlmSettings};
 use crate::context::{resolve_boot_context_with_api_key_env, InstructionSource, SkillEntry};
 use crate::model::{estimate_context_tokens, estimate_message_tokens, ChatMessage, ChatToolCall};
 use crate::protocol::{EventSink, ProtocolEvent, ProtocolWriter};
@@ -24,6 +24,13 @@ struct CliOptions {
     jsonl: bool,
     tui: bool,
     version: bool,
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliCommand {
+    CodexLogin,
+    CodexLogout,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +159,9 @@ where
         }
         return 0;
     }
+    if let Some(command) = options.command {
+        return run_codex_command(command, home, output, &mut diagnostics);
+    }
     let mode = match resolve_mode(args, stdin_is_tty, stdout_is_tty) {
         Ok(mode) => mode,
         Err(error) => {
@@ -166,7 +176,11 @@ where
             write_diagnostic(&mut diagnostics, &error.to_string());
             return 1;
         }
-        return match Session::list(home) {
+        let codex_secret = Config::load_or_create(home)
+            .ok()
+            .and_then(|config| config.resolved_auth().ok())
+            .and_then(|auth| configured_codex_secret(home, auth.provider));
+        return match Session::list_with_secret(home, codex_secret.as_deref()) {
             Ok(sessions) => {
                 for session in sessions {
                     if let Err(error) = protocol.emit_serializable(&session) {
@@ -202,7 +216,23 @@ where
                 return 1;
             }
         };
-        let selected = match config.resolved_llm() {
+        let auth = match config.resolved_auth() {
+            Ok(auth) => auth,
+            Err(error) => {
+                write_diagnostic(&mut diagnostics, &error.to_string());
+                return 1;
+            }
+        };
+        if let Some(secret) = configured_codex_secret(home, auth.provider) {
+            session = match Session::resume_with_secret(home, id, Some(&secret)) {
+                Ok(session) => session,
+                Err(error) => {
+                    write_diagnostic_safe(&mut diagnostics, &error.to_string(), Some(&secret));
+                    return 1;
+                }
+            };
+        }
+        let mut selected = match config.resolved_llm() {
             Ok(settings) => settings,
             Err(error) => {
                 write_diagnostic_safe(
@@ -213,9 +243,11 @@ where
                 return 1;
             }
         };
+        apply_auth_to_settings(&mut selected, auth.provider);
         session.llm.model = selected.model;
         session.llm.effort = selected.effort;
-        let provider = match Provider::new(&session.llm) {
+        session.llm.api_key_env = selected.api_key_env;
+        let provider = match provider_for_settings(home, &session.llm) {
             Ok(provider) => provider,
             Err(error) => {
                 write_diagnostic(&mut diagnostics, &error.to_string());
@@ -228,15 +260,15 @@ where
             write_diagnostic_safe(
                 &mut diagnostics,
                 &error.to_string(),
-                Some(provider.api_key()),
+                Some(&provider.api_key()),
             );
             return 1;
         }
-        if mode == FrontendMode::Tui && conflicts_with_tui_literal(provider.api_key()) {
+        if mode == FrontendMode::Tui && conflicts_with_tui_literal(&provider.api_key()) {
             write_diagnostic_safe(
                 &mut diagnostics,
                 "API key conflicts with terminal UI literals",
-                Some(provider.api_key()),
+                Some(&provider.api_key()),
             );
             return 1;
         }
@@ -249,9 +281,16 @@ where
                 return 1;
             }
         };
+        let auth = match config.resolved_auth() {
+            Ok(auth) => auth,
+            Err(error) => {
+                write_diagnostic(&mut diagnostics, &error.to_string());
+                return 1;
+            }
+        };
         let configured_secret = configured_api_key(&config);
-        let api_key_env = configured_api_key_env(&config);
-        let llm = match config.resolved_llm() {
+        let api_key_env = auth.api_key_env.clone();
+        let mut llm = match config.resolved_llm() {
             Ok(llm) => llm,
             Err(error) => {
                 write_diagnostic_safe(
@@ -262,7 +301,8 @@ where
                 return 1;
             }
         };
-        let provider = match Provider::new(&llm) {
+        apply_auth_to_settings(&mut llm, auth.provider);
+        let provider = match provider_for_settings(home, &llm) {
             Ok(provider) => provider,
             Err(error) => {
                 write_diagnostic_safe(
@@ -273,21 +313,21 @@ where
                 return 1;
             }
         };
-        if mode == FrontendMode::Tui && conflicts_with_tui_literal(provider.api_key()) {
+        if mode == FrontendMode::Tui && conflicts_with_tui_literal(&provider.api_key()) {
             write_diagnostic_safe(
                 &mut diagnostics,
                 "API key conflicts with terminal UI literals",
-                Some(provider.api_key()),
+                Some(&provider.api_key()),
             );
             return 1;
         }
         let safe_cwd = match std::fs::canonicalize(cwd) {
-            Ok(cwd) if !cwd.display().to_string().contains(provider.api_key()) => cwd,
+            Ok(cwd) if !cwd.display().to_string().contains(&provider.api_key()) => cwd,
             Ok(_) => {
                 write_diagnostic_safe(
                     &mut diagnostics,
                     "session header rejected",
-                    Some(provider.api_key()),
+                    Some(&provider.api_key()),
                 );
                 return 1;
             }
@@ -295,7 +335,7 @@ where
                 write_diagnostic_safe(
                     &mut diagnostics,
                     "unable to resolve session cwd",
-                    Some(provider.api_key()),
+                    Some(&provider.api_key()),
                 );
                 return 1;
             }
@@ -316,23 +356,23 @@ where
                 return 1;
             }
         };
-        let boot_system_prompt = redact_secret(&context.system_prompt, Some(provider.api_key()));
-        let attached_agents = attached_agents(context.instruction_files, provider.api_key());
-        let skills = redact_skills(context.skills, provider.api_key());
+        let boot_system_prompt = redact_secret(&context.system_prompt, Some(&provider.api_key()));
+        let attached_agents = attached_agents(context.instruction_files, &provider.api_key());
+        let skills = redact_skills(context.skills, &provider.api_key());
         let session = match Session::create_with_skills_and_secret(
             home,
             &safe_cwd,
             boot_system_prompt,
             llm,
             skills,
-            Some(provider.api_key()),
+            Some(&provider.api_key()),
         ) {
             Ok(session) => session,
             Err(error) => {
                 write_diagnostic_safe(
                     &mut diagnostics,
                     &error.to_string(),
-                    Some(provider.api_key()),
+                    Some(&provider.api_key()),
                 );
                 return 1;
             }
@@ -363,7 +403,7 @@ where
         write_diagnostic_safe(
             &mut diagnostics,
             &format!("unable to write session event: {error}"),
-            Some(harness.provider.api_key()),
+            Some(harness.provider.api_key().as_str()),
         );
         return 1;
     }
@@ -387,7 +427,7 @@ where
                 write_diagnostic_safe(
                     &mut diagnostics,
                     &format!("unable to read stdin: {error}"),
-                    Some(harness.provider.api_key()),
+                    Some(harness.provider.api_key().as_str()),
                 );
                 return 1;
             }
@@ -403,12 +443,12 @@ where
         let text = match parse_input_message(&line) {
             Ok(text) => text,
             Err(error) => {
-                let error = redact_secret(&error, Some(harness.provider.api_key()));
+                let error = redact_secret(&error, Some(harness.provider.api_key().as_str()));
                 if let Err(write_error) = protocol.error(&error) {
                     write_diagnostic_safe(
                         &mut diagnostics,
                         &format!("unable to write protocol error: {write_error}"),
-                        Some(harness.provider.api_key()),
+                        Some(harness.provider.api_key().as_str()),
                     );
                     return 1;
                 }
@@ -416,12 +456,12 @@ where
             }
         };
         if let Err(error) = harness.handle_message(&text, &mut protocol, None) {
-            let error = redact_secret(&error, Some(harness.provider.api_key()));
+            let error = redact_secret(&error, Some(harness.provider.api_key().as_str()));
             if let Err(write_error) = protocol.error(&error) {
                 write_diagnostic_safe(
                     &mut diagnostics,
                     &format!("unable to write protocol error: {write_error}"),
-                    Some(harness.provider.api_key()),
+                    Some(harness.provider.api_key().as_str()),
                 );
                 return 1;
             }
@@ -524,7 +564,8 @@ impl Harness {
         // Endpoint and credential remain the session's established provider boundary.
         settings.base_url = self.session.llm.base_url.clone();
         settings.api_key_env = self.session.llm.api_key_env.clone();
-        let provider = Provider::new(&settings).map_err(|error| error.to_string())?;
+        apply_auth_to_settings(&mut settings, auth_provider_for_settings(&self.session.llm));
+        let provider = provider_for_settings(home, &settings).map_err(|error| error.to_string())?;
         // Validate the candidate before changing the user-owned source of truth.
         Config::save_selection(home, &settings.model, settings.effort.as_deref())
             .map_err(|error| error.to_string())?;
@@ -577,7 +618,7 @@ impl Harness {
         summary_messages.push(ChatMessage::system(COMPACTION_SYSTEM_PROMPT.to_owned()));
         summary_messages.extend(context_messages.into_iter().skip(1));
         let summary = match self.provider.summarize(&summary_messages, cancellation) {
-            Ok(summary) => redact_secret(&summary, Some(self.provider.api_key())),
+            Ok(summary) => redact_secret(&summary, Some(self.provider.api_key().as_str())),
             Err(error) if cancellation.is_cancelled() || error.is_cancelled() => {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
             }
@@ -601,7 +642,7 @@ impl Harness {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
         }
-        let secret = self.provider.api_key().to_owned();
+        let secret = self.provider.api_key();
         let expanded = expand_skill_invocation(text, &self.session.skills)?;
         let user_message = ChatMessage::user(redact_secret(&expanded.text, Some(&secret)));
         if let Err(error) = self.session.append_message(user_message) {
@@ -893,14 +934,14 @@ impl Harness {
         let safe_tool_calls = tool_calls
             .iter()
             .filter(|call| call.name == "cmd")
-            .map(|call| safe_partial_tool_call(call, secret))
+            .map(|call| safe_partial_tool_call(call, &secret))
             .collect::<Vec<_>>();
         let safe_tool_results = tool_results.clone();
         let interruption = crate::session::InterruptionRecord {
             timestamp: 0,
             reason: USER_CANCEL_REASON.to_owned(),
             phase: phase.to_owned(),
-            assistant_text: redact_secret(assistant_text, Some(secret)),
+            assistant_text: redact_secret(assistant_text, Some(&secret)),
             tool_calls: safe_tool_calls.clone(),
             tool_results,
         };
@@ -1226,7 +1267,19 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         jsonl: false,
         tui: false,
         version: false,
+        command: None,
     };
+    if args.len() == 2 && args[0] == "codex" {
+        options.command = Some(match args[1].as_str() {
+            "login" => CliCommand::CodexLogin,
+            "logout" => CliCommand::CodexLogout,
+            _ => return Err("usage: lucy codex <login|logout>".to_owned()),
+        });
+        return Ok(options);
+    }
+    if args.first().is_some_and(|arg| arg == "codex") {
+        return Err("usage: lucy codex <login|logout>".to_owned());
+    }
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1266,7 +1319,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions]"
+                    "usage: lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
                         .to_owned(),
                 );
             }
@@ -1295,18 +1348,82 @@ fn home_directory() -> Result<PathBuf, String> {
 }
 
 fn configured_api_key_env(config: &Config) -> Option<String> {
-    let api_key_env = config
-        .llm
-        .api_key_env
-        .as_deref()
-        .unwrap_or(DEFAULT_API_KEY_ENV)
-        .trim();
-    (!api_key_env.is_empty()).then(|| api_key_env.to_owned())
+    config.resolved_auth().ok()?.api_key_env
 }
 
 fn configured_api_key(config: &Config) -> Option<String> {
     configured_api_key_env(config)
         .and_then(|api_key_env| std::env::var(api_key_env).ok())
+        .filter(|secret| !secret.is_empty())
+}
+
+fn run_codex_command<W: Write, E: Write>(
+    command: CliCommand,
+    home: &Path,
+    mut output: W,
+    diagnostics: &mut E,
+) -> i32 {
+    match command {
+        CliCommand::CodexLogin => match crate::auth::login(home) {
+            Ok(_) => {
+                let _ = writeln!(output, "Codex login successful");
+                0
+            }
+            Err(error) => {
+                write_diagnostic(diagnostics, &error.to_string());
+                1
+            }
+        },
+        CliCommand::CodexLogout => match crate::auth::AuthStore::for_home(home).logout() {
+            Ok(true) => {
+                let _ = writeln!(output, "Codex logout successful");
+                0
+            }
+            Ok(false) => {
+                let _ = writeln!(output, "Codex was not logged in");
+                0
+            }
+            Err(error) => {
+                write_diagnostic(diagnostics, &error.to_string());
+                1
+            }
+        },
+    }
+}
+
+fn apply_auth_to_settings(settings: &mut LlmSettings, provider: AuthProvider) {
+    if provider == AuthProvider::CodexSubscription {
+        settings.api_key_env = crate::codex_provider::CODEX_ENV_SENTINEL.to_owned();
+    }
+}
+
+fn auth_provider_for_settings(settings: &LlmSettings) -> AuthProvider {
+    if settings.api_key_env == crate::codex_provider::CODEX_ENV_SENTINEL {
+        AuthProvider::CodexSubscription
+    } else {
+        AuthProvider::Openrouter
+    }
+}
+
+fn provider_for_settings(
+    home: &Path,
+    settings: &LlmSettings,
+) -> Result<Provider, crate::provider::ProviderError> {
+    match auth_provider_for_settings(settings) {
+        AuthProvider::CodexSubscription => Provider::new_codex(home, settings),
+        AuthProvider::Openrouter => Provider::new(settings),
+    }
+}
+
+fn configured_codex_secret(home: &Path, provider: AuthProvider) -> Option<String> {
+    if provider != AuthProvider::CodexSubscription {
+        return None;
+    }
+    crate::auth::AuthStore::for_home(home)
+        .load()
+        .ok()
+        .flatten()
+        .map(|credentials| credentials.access)
         .filter(|secret| !secret.is_empty())
 }
 
@@ -1352,6 +1469,48 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn codex_subcommands_parse_without_entering_a_session() {
+        assert_eq!(
+            parse_args(&["codex".to_owned(), "login".to_owned()])
+                .expect("codex login")
+                .command,
+            Some(CliCommand::CodexLogin)
+        );
+        assert_eq!(
+            parse_args(&["codex".to_owned(), "logout".to_owned()])
+                .expect("codex logout")
+                .command,
+            Some(CliCommand::CodexLogout)
+        );
+        assert_eq!(
+            parse_args(&["codex".to_owned(), "status".to_owned()])
+                .expect_err("unknown codex command"),
+            "usage: lucy codex <login|logout>"
+        );
+    }
+
+    #[test]
+    fn codex_logout_is_idempotent_and_does_not_bootstrap_a_session() {
+        let home = std::env::temp_dir().join(format!("lucy-codex-logout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        let exit = run_cli_at_home(
+            &["codex".to_owned(), "logout".to_owned()],
+            Cursor::new(Vec::<u8>::new()),
+            &mut output,
+            &mut diagnostics,
+            &home,
+            &cwd,
+        );
+        assert_eq!(exit, 0);
+        assert!(String::from_utf8_lossy(&output).contains("not logged in"));
+        assert!(diagnostics.is_empty());
+        assert!(!home.exists());
+    }
 
     #[test]
     fn auto_compaction_triggers_at_or_above_ninety_five_percent_only() {

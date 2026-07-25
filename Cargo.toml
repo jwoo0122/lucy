@@ -1,6 +1,6 @@
 [package]
 name = "lucy-cli"
-version = "1.7.0"
+version = "1.8.1"
 edition = "2021"
 description = "A small local JSONL agent harness"
 homepage = "https://github.com/jwoo0122/lucy"
@@ -19,6 +19,9 @@ path = "src/lib.rs"
 formula = "lucy"
 
 [dependencies]
+base64 = "0.22"
+getrandom = "0.3"
+sha2 = "0.10"
 libc = "0.2"
 crossterm = "0.29"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
