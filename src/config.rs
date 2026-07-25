@@ -13,11 +13,10 @@ pub const GENERATED_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 pub const CODEX_SUBSCRIPTION_PROVIDER: &str = "codex_subscription";
 pub const OPENROUTER_PROVIDER: &str = "openrouter";
 pub const CODEX_API_KEY_ENV_SENTINEL: &str = "LUCY_CODEX_SUBSCRIPTION_TOKEN";
+#[deprecated(note = "system prompts are Lucy-owned and this compatibility constant is ignored")]
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, use cmd to read a relevant skill's SKILL.md.";
 
-const GENERATED_CONFIG: &str = r#"system_prompt = "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, use cmd to read a relevant skill's SKILL.md."
-
-[auth]
+const GENERATED_CONFIG: &str = r#"[auth]
 provider = "openrouter"
 api_key_env = "OPENROUTER_API_KEY"
 
@@ -53,9 +52,10 @@ impl From<io::Error> for ConfigError {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Config {
-    #[serde(default = "default_system_prompt")]
+    #[serde(skip)]
+    #[deprecated(note = "system prompts are Lucy-owned; this compatibility field is ignored")]
     pub system_prompt: String,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -106,16 +106,6 @@ pub struct LlmSettings {
     pub effort: Option<String>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
-            auth: AuthConfig::default(),
-            llm: LlmConfig::default(),
-        }
-    }
-}
-
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
@@ -134,10 +124,6 @@ impl Default for LlmConfig {
             effort: None,
         }
     }
-}
-
-fn default_system_prompt() -> String {
-    DEFAULT_SYSTEM_PROMPT.to_owned()
 }
 
 fn default_base_url() -> String {
@@ -412,6 +398,7 @@ pub(crate) fn ensure_private_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     #[cfg(unix)]
@@ -475,10 +462,64 @@ mod tests {
         let custom = b"system_prompt = \"custom\"\n[llm]\nmodel = \"local\"\n";
         fs::write(&path, custom).expect("custom config");
         let loaded = Config::load_or_create(&home).expect("load custom config");
-        assert_eq!(loaded.system_prompt, "custom");
         assert_eq!(loaded.llm.model, "local");
         assert_ne!(generated, custom);
         assert_eq!(fs::read(path).expect("bytes after load"), custom);
+
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn generated_config_omits_system_prompt() {
+        let home = temporary_home();
+        Config::ensure_exists(&home).expect("generate config");
+        let generated = fs::read_to_string(config_path(&home)).expect("generated config");
+        let document: toml::Value = toml::from_str(&generated).expect("generated TOML");
+        assert!(document.get("system_prompt").is_none());
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn legacy_system_prompt_is_ignored_without_rewriting_config_bytes() {
+        let home = temporary_home();
+        let path = config_path(&home);
+        fs::create_dir_all(path.parent().expect("config parent")).expect("config parent");
+        let legacy = b"system_prompt = \"legacy sentinel\"\n\n[llm]\nmodel = \"legacy-model\"\n";
+        fs::write(&path, legacy).expect("legacy config");
+
+        let loaded = Config::load_or_create(&home).expect("load legacy config");
+        assert_eq!(loaded.system_prompt, "");
+        assert_eq!(loaded.llm.model, "legacy-model");
+        assert_eq!(fs::read(&path).expect("config bytes after load"), legacy);
+
+        fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn settings_updates_preserve_legacy_system_prompt() {
+        let home = temporary_home();
+        let path = config_path(&home);
+        fs::create_dir_all(path.parent().expect("config parent")).expect("config parent");
+        fs::write(
+            &path,
+            "system_prompt = \"legacy sentinel\"\n\n[llm]\nmodel = \"old\"\n",
+        )
+        .expect("legacy config");
+
+        Config::save_selection(&home, "new", Some("high")).expect("save settings");
+        let updated = fs::read_to_string(&path).expect("updated config");
+        let document: toml::Value = toml::from_str(&updated).expect("updated TOML");
+        assert_eq!(
+            document.get("system_prompt").and_then(toml::Value::as_str),
+            Some("legacy sentinel")
+        );
+        assert_eq!(
+            document
+                .get("llm")
+                .and_then(|llm| llm.get("model"))
+                .and_then(toml::Value::as_str),
+            Some("new")
+        );
 
         fs::remove_dir_all(home).expect("remove temp home");
     }
@@ -521,7 +562,7 @@ mod tests {
         fs::write(&legacy, legacy_bytes).expect("legacy config");
 
         let config = Config::load_or_create(&home).expect("migrate legacy config");
-        assert_eq!(config.system_prompt, "legacy");
+        assert_eq!(config.llm.model, "old-model");
         assert_eq!(
             fs::read(config_path(&home)).expect("migrated bytes"),
             legacy_bytes
@@ -531,7 +572,7 @@ mod tests {
         fs::create_dir_all(legacy.parent().expect("legacy parent")).expect("legacy parent");
         fs::write(&legacy, b"system_prompt = \"stale\"\n").expect("stale legacy config");
         let loaded = Config::load_or_create(&home).expect("retain XDG config");
-        assert_eq!(loaded.system_prompt, "legacy");
+        assert_eq!(loaded.llm.model, "old-model");
         assert_eq!(
             fs::read(config_path(&home)).expect("XDG bytes"),
             legacy_bytes
@@ -586,7 +627,7 @@ mod tests {
     #[test]
     fn omitted_api_key_environment_uses_openai_default() {
         let config = Config {
-            system_prompt: "prompt".to_owned(),
+            system_prompt: String::new(),
             auth: AuthConfig::default(),
             llm: LlmConfig {
                 base_url: "http://localhost".to_owned(),
@@ -604,7 +645,7 @@ mod tests {
     #[test]
     fn auth_provider_rejects_mixed_credentials() {
         let config = Config {
-            system_prompt: "prompt".to_owned(),
+            system_prompt: String::new(),
             auth: AuthConfig {
                 provider: AuthProvider::CodexSubscription,
                 api_key_env: None,
@@ -626,7 +667,7 @@ mod tests {
     #[test]
     fn openrouter_rejects_the_codex_auth_sentinel_environment() {
         let config = Config {
-            system_prompt: "prompt".to_owned(),
+            system_prompt: String::new(),
             auth: AuthConfig {
                 provider: AuthProvider::Openrouter,
                 api_key_env: Some(CODEX_API_KEY_ENV_SENTINEL.to_owned()),
@@ -639,7 +680,7 @@ mod tests {
     #[test]
     fn codex_auth_resolves_without_an_api_key_environment() {
         let config = Config {
-            system_prompt: "prompt".to_owned(),
+            system_prompt: String::new(),
             auth: AuthConfig {
                 provider: AuthProvider::CodexSubscription,
                 api_key_env: None,
@@ -660,7 +701,7 @@ mod tests {
     #[test]
     fn resolved_effort_passes_through_and_trims() {
         let config = |effort: Option<&str>| Config {
-            system_prompt: "prompt".to_owned(),
+            system_prompt: String::new(),
             auth: AuthConfig::default(),
             llm: LlmConfig {
                 base_url: "http://localhost".to_owned(),
