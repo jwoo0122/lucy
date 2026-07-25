@@ -58,38 +58,12 @@ const WELCOME_START_COLOR: (u8, u8, u8) = (180, 130, 245);
 const WELCOME_END_COLOR: (u8, u8, u8) = (0, 180, 180);
 const USER_BORDER_COLOR: Color = Color::Rgb(192, 154, 0);
 const USER_BORDER_GLYPH: &str = "▌";
-const TUI_GLOW_BACKGROUND_RGB: (u8, u8, u8) = (16, 18, 22);
-const TUI_GLOW_BACKGROUND: Color = Color::Rgb(
-    TUI_GLOW_BACKGROUND_RGB.0,
-    TUI_GLOW_BACKGROUND_RGB.1,
-    TUI_GLOW_BACKGROUND_RGB.2,
-);
-const CONSOLE_BACKGROUND_RGB: (u8, u8, u8) = (42, 42, 46);
-const CONSOLE_BACKGROUND: Color = Color::Rgb(
-    CONSOLE_BACKGROUND_RGB.0,
-    CONSOLE_BACKGROUND_RGB.1,
-    CONSOLE_BACKGROUND_RGB.2,
-);
+const BUSY_INDICATOR_FADE_BASE_RGB: (u8, u8, u8) = (42, 42, 46);
 const CONSOLE_STATUS_COLOR: Color = Color::Rgb(144, 144, 148);
 const CONSOLE_ACCENT_LAVENDER: (u8, u8, u8) = (145, 70, 220);
 const CONSOLE_ACCENT_TEAL: (u8, u8, u8) = (0, 180, 180);
 const CONSOLE_ACCENT_CYCLE_DURATION: Duration = Duration::from_secs(15);
 const CONSOLE_ACCENT_DESATURATION: f32 = 0.15;
-const CONSOLE_GLASS_DESATURATION: f32 = 0.65;
-const CONSOLE_GLASS_TINT: f32 = 0.24;
-const CONSOLE_GLASS_WHITE_TINT: f32 = 0.03;
-const CONSOLE_GLASS_GLOW_THROUGH: f32 = 0.26;
-const CONSOLE_REFLECTION_TINT: f32 = 0.12;
-const CONSOLE_REFLECTION_WHITE_TINT: f32 = 0.20;
-const CONSOLE_REFLECTION_GLYPH: &str = "▁";
-const GLOW_HEIGHT: u16 = 12;
-const GLOW_HORIZONTAL_SPREAD: u16 = 24;
-const GLOW_INTENSITY: f32 = 0.70;
-const GLOW_DESATURATION: f32 = 0.10;
-const CONSOLE_BOUNDARY_CYCLE: Duration = Duration::from_millis(7000);
-const CONSOLE_REACH_MIN: f32 = 0.28;
-const CONSOLE_REACH_MAX: f32 = 0.38;
-const CONSOLE_VISIBILITY_TRANSITION: Duration = Duration::from_millis(600);
 const SKILL_TRIGGER_COLOR: Color = Color::Rgb(80, 255, 245);
 const PENDING_TOOL_COLOR_RGB: (u8, u8, u8) = (255, 165, 0);
 const PENDING_TOOL_COLOR: Color = Color::Rgb(
@@ -345,8 +319,7 @@ fn event_loop<W: Write>(
         // Ratatui flushes the buffer diff (which issues MoveTo for every
         // changed cell) before it hides or shows the cursor. If the hardware
         // cursor is visible during that flush it briefly appears at each
-        // changed cell — most noticeable across the animated glow region in
-        // busy state. Hide it first so the flush phase never shows it; Ratatui
+        // changed cell. Hide it first so the flush phase never shows it; Ratatui
         // will re-show it at the prompt position after flush when needed.
         let _ = execute!(terminal.backend_mut(), Hide);
 
@@ -817,16 +790,6 @@ impl EventSink for ChannelSink {
     }
 }
 
-/// A bounded interpolation between the resting bars and a live pulse frame.
-/// Keeping the source frame lets a completed turn settle instead of snapping
-/// straight from its last pulse height to the resting indicator.
-#[derive(Debug, Clone, Copy)]
-struct ConsoleVisibilityTransition {
-    started_at: Instant,
-    from: f32,
-    to: f32,
-}
-
 #[derive(Debug, Clone)]
 struct ActivityTransition {
     started_at: Instant,
@@ -852,7 +815,6 @@ struct UiState {
     auto_scroll: bool,
     tool_animation_epoch: Instant,
     console_animation_epoch: Instant,
-    console_visibility_transition: Option<ConsoleVisibilityTransition>,
     activity_started_at: Instant,
     activity_transition: Option<ActivityTransition>,
     last_active_levels: [usize; PULSE_BAR_PERIODS.len()],
@@ -892,7 +854,6 @@ impl UiState {
             auto_scroll: true,
             tool_animation_epoch: Instant::now(),
             console_animation_epoch: Instant::now(),
-            console_visibility_transition: None,
             activity_started_at: Instant::now(),
             activity_transition: None,
             last_active_levels: [0; PULSE_BAR_PERIODS.len()],
@@ -950,32 +911,10 @@ impl UiState {
         if self.busy == busy {
             return;
         }
-        let from = self.console_visibility_at(now);
-        if busy && from <= f32::EPSILON {
+        if busy {
             self.console_animation_epoch = now;
         }
         self.busy = busy;
-        self.console_visibility_transition = Some(ConsoleVisibilityTransition {
-            started_at: now,
-            from,
-            to: if busy { 1.0 } else { 0.0 },
-        });
-    }
-
-    fn console_visibility_at(&self, now: Instant) -> f32 {
-        let Some(transition) = self.console_visibility_transition else {
-            return if self.busy { 1.0 } else { 0.0 };
-        };
-        let progress = now
-            .saturating_duration_since(transition.started_at)
-            .as_secs_f32()
-            / CONSOLE_VISIBILITY_TRANSITION.as_secs_f32();
-        if progress >= 1.0 {
-            return transition.to;
-        }
-        let progress = progress.clamp(0.0, 1.0);
-        let eased = progress * progress * (3.0 - 2.0 * progress);
-        transition.from + (transition.to - transition.from) * eased
     }
 
     fn set_status(&mut self, status: impl Into<String>) {
@@ -2088,21 +2027,6 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         }
     }
 
-    let activity_now = Instant::now();
-    let activity_elapsed = state.console_animation_elapsed_at(activity_now);
-    let console_visibility = state.console_visibility_at(activity_now);
-    apply_tui_glow(
-        frame,
-        full_area,
-        input_chunk,
-        activity_elapsed,
-        console_visibility,
-    );
-    // Keep the reflection in the existing transcript gap. On constrained
-    // layouts the row above the console belongs to the transcript instead.
-    if chat_chunk.y.saturating_add(chat_chunk.height) < input_chunk.y {
-        apply_console_top_reflection(frame, input_chunk, activity_elapsed, console_visibility);
-    }
     if let Some(layout) = welcome_image_layout {
         let image = welcome_image(layout.image_size);
         frame.render_widget(TuiImage::new(image.as_ref()), layout.image_area);
@@ -2147,13 +2071,12 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         status_area,
     );
 
-    apply_console_background(frame, input_chunk, activity_elapsed, console_visibility);
     if let Some(settings) = &state.settings {
         draw_settings(frame, settings, area);
     }
 
     // A frame cursor makes Ratatui issue `Show` after every redraw. Only set
-    // one while focused, so background glow redraws cannot re-show it.
+    // one while focused.
     if state.terminal_focused && state.settings.is_none() && !prompt_area.is_empty() && visible > 0
     {
         let cursor_prefix: String = prompt.chars().take(state.cursor).collect();
@@ -3139,33 +3062,6 @@ fn model_status_line_at(
     Line::from(spans)
 }
 
-fn blend_rgb(from: Color, to: Color, progress: f32) -> Color {
-    let (from_red, from_green, from_blue) = activity_rgb(from);
-    let (to_red, to_green, to_blue) = activity_rgb(to);
-    Color::Rgb(
-        interpolate_color(from_red, to_red, progress),
-        interpolate_color(from_green, to_green, progress),
-        interpolate_color(from_blue, to_blue, progress),
-    )
-}
-
-fn activity_rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(red, green, blue) => (red, green, blue),
-        // The resting indicator uses ratatui's named cyan. Convert it to its
-        // ANSI RGB equivalent while blending into and out of the accent cycle.
-        Color::Cyan => (0, 255, 255),
-        _ => unreachable!("activity transition colours are cyan or RGB"),
-    }
-}
-
-fn console_reach_at(elapsed: Duration) -> f32 {
-    let phase = elapsed.as_secs_f32() / CONSOLE_BOUNDARY_CYCLE.as_secs_f32();
-    let midpoint = (CONSOLE_REACH_MIN + CONSOLE_REACH_MAX) / 2.0;
-    let amplitude = (CONSOLE_REACH_MAX - CONSOLE_REACH_MIN) / 2.0;
-    midpoint + amplitude * (phase * std::f32::consts::TAU).sin()
-}
-
 fn console_accent_cycle() -> Duration {
     CONSOLE_ACCENT_CYCLE_DURATION
 }
@@ -3192,196 +3088,6 @@ fn desaturate_console_accent(red: u8, green: u8, blue: u8) -> Color {
         interpolate_color(green, neutral, CONSOLE_ACCENT_DESATURATION),
         interpolate_color(blue, neutral, CONSOLE_ACCENT_DESATURATION),
     )
-}
-
-/// Return a smooth half-elliptical falloff beneath the console.
-///
-/// The TUI's bottom edge cuts the ellipse on its horizontal centreline, so the
-/// visible upper half grows wider toward the bottom. The glow is never taller
-/// than `GLOW_HEIGHT` terminal rows and reaches farther horizontally than it
-/// does vertically.
-fn glow_coverage_at(column: u16, row: u16, canvas: Rect, console_area: Rect) -> f32 {
-    let canvas_bottom = canvas.y.saturating_add(canvas.height);
-    if canvas.is_empty() || row < canvas.y || row >= canvas_bottom {
-        return 0.0;
-    }
-
-    let left = console_area.x.max(canvas.x);
-    let right = console_area
-        .x
-        .saturating_add(console_area.width)
-        .min(canvas.x.saturating_add(canvas.width));
-    if left >= right {
-        return 0.0;
-    }
-
-    let x = canvas.x.saturating_add(column);
-    let center_x = (left as f32 + right.saturating_sub(1) as f32) / 2.0;
-    let horizontal_radius = (right - left) as f32 / 2.0 + GLOW_HORIZONTAL_SPREAD as f32;
-    let horizontal_distance = (x as f32 - center_x).abs() / horizontal_radius;
-    // Sample the lower edge of each cell: the bottom edge of the TUI is the
-    // ellipse's centreline while its visible half remains within the canvas.
-    let vertical_distance =
-        (row.saturating_add(1) as f32 - canvas_bottom as f32).abs() / GLOW_HEIGHT as f32;
-    let distance = horizontal_distance.hypot(vertical_distance);
-    let falloff = (1.0 - distance).clamp(0.0, 1.0);
-    falloff * falloff * (3.0 - 2.0 * falloff)
-}
-
-fn glow_accent_at(elapsed: Duration) -> Color {
-    glow_accent_with_desaturation_at(elapsed, GLOW_DESATURATION)
-}
-
-fn glow_accent_with_desaturation_at(elapsed: Duration, desaturation: f32) -> Color {
-    let (red, green, blue) = activity_rgb(console_accent_at(elapsed));
-    let neutral = ((u16::from(red) + u16::from(green) + u16::from(blue)) / 3) as u8;
-    Color::Rgb(
-        interpolate_color(red, neutral, desaturation),
-        interpolate_color(green, neutral, desaturation),
-        interpolate_color(blue, neutral, desaturation),
-    )
-}
-
-fn glow_color_at(
-    elapsed: Duration,
-    column: u16,
-    _width: u16,
-    row: u16,
-    canvas: Rect,
-    console_area: Rect,
-    visibility: f32,
-) -> Option<Color> {
-    let visibility = visibility.clamp(0.0, 1.0);
-    let bottom = canvas.y.saturating_add(canvas.height);
-    if visibility <= 0.0 || row < canvas.y || row >= bottom {
-        return None;
-    }
-
-    let coverage = glow_coverage_at(column, row, canvas, console_area);
-    if coverage <= 0.0 {
-        return None;
-    }
-
-    let intensity =
-        (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * GLOW_INTENSITY * coverage * visibility;
-    Some(blend_rgb(
-        TUI_GLOW_BACKGROUND,
-        glow_accent_at(elapsed),
-        intensity,
-    ))
-}
-
-fn apply_tui_glow(
-    frame: &mut Frame<'_>,
-    canvas: Rect,
-    console_area: Rect,
-    elapsed: Duration,
-    visibility: f32,
-) {
-    let left = console_area
-        .x
-        .saturating_sub(GLOW_HORIZONTAL_SPREAD)
-        .max(canvas.x);
-    let right = console_area
-        .x
-        .saturating_add(console_area.width)
-        .saturating_add(GLOW_HORIZONTAL_SPREAD)
-        .min(canvas.x.saturating_add(canvas.width));
-    let bottom = canvas.y.saturating_add(canvas.height);
-    let top = bottom.saturating_sub(GLOW_HEIGHT).max(canvas.y);
-    let buffer = frame.buffer_mut();
-    for y in top..bottom {
-        for x in left..right {
-            if let Some(color) = glow_color_at(
-                elapsed,
-                x.saturating_sub(canvas.x),
-                canvas.width,
-                y,
-                canvas,
-                console_area,
-                visibility,
-            ) {
-                buffer[(x, y)].set_bg(color);
-            }
-        }
-    }
-}
-
-fn console_glass_color_at(elapsed: Duration, glow: Color, visibility: f32) -> Color {
-    let (red, green, blue) = activity_rgb(console_accent_at(elapsed));
-    let neutral = ((u16::from(red) + u16::from(green) + u16::from(blue)) / 3) as u8;
-    let glass_accent = Color::Rgb(
-        interpolate_color(red, neutral, CONSOLE_GLASS_DESATURATION),
-        interpolate_color(green, neutral, CONSOLE_GLASS_DESATURATION),
-        interpolate_color(blue, neutral, CONSOLE_GLASS_DESATURATION),
-    );
-    let visibility = visibility.clamp(0.0, 1.0);
-    let tint = blend_rgb(
-        CONSOLE_BACKGROUND,
-        glass_accent,
-        CONSOLE_GLASS_TINT * visibility,
-    );
-    let white_tinted = blend_rgb(
-        tint,
-        Color::Rgb(255, 255, 255),
-        CONSOLE_GLASS_WHITE_TINT * visibility,
-    );
-    blend_rgb(white_tinted, glow, CONSOLE_GLASS_GLOW_THROUGH * visibility)
-}
-
-/// Return the faint accent colour used by the external glass reflection.
-fn console_top_reflection_color_at(elapsed: Duration, background: Color, visibility: f32) -> Color {
-    let visibility = visibility.clamp(0.0, 1.0);
-    let reflected = blend_rgb(
-        background,
-        glow_accent_at(elapsed),
-        CONSOLE_REFLECTION_TINT * visibility,
-    );
-    blend_rgb(
-        reflected,
-        Color::Rgb(255, 255, 255),
-        CONSOLE_REFLECTION_WHITE_TINT * visibility,
-    )
-}
-
-/// Draw a one-eighth-cell reflection on the bottom edge of the row immediately
-/// above the console. This leaves the console's own background uniform while
-/// keeping the effect thin in terminals that render block glyphs.
-fn apply_console_top_reflection(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    elapsed: Duration,
-    visibility: f32,
-) {
-    if visibility <= 0.0 || area.y == 0 {
-        return;
-    }
-
-    let y = area.y - 1;
-    let buffer = frame.buffer_mut();
-    for x in area.x..area.x.saturating_add(area.width) {
-        let background = match buffer[(x, y)].bg {
-            Color::Rgb(_, _, _) => buffer[(x, y)].bg,
-            _ => TUI_GLOW_BACKGROUND,
-        };
-        buffer[(x, y)].set_symbol(CONSOLE_REFLECTION_GLYPH).set_fg(
-            console_top_reflection_color_at(elapsed, background, visibility),
-        );
-    }
-}
-
-/// Composite the dark, low-saturation glass only over the console rectangle.
-fn apply_console_background(frame: &mut Frame<'_>, area: Rect, elapsed: Duration, visibility: f32) {
-    let buffer = frame.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            let glow = match buffer[(x, y)].bg {
-                Color::Rgb(_, _, _) => buffer[(x, y)].bg,
-                _ => TUI_GLOW_BACKGROUND,
-            };
-            buffer[(x, y)].set_bg(console_glass_color_at(elapsed, glow, visibility));
-        }
-    }
 }
 
 fn thinking_style() -> Style {
@@ -3485,9 +3191,9 @@ fn busy_indicator_color(accent: Color, distance: Option<usize>) -> Color {
         .copied()
         .unwrap_or(0.0);
     Color::Rgb(
-        interpolate_color(CONSOLE_BACKGROUND_RGB.0, red, opacity),
-        interpolate_color(CONSOLE_BACKGROUND_RGB.1, green, opacity),
-        interpolate_color(CONSOLE_BACKGROUND_RGB.2, blue, opacity),
+        interpolate_color(BUSY_INDICATOR_FADE_BASE_RGB.0, red, opacity),
+        interpolate_color(BUSY_INDICATOR_FADE_BASE_RGB.1, green, opacity),
+        interpolate_color(BUSY_INDICATOR_FADE_BASE_RGB.2, blue, opacity),
     )
 }
 fn pulse_levels_at(elapsed: Duration) -> [usize; PULSE_BAR_PERIODS.len()] {
@@ -3892,13 +3598,13 @@ mod tests {
         assert_eq!(BUSY_INDICATOR_TICK, Duration::from_micros(62_500));
     }
 
-    fn color_distance_from_console(color: Color) -> u32 {
+    fn color_distance_from_indicator_base(color: Color) -> u32 {
         let Color::Rgb(red, green, blue) = color else {
             return 0;
         };
-        u32::from(red.abs_diff(CONSOLE_BACKGROUND_RGB.0))
-            + u32::from(green.abs_diff(CONSOLE_BACKGROUND_RGB.1))
-            + u32::from(blue.abs_diff(CONSOLE_BACKGROUND_RGB.2))
+        u32::from(red.abs_diff(BUSY_INDICATOR_FADE_BASE_RGB.0))
+            + u32::from(green.abs_diff(BUSY_INDICATOR_FADE_BASE_RGB.1))
+            + u32::from(blue.abs_diff(BUSY_INDICATOR_FADE_BASE_RGB.2))
     }
 
     #[test]
@@ -3910,7 +3616,7 @@ mod tests {
         assert_eq!(BUSY_INDICATOR_BLOCK, '■');
         assert_ne!(near, accent);
         assert_ne!(far, near);
-        assert!(color_distance_from_console(near) > color_distance_from_console(far));
+        assert!(color_distance_from_indicator_base(near) > color_distance_from_indicator_base(far));
     }
 
     #[test]
@@ -3966,578 +3672,6 @@ mod tests {
         assert_eq!(state.console_animation_epoch, epoch);
     }
 
-    fn color_distance(from: Color, to: Color) -> u16 {
-        let (from_red, from_green, from_blue) = activity_rgb(from);
-        let (to_red, to_green, to_blue) = activity_rgb(to);
-        u16::from(from_red.abs_diff(to_red))
-            + u16::from(from_green.abs_diff(to_green))
-            + u16::from(from_blue.abs_diff(to_blue))
-    }
-
-    fn color_saturation(color: Color) -> u8 {
-        let (red, green, blue) = activity_rgb(color);
-        red.max(green).max(blue) - red.min(green).min(blue)
-    }
-
-    fn color_luminance(color: Color) -> u32 {
-        let (red, green, blue) = activity_rgb(color);
-        299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue)
-    }
-
-    #[test]
-    fn glow_coverage_is_a_bottom_anchored_half_ellipse_with_a_twelve_row_cap() {
-        let canvas = Rect::new(0, 0, 160, 40);
-        let console = Rect::new(40, 28, 80, 7);
-        let bottom = canvas.y + canvas.height;
-        let center_x = console.x + console.width / 2 - 1;
-        let outer_x = center_x + 35;
-        let active_rows = (canvas.y..bottom)
-            .filter(|&row| glow_coverage_at(center_x, row, canvas, console) > 0.0)
-            .collect::<Vec<_>>();
-
-        assert_eq!(GLOW_HEIGHT, 12);
-        assert_eq!(GLOW_HORIZONTAL_SPREAD, 24);
-        assert_eq!(
-            active_rows,
-            (bottom - GLOW_HEIGHT..bottom).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            glow_coverage_at(center_x, bottom - GLOW_HEIGHT - 1, canvas, console),
-            0.0,
-            "the glow never exceeds its twelve-row cap"
-        );
-        assert_eq!(
-            glow_coverage_at(center_x, bottom - 1, canvas, console),
-            glow_coverage_at(center_x + 1, bottom - 1, canvas, console),
-            "the bottom edge intersects the ellipse at its horizontal centreline"
-        );
-        assert_eq!(
-            glow_coverage_at(outer_x, bottom - GLOW_HEIGHT, canvas, console),
-            0.0,
-            "the top of the half ellipse stays narrow"
-        );
-        assert!(
-            glow_coverage_at(outer_x, bottom - 1, canvas, console) > 0.0,
-            "the exposed glow grows wider toward the TUI bottom"
-        );
-        assert!(
-            glow_coverage_at(console.x + console.width + 23, bottom - 1, canvas, console) > 0.0,
-            "the glow extends twenty-four cells beyond each console edge"
-        );
-    }
-
-    #[test]
-    fn wider_console_has_a_wider_elliptical_side_falloff() {
-        let canvas = Rect::new(0, 0, 200, 20);
-        let wide_console = Rect::new(50, 12, 100, 7);
-        let narrow_console = Rect::new(50, 12, 4, 7);
-        let bottom_row = canvas.y + canvas.height - 1;
-        let offset_from_center = 60;
-        let wide_sample = wide_console.x + wide_console.width / 2 + offset_from_center;
-        let narrow_sample = narrow_console.x + narrow_console.width / 2 + offset_from_center;
-
-        let wide = glow_coverage_at(wide_sample, bottom_row, canvas, wide_console);
-        let narrow = glow_coverage_at(narrow_sample, bottom_row, canvas, narrow_console);
-
-        assert!(wide > 0.0);
-        assert_eq!(narrow, 0.0);
-        assert!(
-            wide > narrow,
-            "the horizontal radius follows the console width to form an ellipse rather than fixed endpoint circles"
-        );
-    }
-
-    #[test]
-    fn exposed_bloom_is_not_tinted_as_console_glass() {
-        let canvas = Rect::new(0, 0, 80, 20);
-        let console = Rect::new(20, 12, 40, 7);
-        let elapsed = CONSOLE_BOUNDARY_CYCLE / 4;
-        let source_row = canvas.y + canvas.height - 1;
-        let exposed = (console.x - 1, source_row);
-        let inside = (console.x, console.y + console.height - 1);
-        let exposed_glow = glow_color_at(
-            elapsed,
-            exposed.0,
-            canvas.width,
-            exposed.1,
-            canvas,
-            console,
-            1.0,
-        )
-        .expect("endpoint bloom");
-        let inside_glow = glow_color_at(
-            elapsed,
-            inside.0,
-            canvas.width,
-            inside.1,
-            canvas,
-            console,
-            1.0,
-        )
-        .expect("source segment glow");
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
-            canvas.width,
-            canvas.height,
-        ))
-        .expect("test terminal");
-
-        terminal
-            .draw(|frame| {
-                apply_tui_glow(frame, canvas, console, elapsed, 1.0);
-                apply_console_background(frame, console, elapsed, 1.0);
-                let buffer = frame.buffer_mut();
-                assert_eq!(buffer[exposed].bg, exposed_glow);
-                assert_eq!(
-                    buffer[inside].bg,
-                    console_glass_color_at(elapsed, inside_glow, 1.0)
-                );
-            })
-            .expect("render glow and glass");
-    }
-
-    #[test]
-    fn idle_canvas_has_no_glow() {
-        let canvas = Rect::new(0, 0, 80, 12);
-        let console = Rect::new(2, 6, 76, 5);
-        for row in canvas.y..canvas.y + canvas.height {
-            for column in 0..canvas.width {
-                assert_eq!(
-                    glow_color_at(
-                        CONSOLE_BOUNDARY_CYCLE / 4,
-                        column,
-                        canvas.width,
-                        row,
-                        canvas,
-                        console,
-                        0.0,
-                    ),
-                    None,
-                    "idle glow never paints the canvas"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn console_visibility_transition_is_smooth_and_reversible() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.set_busy(true);
-        let entering = state
-            .console_visibility_transition
-            .expect("entry transition");
-        assert_eq!(state.console_visibility_at(entering.started_at), 0.0);
-        let entry_middle =
-            state.console_visibility_at(entering.started_at + CONSOLE_VISIBILITY_TRANSITION / 2);
-        assert!((entry_middle - 0.5).abs() < 0.000_1);
-        assert_eq!(
-            state.console_visibility_at(entering.started_at + CONSOLE_VISIBILITY_TRANSITION),
-            1.0
-        );
-
-        state.console_visibility_transition = None;
-        state.set_busy(false);
-        let exiting = state
-            .console_visibility_transition
-            .expect("exit transition");
-        assert_eq!(state.console_visibility_at(exiting.started_at), 1.0);
-        let exit_middle =
-            state.console_visibility_at(exiting.started_at + CONSOLE_VISIBILITY_TRANSITION / 2);
-        assert!((exit_middle - 0.5).abs() < 0.000_1);
-        assert_eq!(
-            state.console_visibility_at(exiting.started_at + CONSOLE_VISIBILITY_TRANSITION),
-            0.0
-        );
-    }
-
-    #[test]
-    fn rapid_console_reentry_preserves_glow_phase() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        let canvas = Rect::new(0, 0, 80, 12);
-        let console = Rect::new(2, 6, 76, 5);
-        let start = Instant::now();
-        state.set_busy_at(true, start);
-        let epoch = state.console_animation_epoch;
-        state.set_busy_at(false, start + CONSOLE_VISIBILITY_TRANSITION);
-        let reversal_at = start + CONSOLE_VISIBILITY_TRANSITION * 3 / 2;
-        let visibility_before = state.console_visibility_at(reversal_at);
-        let elapsed_before = state.console_animation_elapsed_at(reversal_at);
-        let color_before = glow_color_at(
-            elapsed_before,
-            40,
-            canvas.width,
-            canvas.y + canvas.height - 1,
-            canvas,
-            console,
-            visibility_before,
-        );
-
-        state.set_busy_at(true, reversal_at);
-
-        assert_eq!(state.console_animation_epoch, epoch);
-        assert!((state.console_visibility_at(reversal_at) - visibility_before).abs() < 0.000_1);
-        assert_eq!(
-            glow_color_at(
-                state.console_animation_elapsed_at(reversal_at),
-                40,
-                canvas.width,
-                canvas.y + canvas.height - 1,
-                canvas,
-                console,
-                state.console_visibility_at(reversal_at),
-            ),
-            color_before,
-            "reversing an exit keeps the current glow phase"
-        );
-    }
-
-    #[test]
-    fn glow_reach_still_controls_light_intensity() {
-        let long = CONSOLE_BOUNDARY_CYCLE / 4;
-        let short = CONSOLE_BOUNDARY_CYCLE * 3 / 4;
-        let canvas = Rect::new(0, 0, 80, 12);
-        let console = Rect::new(2, 6, 76, 5);
-        let row = canvas.y + canvas.height - 1;
-        let long_glow =
-            glow_color_at(long, 40, canvas.width, row, canvas, console, 1.0).expect("visible glow");
-        let short_glow = glow_color_at(short, 40, canvas.width, row, canvas, console, 1.0)
-            .expect("visible glow");
-
-        assert!((console_reach_at(long) - CONSOLE_REACH_MAX).abs() < 0.000_1);
-        assert!((console_reach_at(short) - CONSOLE_REACH_MIN).abs() < 0.000_1);
-        assert!(
-            color_distance(TUI_GLOW_BACKGROUND, long_glow)
-                > color_distance(TUI_GLOW_BACKGROUND, short_glow)
-        );
-    }
-
-    #[test]
-    fn maximum_glow_is_brighter_and_more_saturated_than_the_previous_tuning() {
-        let canvas = Rect::new(0, 0, 160, 20);
-        let console = Rect::new(40, 12, 80, 7);
-        let column = console.x + console.width / 2;
-        let row = canvas.y + canvas.height - 1;
-        let elapsed = Duration::ZERO;
-        let coverage = glow_coverage_at(column, row, canvas, console);
-        assert_eq!(GLOW_INTENSITY, 0.70);
-        let current = glow_color_at(elapsed, column, canvas.width, row, canvas, console, 1.0)
-            .expect("bottom-centre glow");
-        let previous = blend_rgb(
-            TUI_GLOW_BACKGROUND,
-            glow_accent_with_desaturation_at(elapsed, 0.16),
-            (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * 0.62 * coverage,
-        );
-
-        assert!(
-            color_luminance(current) > color_luminance(previous),
-            "the adjusted maximum glow is brighter than the previous maximum"
-        );
-        assert!(
-            color_saturation(current) > color_saturation(previous),
-            "the adjusted maximum glow is more saturated than the previous maximum"
-        );
-    }
-
-    #[test]
-    fn glow_tuning_is_brighter_and_more_saturated_than_before() {
-        let canvas = Rect::new(0, 0, 160, 20);
-        let console = Rect::new(40, 12, 80, 7);
-        let column = console.x + console.width / 2;
-        let row = canvas.y + canvas.height - 1;
-        let coverage = glow_coverage_at(column, row, canvas, console);
-
-        assert_eq!(GLOW_INTENSITY, 0.70);
-        assert_eq!(GLOW_DESATURATION, 0.10);
-        for (phase, elapsed) in [
-            Duration::ZERO,
-            console_accent_cycle() / 4,
-            console_accent_cycle() / 2,
-            console_accent_cycle() * 3 / 4,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let current_accent = glow_accent_at(elapsed);
-            let previous_accent = glow_accent_with_desaturation_at(elapsed, 0.16);
-            assert!(
-                color_saturation(current_accent) > color_saturation(previous_accent),
-                "phase {phase}: reducing glow desaturation raises saturation"
-            );
-            let current = glow_color_at(elapsed, column, canvas.width, row, canvas, console, 1.0)
-                .expect("bottom-centre glow");
-            let previous = blend_rgb(
-                TUI_GLOW_BACKGROUND,
-                glow_accent_with_desaturation_at(elapsed, 0.16),
-                (console_reach_at(elapsed) / CONSOLE_REACH_MAX) * 0.62 * coverage,
-            );
-
-            assert!(
-                color_luminance(current) > color_luminance(previous),
-                "phase {phase}: the rendered glow is brighter than the prior tuning"
-            );
-            assert!(
-                color_saturation(current) > color_saturation(previous),
-                "phase {phase}: the rendered glow is more saturated than the prior tuning"
-            );
-        }
-    }
-
-    #[test]
-    fn console_is_dark_lower_saturation_glass_over_the_glow() {
-        let elapsed = CONSOLE_BOUNDARY_CYCLE / 4;
-        let canvas = Rect::new(0, 0, 80, 12);
-        let console = Rect::new(2, 6, 76, 5);
-        let glow = glow_color_at(
-            elapsed,
-            40,
-            canvas.width,
-            canvas.y + canvas.height - 1,
-            canvas,
-            console,
-            1.0,
-        )
-        .expect("visible glow");
-        let glass = console_glass_color_at(elapsed, glow, 1.0);
-        let solid_glass = console_glass_color_at(elapsed, CONSOLE_BACKGROUND, 1.0);
-
-        assert_eq!(
-            console_glass_color_at(elapsed, glow, 0.0),
-            CONSOLE_BACKGROUND
-        );
-        assert_ne!(glass, CONSOLE_BACKGROUND);
-        let (glass_red, glass_green, glass_blue) = activity_rgb(glass);
-        let (glow_red, glow_green, glow_blue) = activity_rgb(glow);
-        assert!(
-            u16::from(glass_red) + u16::from(glass_green) + u16::from(glass_blue)
-                < u16::from(glow_red) + u16::from(glow_green) + u16::from(glow_blue),
-            "console glass is darker than the exposed glow"
-        );
-        assert!(
-            color_distance(CONSOLE_BACKGROUND, glass) < color_distance(TUI_GLOW_BACKGROUND, glow),
-            "glass tint is subtler than the exposed glow"
-        );
-        assert!(
-            color_distance(CONSOLE_BACKGROUND, glass)
-                > color_distance(CONSOLE_BACKGROUND, solid_glass),
-            "the glow visibly carries through the stronger glass tint"
-        );
-        assert!(
-            color_saturation(glass) < color_saturation(glow),
-            "glass tint is less saturated than the exposed glow"
-        );
-    }
-
-    #[test]
-    fn console_top_reflection_is_a_thin_active_line_in_the_external_gap() {
-        assert_eq!(CONSOLE_REFLECTION_WHITE_TINT, 0.20);
-        let elapsed = Duration::ZERO;
-        let canvas = Rect::new(0, 0, 20, 8);
-        let console = Rect::new(2, 3, 16, 4);
-        let reflection_y = console.y - 1;
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
-            canvas.width,
-            canvas.height,
-        ))
-        .expect("test terminal");
-        terminal
-            .draw(|frame| {
-                apply_tui_glow(frame, canvas, console, elapsed, 1.0);
-                apply_console_top_reflection(frame, console, elapsed, 1.0);
-                apply_console_background(frame, console, elapsed, 1.0);
-            })
-            .expect("render external console reflection");
-
-        let reflection_glow = glow_color_at(
-            elapsed,
-            console.x,
-            canvas.width,
-            reflection_y,
-            canvas,
-            console,
-            1.0,
-        )
-        .expect("reflection row glow");
-        let accent_only_reflection = blend_rgb(
-            reflection_glow,
-            glow_accent_at(elapsed),
-            CONSOLE_REFLECTION_TINT,
-        );
-        let previous_reflection =
-            blend_rgb(accent_only_reflection, Color::Rgb(255, 255, 255), 0.10);
-        let reflection = console_top_reflection_color_at(elapsed, reflection_glow, 1.0);
-        let previous_luminance_lift =
-            color_luminance(previous_reflection) - color_luminance(accent_only_reflection);
-        let luminance_lift = color_luminance(reflection) - color_luminance(accent_only_reflection);
-        assert!(
-            luminance_lift * 100 >= previous_luminance_lift * 195
-                && luminance_lift * 100 <= previous_luminance_lift * 210,
-            "doubling the white tint doubles its reflection luminance contribution"
-        );
-        let console_glow = glow_color_at(
-            elapsed,
-            console.x,
-            canvas.width,
-            console.y,
-            canvas,
-            console,
-            1.0,
-        )
-        .expect("console glow");
-        let buffer = terminal.backend().buffer();
-        assert_eq!(
-            buffer[(console.x, reflection_y)].symbol(),
-            CONSOLE_REFLECTION_GLYPH,
-            "the reflection is drawn in the row above the console"
-        );
-        assert_eq!(
-            buffer[(console.x, reflection_y)].fg,
-            console_top_reflection_color_at(elapsed, reflection_glow, 1.0),
-            "the thin reflection follows the glow accent"
-        );
-        assert_eq!(
-            buffer[(console.x, reflection_y - 1)].symbol(),
-            " ",
-            "only the closest external row is changed"
-        );
-        assert_eq!(
-            buffer[(console.x, console.y)].bg,
-            console_glass_color_at(elapsed, console_glow, 1.0),
-            "the console top row remains normal glass"
-        );
-
-        let mut idle_terminal = Terminal::new(ratatui::backend::TestBackend::new(
-            canvas.width,
-            canvas.height,
-        ))
-        .expect("idle test terminal");
-        idle_terminal
-            .draw(|frame| {
-                apply_tui_glow(frame, canvas, console, elapsed, 0.0);
-                apply_console_top_reflection(frame, console, elapsed, 0.0);
-                apply_console_background(frame, console, elapsed, 0.0);
-            })
-            .expect("render idle console");
-        assert_eq!(
-            idle_terminal.backend().buffer()[(console.x, reflection_y)].symbol(),
-            " ",
-            "idle consoles have no external reflection"
-        );
-
-        let state = UiState::from_history(&[], "secret", "model", None, false);
-        let viewport = tui_viewport(Rect::new(0, 0, 80, 10));
-        let (chat, _, _, _, input_area, _) = ui_layout(&state, viewport);
-        assert_eq!(
-            chat.y + chat.height + 1,
-            input_area.y,
-            "the reflection uses the existing transcript gap rather than adding a row"
-        );
-    }
-
-    #[test]
-    fn console_reflection_skips_transcript_when_no_gap_fits() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.welcome_visible = false;
-        state
-            .transcript
-            .push(TranscriptItem::Info("protected transcript".to_owned()));
-        state.busy = true;
-        state.activity_transition = None;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
-        let area = Rect::new(0, 0, 60, 7);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw constrained active console");
-
-        let (chat, _, _, _, console, _) = ui_layout(&state, tui_viewport(area));
-        assert_eq!(chat.y + chat.height, console.y, "there is no separator row");
-        assert_eq!(
-            terminal.backend().buffer()[(chat.x, chat.y)].symbol(),
-            "p",
-            "the active reflection does not overwrite the adjacent transcript"
-        );
-    }
-
-    #[test]
-    fn console_reflection_stays_behind_an_active_skill_picker() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["agent-browser".to_owned()]);
-        state.input = "/".to_owned();
-        state.input_changed();
-        state.busy = true;
-        state.activity_transition = None;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
-        let area = Rect::new(0, 0, 40, 12);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw active picker");
-
-        let (_, picker, _, _, input, _) = ui_layout(&state, tui_viewport(area));
-        let picker = picker.expect("visible picker");
-        assert_eq!(picker.y + picker.height, input.y);
-        let buffer = terminal.backend().buffer();
-        assert_eq!(
-            buffer[(picker.x, picker.y + picker.height - 1)].bg,
-            SKILL_PICKER_BACKGROUND,
-            "the picker covers the reflection row"
-        );
-        assert_ne!(
-            buffer[(picker.x, picker.y + picker.height - 1)].symbol(),
-            CONSOLE_REFLECTION_GLYPH,
-            "the reflection glyph does not show through the picker"
-        );
-    }
-
-    #[test]
-    fn console_glass_white_film_brightens_only_visible_glass() {
-        let elapsed = Duration::ZERO;
-        let glow = Color::Rgb(80, 82, 86);
-        let (red, green, blue) = activity_rgb(console_accent_at(elapsed));
-        let neutral = ((u16::from(red) + u16::from(green) + u16::from(blue)) / 3) as u8;
-        let glass_accent = Color::Rgb(
-            interpolate_color(red, neutral, CONSOLE_GLASS_DESATURATION),
-            interpolate_color(green, neutral, CONSOLE_GLASS_DESATURATION),
-            interpolate_color(blue, neutral, CONSOLE_GLASS_DESATURATION),
-        );
-        let accent_tinted = blend_rgb(CONSOLE_BACKGROUND, glass_accent, CONSOLE_GLASS_TINT);
-        let without_white_film = blend_rgb(accent_tinted, glow, CONSOLE_GLASS_GLOW_THROUGH);
-        let with_white_film = console_glass_color_at(elapsed, glow, 1.0);
-        let expected = blend_rgb(
-            blend_rgb(
-                accent_tinted,
-                Color::Rgb(255, 255, 255),
-                CONSOLE_GLASS_WHITE_TINT,
-            ),
-            glow,
-            CONSOLE_GLASS_GLOW_THROUGH,
-        );
-
-        assert_eq!(CONSOLE_GLASS_WHITE_TINT, 0.03);
-        assert_eq!(
-            console_glass_color_at(elapsed, glow, 0.0),
-            CONSOLE_BACKGROUND,
-            "idle glass uses the configured console background"
-        );
-        assert_eq!(
-            with_white_film, expected,
-            "the white film is composited before glow-through"
-        );
-        let (with_white_red, with_white_green, with_white_blue) = activity_rgb(with_white_film);
-        let (without_white_red, without_white_green, without_white_blue) =
-            activity_rgb(without_white_film);
-        assert!(
-            u16::from(with_white_red) + u16::from(with_white_green) + u16::from(with_white_blue)
-                > u16::from(without_white_red)
-                    + u16::from(without_white_green)
-                    + u16::from(without_white_blue),
-            "the active glass has a visible white film"
-        );
-    }
-
     #[test]
     fn console_accent_uses_a_fifteen_second_lavender_to_teal_round_trip() {
         assert_eq!(console_accent_cycle(), Duration::from_secs(15));
@@ -4565,25 +3699,17 @@ mod tests {
         assert_ne!(
             midpoint,
             console_accent_at(Duration::ZERO),
-            "the glow transitions continuously instead of holding at lavender"
+            "the accent transitions continuously instead of holding at lavender"
         );
         assert_ne!(
             midpoint,
             console_accent_at(console_accent_cycle() / 2),
-            "the glow transitions continuously instead of holding at teal"
+            "the accent transitions continuously instead of holding at teal"
         );
     }
 
     #[test]
-    fn tui_glow_background_is_ghostty_base_101216() {
-        assert_eq!(TUI_GLOW_BACKGROUND_RGB, (16, 18, 22));
-        assert_eq!(TUI_GLOW_BACKGROUND, Color::Rgb(16, 18, 22));
-    }
-
-    #[test]
-    fn console_palette_starts_lavender_with_fifteen_percent_desaturation() {
-        assert_eq!(CONSOLE_BACKGROUND_RGB, (42, 42, 46));
-        assert_eq!(CONSOLE_BACKGROUND, Color::Rgb(42, 42, 46));
+    fn model_status_accent_starts_lavender_with_fifteen_percent_desaturation() {
         assert_eq!(
             console_accent_at(Duration::ZERO),
             desaturate_console_accent(
@@ -4591,62 +3717,6 @@ mod tests {
                 CONSOLE_ACCENT_LAVENDER.1,
                 CONSOLE_ACCENT_LAVENDER.2,
             )
-        );
-    }
-
-    #[test]
-    fn console_accent_transition_changes_all_tui_glow_in_sync() {
-        let elapsed = console_accent_cycle() / 4;
-        let canvas = Rect::new(0, 0, 80, 20);
-        let console = Rect::new(20, 12, 40, 7);
-        let row = canvas.y + canvas.height - 1;
-        let left = glow_color_at(elapsed, console.x, canvas.width, row, canvas, console, 1.0)
-            .expect("left-side glow");
-        let right = glow_color_at(
-            elapsed,
-            console.x + console.width - 1,
-            canvas.width,
-            row,
-            canvas,
-            console,
-            1.0,
-        )
-        .expect("right-side glow");
-        let intensity = (console_reach_at(elapsed) / CONSOLE_REACH_MAX)
-            * GLOW_INTENSITY
-            * glow_coverage_at(console.x, row, canvas, console);
-
-        assert_eq!(
-            blend_rgb(TUI_GLOW_BACKGROUND, glow_accent_at(elapsed), intensity),
-            left,
-            "the left edge uses the shared accent phase"
-        );
-        assert_eq!(left, right, "the glow has no horizontal color phase");
-
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(
-            canvas.width,
-            canvas.height,
-        ))
-        .expect("test terminal");
-        terminal
-            .draw(|frame| {
-                apply_tui_glow(frame, canvas, console, elapsed, 1.0);
-                apply_console_top_reflection(frame, console, elapsed, 1.0);
-                apply_console_background(frame, console, elapsed, 1.0);
-            })
-            .expect("render synchronized TUI glow");
-        let buffer = terminal.backend().buffer();
-        let left_x = console.x;
-        let right_x = console.x + console.width - 1;
-        assert_eq!(
-            buffer[(left_x, console.y)].bg,
-            buffer[(right_x, console.y)].bg,
-            "the glass uses the shared accent phase"
-        );
-        assert_eq!(
-            buffer[(left_x, console.y - 1)].fg,
-            buffer[(right_x, console.y - 1)].fg,
-            "the reflection uses the shared accent phase"
         );
     }
 
@@ -5749,7 +4819,7 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_status_omits_activity_animation_on_idle_and_busy_glass() {
+    fn main_agent_status_omits_activity_animation_on_idle_and_busy_states() {
         let mut state =
             UiState::from_history(&[], "secret", "model", None, false).with_context(Some(100), 81);
         let area = Rect::new(0, 0, 80, 10);
@@ -5778,7 +4848,7 @@ mod tests {
         state.set_status("working");
         state.busy = true;
         state.activity_transition = None;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
+        state.console_animation_epoch = Instant::now() - console_accent_cycle() / 4;
         terminal
             .draw(|frame| draw(frame, &state))
             .expect("draw working status");
@@ -5790,11 +4860,6 @@ mod tests {
         assert!(rendered.starts_with("model · default "));
         assert!(rendered.contains(BUSY_INDICATOR_BLOCK));
         assert!(rendered.ends_with(expected_context));
-        assert!(
-            (status_area.x..status_area.x + status_area.width)
-                .any(|x| buffer[(x, status_area.y)].bg != CONSOLE_BACKGROUND),
-            "the busy status line renders over bright glass"
-        );
     }
 
     #[test]
@@ -5813,22 +4878,21 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_busy_glow_keeps_the_hardware_cursor_hidden() {
+    fn unfocused_busy_redraw_keeps_the_hardware_cursor_hidden() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
         state.set_status("working");
         state.set_busy(true);
         state.terminal_focused = false;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
 
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(80, 10)).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, &state))
-            .expect("draw busy glow");
+            .expect("draw busy state");
 
         assert!(
             !terminal.backend().cursor_visible(),
-            "the glow redraw must not re-show the terminal cursor"
+            "a busy redraw must not re-show the terminal cursor"
         );
     }
 
@@ -5890,153 +4954,31 @@ mod tests {
     }
 
     #[test]
-    fn idle_console_has_external_gutters_uniform_background_and_no_borders() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.input = "prompt".to_owned();
-        state.cursor = state.input.chars().count();
-        let area = Rect::new(0, 0, 80, 10);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
+    fn prompt_surface_has_no_background_effects_when_idle_or_busy() {
+        for busy in [false, true] {
+            let mut state = UiState::from_history(&[], "secret", "model", None, false);
+            state.input = "prompt".to_owned();
+            state.cursor = state.input.chars().count();
+            state.busy = busy;
+            let area = Rect::new(0, 0, 80, 10);
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .expect("test terminal");
 
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw idle console");
+            terminal
+                .draw(|frame| draw(frame, &state))
+                .expect("draw prompt surface");
 
-        let input_area = ui_layout(&state, tui_viewport(area)).4;
-        let prompt_area = prompt_area(input_area, &state);
-        let buffer = terminal.backend().buffer();
-        let bottom_y = area.y + area.height - 1;
-        assert_eq!(buffer[(area.x, bottom_y)].bg, Color::Reset);
-        assert_eq!(buffer[(area.x + area.width - 1, bottom_y)].bg, Color::Reset);
-        for y in input_area.y..input_area.y + input_area.height {
-            assert_eq!(buffer[(0, y)].bg, Color::Reset);
-            assert_eq!(buffer[(79, y)].bg, Color::Reset);
-            for x in input_area.x..input_area.x + input_area.width {
-                assert_eq!(buffer[(x, y)].bg, CONSOLE_BACKGROUND);
-            }
-        }
-        assert_eq!(buffer[(input_area.x, input_area.y)].symbol(), " ");
-        assert_eq!(
-            buffer[(input_area.x + input_area.width - 1, input_area.y)].symbol(),
-            " "
-        );
-        assert_eq!(
-            buffer[(input_area.x, input_area.y + input_area.height - 1)].symbol(),
-            " "
-        );
-        assert_eq!(
-            buffer[(
-                input_area.x + input_area.width - 1,
-                input_area.y + input_area.height - 1
-            )]
-                .symbol(),
-            " "
-        );
-        assert_eq!(buffer[(prompt_area.x, prompt_area.y)].symbol(), "p");
-        assert_eq!(buffer[(prompt_area.x, prompt_area.y)].fg, Color::White);
-        terminal.backend_mut().assert_cursor_position((
-            prompt_area.x + UnicodeWidthStr::width(state.input.as_str()) as u16,
-            prompt_area.y,
-        ));
-    }
-
-    #[test]
-    fn busy_console_keeps_glass_inside_the_bottom_half_ellipse() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.busy = true;
-        state.set_status("working");
-        state.activity_transition = None;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
-        let area = Rect::new(0, 0, 200, 10);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw busy console");
-
-        let viewport = tui_viewport(area);
-        let (chat_area, _, _, _, input_area, _) = ui_layout(&state, viewport);
-        let reflection_y = input_area.y - 1;
-        let glow_floor_y = area.y + area.height - 1;
-        let edge_y = input_area.y + input_area.height - 1;
-        let floor = input_area.x + input_area.width / 2;
-        let left_edge = input_area.x;
-        let left_outer = left_edge - 1;
-        let right_edge = input_area.x + input_area.width - 1;
-        let right_outer = right_edge + 1;
-        let widening_sample = input_area.x - 22;
-        let buffer = terminal.backend().buffer();
-        assert_eq!(chat_area.y + chat_area.height + 1, input_area.y);
-        assert_eq!(
-            buffer[(floor, reflection_y)].symbol(),
-            CONSOLE_REFLECTION_GLYPH,
-            "the active console reflects along the bottom of the existing gap row"
-        );
-        assert_ne!(buffer[(floor, reflection_y)].fg, Color::Reset);
-        assert_ne!(buffer[(floor, glow_floor_y)].bg, Color::Reset);
-        assert_ne!(buffer[(left_outer, edge_y)].bg, Color::Reset);
-        assert_ne!(buffer[(right_outer, edge_y)].bg, Color::Reset);
-        let left_extent = left_edge - GLOW_HORIZONTAL_SPREAD;
-        let right_extent = right_edge + GLOW_HORIZONTAL_SPREAD;
-        assert_ne!(buffer[(left_extent, glow_floor_y)].bg, Color::Reset);
-        assert_ne!(buffer[(right_extent, glow_floor_y)].bg, Color::Reset);
-        assert_eq!(buffer[(left_extent - 1, glow_floor_y)].bg, Color::Reset);
-        assert_eq!(buffer[(right_extent + 1, glow_floor_y)].bg, Color::Reset);
-        assert_eq!(buffer[(widening_sample, input_area.y)].bg, Color::Reset);
-        assert_ne!(buffer[(widening_sample, glow_floor_y)].bg, Color::Reset);
-        assert_eq!(buffer[(area.x, glow_floor_y)].bg, Color::Reset);
-        for y in input_area.y..input_area.y + input_area.height {
-            for x in input_area.x..input_area.x + input_area.width {
-                assert_ne!(buffer[(x, y)].bg, Color::Reset);
-            }
-        }
-        for y in input_area.y..input_area.y + input_area.height {
-            for x in input_area.x..input_area.x + input_area.width {
-                assert_ne!(buffer[(x, y)].bg, Color::Reset);
-                assert!(
-                    color_distance(CONSOLE_BACKGROUND, buffer[(x, y)].bg)
-                        < color_distance(TUI_GLOW_BACKGROUND, buffer[(floor, glow_floor_y)].bg)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn narrow_busy_console_keeps_both_endpoint_blooms_exposed() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.busy = true;
-        state.set_status("working");
-        state.activity_transition = None;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
-        let area = Rect::new(0, 0, 10, 10);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw narrow TUI");
-
-        let input = ui_layout(&state, tui_viewport(area)).4;
-        assert_eq!(input.width, 4, "test the minimum inset console width");
-        let left_edge = input.x;
-        let right_edge = input.x + input.width - 1;
-        let buffer = terminal.backend().buffer();
-        for y in input.y..input.y + input.height {
-            for (edge, outer) in [(left_edge, left_edge - 1), (right_edge, right_edge + 1)] {
-                assert_ne!(
-                    buffer[(outer, y)].bg,
-                    Color::Reset,
-                    "the outer glow cell is present at ({outer}, {y})"
-                );
-                assert_ne!(
-                    buffer[(edge, y)].bg,
-                    buffer[(outer, y)].bg,
-                    "narrow console glass does not spill into the exposed bloom at ({edge}, {y})"
-                );
+            let (_, _, _, _, input_area, _) = ui_layout(&state, tui_viewport(area));
+            let buffer = terminal.backend().buffer();
+            for y in input_area.y.saturating_sub(1)..area.height {
+                for x in 0..area.width {
+                    assert_eq!(
+                        buffer[(x, y)].bg,
+                        Color::Reset,
+                        "busy={busy}: background effect remains at ({x}, {y})"
+                    );
+                }
             }
         }
     }
@@ -6441,64 +5383,6 @@ mod skill_picker_tests {
     }
 
     #[test]
-    fn tui_glow_background_is_ghostty_base_101216() {
-        assert_eq!(TUI_GLOW_BACKGROUND_RGB, (16, 18, 22));
-        assert_eq!(TUI_GLOW_BACKGROUND, Color::Rgb(16, 18, 22));
-    }
-
-    #[test]
-    fn idle_console_has_external_gutters_uniform_background_and_no_borders() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.input = "prompt".to_owned();
-        state.cursor = state.input.chars().count();
-        let area = Rect::new(0, 0, 80, 10);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw idle console");
-
-        let input_area = ui_layout(&state, tui_viewport(area)).4;
-        let prompt_area = prompt_area(input_area, &state);
-        let buffer = terminal.backend().buffer();
-        let bottom_y = area.y + area.height - 1;
-        assert_eq!(buffer[(area.x, bottom_y)].bg, Color::Reset);
-        assert_eq!(buffer[(area.x + area.width - 1, bottom_y)].bg, Color::Reset);
-        for y in input_area.y..input_area.y + input_area.height {
-            assert_eq!(buffer[(0, y)].bg, Color::Reset);
-            assert_eq!(buffer[(79, y)].bg, Color::Reset);
-            for x in input_area.x..input_area.x + input_area.width {
-                assert_eq!(buffer[(x, y)].bg, CONSOLE_BACKGROUND);
-            }
-        }
-        assert_eq!(buffer[(input_area.x, input_area.y)].symbol(), " ");
-        assert_eq!(
-            buffer[(input_area.x + input_area.width - 1, input_area.y)].symbol(),
-            " "
-        );
-        assert_eq!(
-            buffer[(input_area.x, input_area.y + input_area.height - 1)].symbol(),
-            " "
-        );
-        assert_eq!(
-            buffer[(
-                input_area.x + input_area.width - 1,
-                input_area.y + input_area.height - 1
-            )]
-                .symbol(),
-            " "
-        );
-        assert_eq!(buffer[(prompt_area.x, prompt_area.y)].symbol(), "p");
-        assert_eq!(buffer[(prompt_area.x, prompt_area.y)].fg, Color::White);
-        terminal.backend_mut().assert_cursor_position((
-            prompt_area.x + UnicodeWidthStr::width(state.input.as_str()) as u16,
-            prompt_area.y,
-        ));
-    }
-
-    #[test]
     fn slash_picker_is_rendered_immediately_above_the_input() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false)
             .with_skill_names(skill_names());
@@ -6547,7 +5431,7 @@ mod skill_picker_tests {
             SKILL_PICKER_BACKGROUND
         );
         assert_eq!(buffer[(input_area.x, input_area.y)].symbol(), " ");
-        assert_eq!(buffer[(input_area.x, input_area.y)].bg, CONSOLE_BACKGROUND);
+        assert_eq!(buffer[(input_area.x, input_area.y)].bg, Color::Reset);
     }
 
     #[test]
