@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -635,6 +637,10 @@ impl Harness {
 
     pub(crate) fn has_active_background_commands(&self) -> bool {
         self.background_commands.has_active()
+    }
+
+    pub(crate) fn background_active_count(&self) -> Arc<AtomicUsize> {
+        self.background_commands.active_count_handle()
     }
 
     pub(crate) fn has_completed_background_commands(&self) -> bool {

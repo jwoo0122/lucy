@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, Sender},
     Arc,
 };
@@ -46,6 +46,7 @@ pub(crate) struct BackgroundCommands {
     jobs: HashMap<String, BackgroundJob>,
     completed_tx: Sender<BackgroundCompletion>,
     completed_rx: Receiver<BackgroundCompletion>,
+    active: Arc<AtomicUsize>,
 }
 
 impl Default for BackgroundCommands {
@@ -56,6 +57,7 @@ impl Default for BackgroundCommands {
             jobs: HashMap::new(),
             completed_tx,
             completed_rx,
+            active: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -100,6 +102,7 @@ impl BackgroundCommands {
                 handle,
             },
         );
+        self.active.store(self.jobs.len(), Ordering::Relaxed);
         json!({
             "background_id": id,
             "status": "running",
@@ -115,7 +118,12 @@ impl BackgroundCommands {
             }
             completions.push(completion);
         }
+        self.active.store(self.jobs.len(), Ordering::Relaxed);
         completions
+    }
+
+    pub(crate) fn active_count_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.active)
     }
 
     pub(crate) fn has_active(&self) -> bool {
@@ -135,6 +143,7 @@ impl Drop for BackgroundCommands {
         for (_, job) in self.jobs.drain() {
             let _ = job.handle.join();
         }
+        self.active.store(self.jobs.len(), Ordering::Relaxed);
     }
 }
 
