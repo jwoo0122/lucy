@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -34,7 +34,7 @@ use crate::model::{estimate_context_tokens, ChatMessage};
 use crate::protocol::{EventSink, ProtocolEvent};
 use crate::provider::ProviderModel;
 use crate::redaction::redact_secret;
-use crate::session::SessionHistoryRecord;
+use crate::session::{Session, SessionHistoryRecord, SessionMetadata};
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
@@ -92,13 +92,23 @@ const FLOATING_PANEL_BACKGROUND: Color = Color::Rgb(28, 28, 30);
 const SKILL_PICKER_BACKGROUND: Color = FLOATING_PANEL_BACKGROUND;
 const SECTION_CHROME_COLOR: Color = Color::Rgb(0, 180, 180);
 const SKILL_PICKER_MAX_ROWS: usize = 5;
-const BUILTIN_COMMANDS: [&str; 2] = ["settings", "exit"];
+const BUILTIN_COMMANDS: [&str; 3] = ["settings", "session", "exit"];
 const SETTINGS_MIN_WIDTH: u16 = 36;
 const SETTINGS_MAX_WIDTH: u16 = 88;
 const SETTINGS_MIN_HEIGHT: u16 = 8;
 const SETTINGS_MAX_HEIGHT: u16 = 22;
 
-pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TuiOutcome {
+    Exit,
+    Attach(String),
+}
+
+pub(crate) fn run<W: Write>(
+    mut harness: Harness,
+    resumed: bool,
+    stdout: W,
+) -> Result<TuiOutcome, String> {
     let secret = harness.provider.api_key();
     let context_window = harness
         .context_window
@@ -115,6 +125,7 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
     );
     let mut state = UiState::from_history(
         &harness.session.history,
+        &harness.session.id,
         &secret,
         &harness.session.llm.model,
         harness.session.llm.effort.as_deref(),
@@ -257,6 +268,12 @@ fn worker_loop(
                     harness.provider.models().map_err(|error| error.to_string()),
                 ));
             }
+            WorkerRequest::Sessions => {
+                let secret = harness.provider.api_key();
+                let result = Session::list_with_secret(&harness.home, Some(&secret))
+                    .map_err(|error| error.to_string());
+                let _ = messages.send(WorkerMessage::Sessions(result));
+            }
             WorkerRequest::ApplySettings { model, effort } => {
                 let result = harness.apply_settings(&harness.home.clone(), model, effort);
                 let _ = messages.send(WorkerMessage::SettingsApplied(
@@ -276,7 +293,7 @@ fn event_loop<W: Write>(
     state: &mut UiState,
     requests: &Sender<WorkerRequest>,
     messages: &Receiver<WorkerMessage>,
-) -> Result<(), String> {
+) -> Result<TuiOutcome, String> {
     let mut quitting = false;
     loop {
         loop {
@@ -310,6 +327,7 @@ fn event_loop<W: Write>(
                     )));
                 }
                 Ok(WorkerMessage::Catalog(result)) => state.open_catalog(result),
+                Ok(WorkerMessage::Sessions(result)) => state.open_sessions(result),
                 Ok(WorkerMessage::SettingsApplied(result, model, effort, context_window)) => {
                     state.settings_applied(result, model, effort, context_window)
                 }
@@ -321,7 +339,7 @@ fn event_loop<W: Write>(
                         _ => {}
                     }
                     if quitting {
-                        return Ok(());
+                        return Ok(TuiOutcome::Exit);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -329,7 +347,7 @@ fn event_loop<W: Write>(
                     if state.busy {
                         return Err("TUI worker stopped unexpectedly".to_owned());
                     }
-                    return Ok(());
+                    return Ok(TuiOutcome::Exit);
                 }
             }
         }
@@ -377,7 +395,7 @@ fn event_loop<W: Write>(
                     let _ = token.cancel();
                     quitting = true;
                 } else {
-                    return Ok(());
+                    return Ok(TuiOutcome::Exit);
                 }
                 continue;
             }
@@ -390,6 +408,12 @@ fn event_loop<W: Write>(
                     requests
                         .send(WorkerRequest::ApplySettings { model, effort })
                         .map_err(|_| "TUI worker is unavailable".to_owned())?;
+                }
+                continue;
+            }
+            if !state.busy && state.sessions.is_some() {
+                if let Some(session_id) = state.handle_sessions_key(&key) {
+                    return Ok(TuiOutcome::Attach(session_id));
                 }
                 continue;
             }
@@ -445,7 +469,14 @@ fn event_loop<W: Write>(
                                     .map_err(|_| "TUI worker is unavailable".to_owned())?;
                                 continue;
                             }
-                            BuiltinCommand::Exit => return Ok(()),
+                            BuiltinCommand::Session => {
+                                state.sessions = Some(SessionsState::Loading);
+                                requests
+                                    .send(WorkerRequest::Sessions)
+                                    .map_err(|_| "TUI worker is unavailable".to_owned())?;
+                                continue;
+                            }
+                            BuiltinCommand::Exit => return Ok(TuiOutcome::Exit),
                         }
                     }
                     state.reset_skill_picker();
@@ -730,6 +761,7 @@ enum WorkerRequest {
         text: String,
     },
     Catalog,
+    Sessions,
     ApplySettings {
         model: String,
         effort: Option<String>,
@@ -753,6 +785,7 @@ enum WorkerMessage {
         tokens_after: usize,
     },
     Catalog(Result<Vec<ProviderModel>, String>),
+    Sessions(Result<Vec<SessionMetadata>, String>),
     SettingsApplied(Result<(), String>, String, Option<String>, Option<usize>),
     Finished,
 }
@@ -816,6 +849,7 @@ struct ActivityTransition {
 }
 
 struct UiState {
+    active_session_id: String,
     model: String,
     effort: Option<String>,
     context_window: Option<usize>,
@@ -844,17 +878,20 @@ struct UiState {
     skill_picker_focus: usize,
     skill_picker_suppressed: bool,
     settings: Option<SettingsState>,
+    sessions: Option<SessionsState>,
 }
 
 impl UiState {
     fn from_history(
         history: &[SessionHistoryRecord],
+        active_session_id: &str,
         secret: &str,
         model: &str,
         effort: Option<&str>,
         resumed: bool,
     ) -> Self {
         let mut state = Self {
+            active_session_id: active_session_id.to_owned(),
             model: model.to_owned(),
             effort: effort.map(str::to_owned),
             context_window: None,
@@ -883,6 +920,7 @@ impl UiState {
             skill_picker_focus: 0,
             skill_picker_suppressed: false,
             settings: None,
+            sessions: None,
         };
         for record in history {
             state.add_history_record(record);
@@ -1078,6 +1116,69 @@ impl UiState {
             }
             Err(error) => SettingsState::Error(error),
         });
+    }
+    fn open_sessions(&mut self, result: Result<Vec<SessionMetadata>, String>) {
+        if self.sessions.is_none() {
+            return;
+        }
+        self.sessions = Some(match result {
+            Ok(mut sessions) => {
+                sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                SessionsState::Sessions {
+                    sessions,
+                    query: String::new(),
+                    focus: 0,
+                }
+            }
+            Err(error) => SessionsState::Error(error),
+        });
+    }
+    fn handle_sessions_key(&mut self, key: &KeyEvent) -> Option<String> {
+        let active_session_id = self.active_session_id.clone();
+        match self.sessions.as_mut()? {
+            SessionsState::Loading => {
+                if key.code == KeyCode::Esc {
+                    self.sessions = None;
+                }
+            }
+            SessionsState::Error(_) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    self.sessions = None;
+                }
+            }
+            SessionsState::Sessions {
+                sessions,
+                query,
+                focus,
+            } => match key.code {
+                KeyCode::Esc => self.sessions = None,
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    *focus = 0;
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *focus = 0;
+                }
+                KeyCode::Up => *focus = focus.saturating_sub(1),
+                KeyCode::Down => {
+                    let count = filtered_sessions(sessions, query).count();
+                    *focus = (*focus + 1).min(count.saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    let selected_session_id = filtered_sessions(sessions, query)
+                        .nth(*focus)
+                        .map(|session| session.session_id.clone());
+                    if selected_session_id.as_deref() == Some(active_session_id.as_str()) {
+                        self.sessions = None;
+                        return None;
+                    }
+                    return selected_session_id;
+                }
+                _ => {}
+            },
+        }
+        None
     }
     fn settings_applied(
         &mut self,
@@ -1729,6 +1830,7 @@ fn command_names(mut skill_names: Vec<String>) -> Vec<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BuiltinCommand {
     Settings,
+    Session,
     Exit,
 }
 
@@ -1736,6 +1838,7 @@ impl BuiltinCommand {
     fn name(self) -> &'static str {
         match self {
             Self::Settings => "settings",
+            Self::Session => "session",
             Self::Exit => "exit",
         }
     }
@@ -1744,6 +1847,7 @@ impl BuiltinCommand {
 fn builtin_command(input: &str) -> Option<BuiltinCommand> {
     match input.split_whitespace().next()? {
         "/settings" => Some(BuiltinCommand::Settings),
+        "/session" => Some(BuiltinCommand::Session),
         "/exit" => Some(BuiltinCommand::Exit),
         _ => None,
     }
@@ -2103,10 +2207,17 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     if let Some(settings) = &state.settings {
         draw_settings(frame, settings, area);
     }
+    if let Some(sessions) = &state.sessions {
+        draw_sessions(frame, sessions, area, &state.secret);
+    }
 
     // A frame cursor makes Ratatui issue `Show` after every redraw. Only set
     // one while focused.
-    if state.terminal_focused && state.settings.is_none() && !prompt_area.is_empty() && visible > 0
+    if state.terminal_focused
+        && state.settings.is_none()
+        && state.sessions.is_none()
+        && !prompt_area.is_empty()
+        && visible > 0
     {
         let cursor_prefix: String = prompt.chars().take(state.cursor).collect();
         let cursor_rows = wrap_text(&cursor_prefix, prompt_area.width.max(1) as usize);
@@ -2170,6 +2281,35 @@ enum SettingsState {
         focus: usize,
     },
 }
+
+enum SessionsState {
+    Loading,
+    Error(String),
+    Sessions {
+        sessions: Vec<SessionMetadata>,
+        query: String,
+        focus: usize,
+    },
+}
+
+fn filtered_sessions<'a>(
+    sessions: &'a [SessionMetadata],
+    query: &str,
+) -> impl Iterator<Item = &'a SessionMetadata> {
+    let query = query.to_lowercase();
+    sessions.iter().filter(move |session| {
+        session.session_id.to_lowercase().contains(&query)
+            || session
+                .first_message
+                .as_deref()
+                .is_some_and(|message| message.to_lowercase().contains(&query))
+            || session
+                .last_message
+                .as_deref()
+                .is_some_and(|message| message.to_lowercase().contains(&query))
+    })
+}
+
 fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
     let width = area
         .width
@@ -2340,6 +2480,148 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
         }
     };
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, secret: &str) {
+    let width = area
+        .width
+        .saturating_sub(2)
+        .min(SETTINGS_MAX_WIDTH)
+        .max(SETTINGS_MIN_WIDTH.min(area.width));
+    let height = area
+        .height
+        .saturating_sub(2)
+        .min(SETTINGS_MAX_HEIGHT)
+        .max(SETTINGS_MIN_HEIGHT.min(area.height));
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" /session ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines = match sessions {
+        SessionsState::Loading => vec![
+            Line::styled("Loading sessions…", Style::default().fg(Color::Cyan)),
+            Line::raw(""),
+            Line::styled("Esc  cancel", Style::default().fg(Color::DarkGray)),
+        ],
+        SessionsState::Error(error) => vec![
+            Line::styled("Unable to list sessions", Style::default().fg(Color::Red)),
+            Line::raw(""),
+            Line::raw(redact_secret(error, Some(secret))),
+            Line::raw(""),
+            Line::styled("Enter/Esc  close", Style::default().fg(Color::DarkGray)),
+        ],
+        SessionsState::Sessions {
+            sessions,
+            query,
+            focus,
+        } => {
+            let filtered = filtered_sessions(sessions, query).collect::<Vec<_>>();
+            let focus = (*focus).min(filtered.len().saturating_sub(1));
+            let list_rows = inner.height.saturating_sub(4) as usize / 2;
+            let range = selection_range(filtered.len(), focus, list_rows.max(1));
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("Filter  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        if query.is_empty() {
+                            "type to filter…".to_owned()
+                        } else {
+                            redact_secret(query, Some(secret))
+                        },
+                        Style::default().fg(if query.is_empty() {
+                            Color::DarkGray
+                        } else {
+                            Color::White
+                        }),
+                    ),
+                ]),
+                Line::styled(
+                    format!(
+                        "{} sessions{}",
+                        filtered.len(),
+                        if filtered.is_empty() {
+                            ""
+                        } else {
+                            " · ↑/↓ move · Enter attach"
+                        }
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+            if filtered.is_empty() {
+                lines.push(Line::styled(
+                    if sessions.is_empty() {
+                        "No sessions found"
+                    } else {
+                        "No matching sessions"
+                    },
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else {
+                for index in range {
+                    let session = filtered[index];
+                    let selected = index == focus;
+                    let style = if selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    lines.push(Line::styled(
+                        format!(
+                            "{} {} · {}",
+                            if selected { "›" } else { " " },
+                            redact_secret(&session.session_id, Some(secret)),
+                            format_session_time(session.updated_at)
+                        ),
+                        style,
+                    ));
+                    let first = session.first_message.as_deref().unwrap_or("—");
+                    let last = session.last_message.as_deref().unwrap_or("—");
+                    lines.push(Line::styled(
+                        format!(
+                            "  {} → {}",
+                            single_line_preview(&redact_secret(first, Some(secret))),
+                            single_line_preview(&redact_secret(last, Some(secret)))
+                        ),
+                        style,
+                    ));
+                }
+            }
+            lines.push(Line::styled(
+                "Esc  cancel",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
+        inner,
+    );
+}
+
+fn format_session_time(updated_at: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(updated_at);
+    let elapsed_seconds = now.saturating_sub(updated_at) / 1000;
+    match elapsed_seconds {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{}m ago", elapsed_seconds / 60),
+        3_600..=86_399 => format!("{}h ago", elapsed_seconds / 3_600),
+        _ => format!("{}d ago", elapsed_seconds / 86_400),
+    }
 }
 
 fn selection_range(total: usize, focus: usize, max_rows: usize) -> std::ops::Range<usize> {
@@ -3390,7 +3672,8 @@ mod tests {
 
     #[test]
     fn notification_write_failure_does_not_keep_the_tui_busy() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.busy = true;
         state.active_cancel = Some(CancellationToken::new());
         let mut writer = FailingWriter;
@@ -3403,7 +3686,8 @@ mod tests {
 
     #[test]
     fn an_idle_finish_does_not_emit_a_duplicate_notification() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let mut output = Vec::new();
 
         release_finished_turn(&mut output, &mut state);
@@ -3413,8 +3697,9 @@ mod tests {
 
     #[test]
     fn context_status_shows_used_window_and_percentage_in_uniform_gray() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_context(Some(100_000), 80_000);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_context(Some(100_000), 80_000);
 
         assert_eq!(
             context_status_text(&state),
@@ -3439,8 +3724,9 @@ mod tests {
 
     #[test]
     fn context_status_keeps_percentage_consistent_at_capacity() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_context(Some(100_000), 99_001);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_context(Some(100_000), 99_001);
 
         assert_eq!(
             context_status_text(&state),
@@ -3462,7 +3748,7 @@ mod tests {
 
     #[test]
     fn context_status_handles_unknown_window_without_highlighting() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
 
         assert_eq!(context_status_text(&state), "Context: 1/? (?%) ??????????");
         assert_eq!(
@@ -3499,7 +3785,7 @@ mod tests {
 
     #[test]
     fn bottom_console_has_external_margins_without_losing_internal_padding() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let viewport = tui_viewport(Rect::new(0, 0, 80, 14));
         let (chat, _, _, _, console, _) = ui_layout(&state, viewport);
         let content = console_content_area(console);
@@ -3532,7 +3818,8 @@ mod tests {
 
     #[test]
     fn inset_console_width_drives_prompt_rows_and_vertical_navigation() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.input = "x".repeat(71);
         let viewport = tui_viewport(Rect::new(0, 0, 80, 14));
         let console = ui_layout(&state, viewport).4;
@@ -3550,8 +3837,8 @@ mod tests {
 
     #[test]
     fn context_status_is_right_aligned_in_uniform_gray() {
-        let state =
-            UiState::from_history(&[], "secret", "model", None, false).with_context(Some(100), 81);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false)
+            .with_context(Some(100), 81);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(80, 10)).expect("test terminal");
 
@@ -3581,7 +3868,8 @@ mod tests {
 
     #[test]
     fn busy_model_name_and_indicator_share_the_animated_accent_gradient() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.busy = true;
         let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
         let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
@@ -3603,7 +3891,7 @@ mod tests {
 
     #[test]
     fn idle_model_status_has_no_busy_indicator() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
         let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
 
@@ -3693,7 +3981,8 @@ mod tests {
 
     #[test]
     fn console_animation_clock_runs_during_entry_and_survives_active_status_changes() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.set_status("working");
         let epoch = state.console_animation_epoch;
         assert_eq!(
@@ -3758,7 +4047,8 @@ mod tests {
 
     #[test]
     fn prompt_uses_two_cells_of_horizontal_console_padding() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.input = "1234567890123456".to_owned();
         let area = Rect::new(0, 0, 20, 6);
         let mut terminal =
@@ -3790,7 +4080,8 @@ mod tests {
 
     #[test]
     fn prompt_width_reduction_wraps_and_saturates_at_narrow_widths() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.input = "12345".to_owned();
         state.cursor = state.input.chars().count();
         let input_area = Rect::new(3, 2, 6, 6);
@@ -3820,7 +4111,8 @@ mod tests {
 
     #[test]
     fn ready_submission_bypasses_queue_and_is_not_added_twice_when_started() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
 
         state.submit_user("send now");
 
@@ -3839,7 +4131,8 @@ mod tests {
 
     #[test]
     fn busy_submission_remains_queued_until_its_turn_starts() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.busy = true;
 
         state.submit_user("send later");
@@ -3857,8 +4150,9 @@ mod tests {
 
     #[test]
     fn skill_picker_stays_above_a_visible_message_queue() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["release-notes".to_owned()]);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(vec!["release-notes".to_owned()]);
         state.queue_user("next task");
         state.input = "/".to_owned();
         state.input_changed();
@@ -3874,7 +4168,7 @@ mod tests {
 
     #[test]
     fn fresh_sessions_show_the_versioned_gradient_welcome_message() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         assert!(state.welcome_visible);
 
         let line = welcome_line();
@@ -3926,7 +4220,7 @@ mod tests {
         let scaled = welcome_image_layout(Rect::new(0, 0, 60, 25), 6).expect("scaled image fits");
         assert_eq!(scaled.image_size, Size::new(60, 15));
 
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let area = Rect::new(0, 0, 80, 12);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
@@ -3959,7 +4253,7 @@ mod tests {
                 && matches!(span.style.fg, Some(Color::Rgb(..)))
         }));
 
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let area = Rect::new(0, 0, 100, 50);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
@@ -4025,7 +4319,7 @@ mod tests {
 
     #[test]
     fn welcome_renders_version_below_title_with_a_blank_line_before_tagline() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let area = Rect::new(0, 0, 80, 12);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
@@ -4069,7 +4363,7 @@ mod tests {
 
     #[test]
     fn welcome_shows_the_tagline_and_attached_agents_paths() {
-        let state = UiState::from_history(&[], "secret", "model", None, false)
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false)
             .with_attached_agents(vec![
                 "/workspace/AGENTS.md".to_owned(),
                 "/workspace/app/AGENTS.md".to_owned(),
@@ -4101,7 +4395,7 @@ mod tests {
 
     #[test]
     fn resumed_sessions_do_not_show_the_welcome_message() {
-        let state = UiState::from_history(&[], "secret", "model", None, true);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, true);
         assert!(!state.welcome_visible);
     }
 
@@ -4121,7 +4415,14 @@ mod tests {
                 tool_results: Vec::new(),
             },
         ];
-        let state = UiState::from_history(&history, "provider-secret", "model", None, true);
+        let state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            true,
+        );
         assert!(matches!(state.transcript[0], TranscriptItem::User { .. }));
         assert!(matches!(state.transcript[1], TranscriptItem::Assistant(_)));
         assert!(matches!(state.transcript[2], TranscriptItem::Info(_)));
@@ -4144,7 +4445,14 @@ mod tests {
             timestamp: 1,
             message,
         }];
-        let state = UiState::from_history(&history, "provider-secret", "model", None, true);
+        let state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            true,
+        );
         let text = transcript_lines(&state, 80)
             .iter()
             .map(ToString::to_string)
@@ -4171,7 +4479,14 @@ mod tests {
                 tool_results: Vec::new(),
             },
         ];
-        let state = UiState::from_history(&history, "provider-secret", "model", None, true);
+        let state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            true,
+        );
         assert_eq!(
             state
                 .transcript
@@ -4188,7 +4503,14 @@ mod tests {
             timestamp: 1,
             message: ChatMessage::user("hello\nworld".to_owned()),
         }];
-        let state = UiState::from_history(&history, "provider-secret", "model", None, false);
+        let state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
         let lines = transcript_lines(&state, 12);
 
         assert_eq!(UnicodeWidthStr::width(USER_BORDER_GLYPH), 1);
@@ -4211,8 +4533,9 @@ mod tests {
 
     #[test]
     fn attached_skill_highlights_its_trigger_in_the_user_message_without_a_notice_line() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["release-notes".to_owned()]);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(vec!["release-notes".to_owned()]);
         state.add_user("/release-notes v1.2.0", "secret");
         state.mark_latest_user_skill_attached();
 
@@ -4237,7 +4560,14 @@ mod tests {
             timestamp: 1,
             message: ChatMessage::assistant("provider-secret".to_owned(), Vec::new()),
         }];
-        let state = UiState::from_history(&history, "provider-secret", "model", None, false);
+        let state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
         let text = transcript_lines(&state, 80)
             .iter()
             .map(ToString::to_string)
@@ -4252,7 +4582,14 @@ mod tests {
             timestamp: 1,
             message: ChatMessage::user("hello".to_owned()),
         }];
-        let mut state = UiState::from_history(&history, "provider-secret", "model", None, false);
+        let mut state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
         handle_mouse_event(&mut state, MouseEventKind::ScrollUp, 10);
         assert!(!state.auto_scroll);
         assert_eq!(state.scroll, 7);
@@ -4269,7 +4606,14 @@ mod tests {
 
     #[test]
     fn transcript_scrollbar_appears_only_when_the_stream_is_scrolled() {
-        let mut state = UiState::from_history(&[], "provider-secret", "model", None, false);
+        let mut state = UiState::from_history(
+            &[],
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
         state.welcome_visible = false;
         let area = Rect::new(0, 0, 80, 14);
         let chat_area = ui_layout(&state, tui_viewport(area)).0;
@@ -4339,7 +4683,8 @@ mod tests {
 
     #[test]
     fn multiline_input_arrows_move_cursor_between_explicit_and_wrapped_rows() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.input = "ab\ncd\nef".to_owned();
         state.cursor = 1;
 
@@ -4368,7 +4713,14 @@ mod tests {
             timestamp: 1,
             message: ChatMessage::user("hello".to_owned()),
         }];
-        let mut state = UiState::from_history(&history, "provider-secret", "model", None, false);
+        let mut state = UiState::from_history(
+            &history,
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
         state.busy = true;
         state.active_cancel = Some(CancellationToken::new());
         state.apply_event(ProtocolEvent::TurnEnd);
@@ -4389,7 +4741,8 @@ mod tests {
                 message: ChatMessage::assistant("hello".to_owned(), Vec::new()),
             },
         ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let state =
+            UiState::from_history(&history, "current-session", "secret", "model", None, false);
         let lines = transcript_lines(&state, 80);
         assert_eq!(lines.len(), 5);
         assert_eq!(lines[0].to_string(), "▌");
@@ -4422,7 +4775,8 @@ mod tests {
                 ),
             },
         ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let state =
+            UiState::from_history(&history, "current-session", "secret", "model", None, false);
         let text = transcript_lines(&state, 80)[0].to_string();
 
         assert_eq!(text, "✓ cmd  $ pwd");
@@ -4443,7 +4797,8 @@ mod tests {
                 }],
             ),
         }];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let state =
+            UiState::from_history(&history, "current-session", "secret", "model", None, false);
         let line = &transcript_lines(&state, 80)[0];
 
         let text = line.to_string();
@@ -4468,7 +4823,7 @@ mod tests {
         assert_eq!(tool_spinner_frame_at(TOOL_SPINNER_FRAME_DURATION * 2), '-');
         assert_eq!(tool_spinner_frame_at(TOOL_SPINNER_FRAME_DURATION * 3), '\\');
 
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let spinner = running_tool_status(&state);
         assert_eq!(spinner.chars().count(), 1);
         assert!(spinner
@@ -4584,7 +4939,8 @@ mod tests {
 
     #[test]
     fn only_live_cmd_results_start_a_result_sweep() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let succeeded = serde_json::json!({"exit_code": 0});
 
         state.add_tool_result("historic", "cmd", succeeded.clone());
@@ -4645,7 +5001,8 @@ mod tests {
 
     #[test]
     fn live_failed_cmd_sweep_keeps_the_final_status_text() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let result = serde_json::json!({"exit_code": 1});
         state.add_live_tool_result("failed", "cmd", result.clone());
 
@@ -4722,7 +5079,8 @@ mod tests {
                     ),
                 },
             ];
-            let state = UiState::from_history(&history, "secret", "model", None, false);
+            let state =
+                UiState::from_history(&history, "current-session", "secret", "model", None, false);
             assert_eq!(transcript_lines(&state, 80)[0].to_string(), expected);
         }
     }
@@ -4752,7 +5110,8 @@ mod tests {
                 ),
             },
         ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let state =
+            UiState::from_history(&history, "current-session", "secret", "model", None, false);
         let text = transcript_lines(&state, 200)[0].to_string();
         assert!(text.contains(&format!("$ {}…", "a".repeat(100))));
         assert!(!text.contains(&"a".repeat(101)));
@@ -4797,7 +5156,8 @@ mod tests {
                 ),
             },
         ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let state =
+            UiState::from_history(&history, "current-session", "secret", "model", None, false);
         let lines = transcript_lines(&state, 200);
         assert_eq!(lines[0].to_string(), "✓ cmd  $ first");
         assert_eq!(lines[2].to_string(), "✓ cmd  $ second");
@@ -4818,7 +5178,7 @@ mod tests {
                 "call-1",
                 "{\"command\":\"pwd\"}",
                 None,
-                &UiState::from_history(&[], "secret", "model", None, false)
+                &UiState::from_history(&[], "current-session", "secret", "model", None, false)
             )[0]
             .1
             .fg,
@@ -4848,8 +5208,9 @@ mod tests {
 
     #[test]
     fn draw_renders_an_active_skill_trigger_in_cyan() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["release-notes".to_owned()]);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(vec!["release-notes".to_owned()]);
         state.input = "/release-notes v1.2.0".to_owned();
         state.cursor = state.input.chars().count();
 
@@ -4876,7 +5237,8 @@ mod tests {
     #[test]
     fn main_agent_status_omits_activity_animation_on_idle_and_busy_states() {
         let mut state =
-            UiState::from_history(&[], "secret", "model", None, false).with_context(Some(100), 81);
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_context(Some(100), 81);
         let area = Rect::new(0, 0, 80, 10);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
@@ -4919,7 +5281,8 @@ mod tests {
 
     #[test]
     fn terminal_focus_events_control_cursor_visibility() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
 
         assert!(handle_terminal_focus_event(&mut state, &Event::FocusLost));
         assert!(!state.terminal_focused);
@@ -4934,7 +5297,8 @@ mod tests {
 
     #[test]
     fn unfocused_busy_redraw_keeps_the_hardware_cursor_hidden() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.set_status("working");
         state.set_busy(true);
         state.terminal_focused = false;
@@ -4953,7 +5317,8 @@ mod tests {
 
     #[test]
     fn cjk_input_keeps_the_terminal_cursor_in_the_prompt_without_resetting_activity() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.set_status("working");
         state.busy = true;
         state.input = "한글".to_owned();
@@ -4989,7 +5354,7 @@ mod tests {
 
     #[test]
     fn transcript_and_console_are_separated_by_one_blank_row() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         let area = Rect::new(0, 0, 80, 10);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
@@ -5011,7 +5376,8 @@ mod tests {
     #[test]
     fn prompt_surface_has_a_subtle_dark_background_when_idle_or_busy() {
         for busy in [false, true] {
-            let mut state = UiState::from_history(&[], "secret", "model", None, false);
+            let mut state =
+                UiState::from_history(&[], "current-session", "secret", "model", None, false);
             state.input = "prompt".to_owned();
             state.cursor = state.input.chars().count();
             state.busy = busy;
@@ -5089,7 +5455,8 @@ mod tests {
 
     #[test]
     fn input_prompt_wraps_to_multiple_rows_when_long() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.input = "abcdefghij".to_owned();
         // width 5: the input wraps across multiple rows without a prompt marker.
         let rows = input_visible_rows(&state, 5);
@@ -5128,7 +5495,8 @@ mod tests {
 
     #[test]
     fn shift_enter_renders_the_cursor_on_the_new_input_row() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.input = "beforeafter".to_owned();
         state.cursor = 6;
         insert_at_cursor(&mut state.input, &mut state.cursor, '\n');
@@ -5187,7 +5555,8 @@ mod tests {
             },
         ];
 
-        let state = UiState::from_history(&history, "secret", "model", None, false);
+        let state =
+            UiState::from_history(&history, "current-session", "secret", "model", None, false);
         let lines = transcript_lines(&state, 200);
         assert_eq!(
             lines.len(),
@@ -5199,13 +5568,14 @@ mod tests {
     }
     #[test]
     fn clipped_slash_picker_uses_its_actual_item_rows_for_the_focused_item() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(
-                ["alpha", "beta", "build", "charlie", "deploy", "doctor"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
-            );
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(
+                    ["alpha", "beta", "build", "charlie", "deploy", "doctor"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                );
         state.input = "/".to_owned();
         state.input_changed();
         state.skill_picker_focus = 5;
@@ -5241,14 +5611,190 @@ mod skill_picker_tests {
     fn built_in_commands_share_the_slash_catalog_without_becoming_skills() {
         assert_eq!(
             command_names(vec!["release-notes".to_owned(), "settings".to_owned()]),
-            vec!["exit", "release-notes", "settings"]
+            vec!["exit", "release-notes", "session", "settings"]
         );
         assert_eq!(
             builtin_command("/settings ignored arguments"),
             Some(BuiltinCommand::Settings)
         );
         assert_eq!(builtin_command("  /exit  "), Some(BuiltinCommand::Exit));
+        assert_eq!(builtin_command("/session"), Some(BuiltinCommand::Session));
         assert_eq!(builtin_command("/settings-extra"), None);
+    }
+
+    fn session(id: &str, first: Option<&str>, last: Option<&str>) -> SessionMetadata {
+        SessionMetadata {
+            record_type: "session_metadata",
+            session_id: id.to_owned(),
+            created_at: 1,
+            updated_at: 2,
+            first_message: first.map(str::to_owned),
+            last_message: last.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn session_overlay_filters_ids_and_message_previews_case_insensitively() {
+        let sessions = vec![
+            session("alpha-id", Some("First request"), Some("Final answer")),
+            session("beta-id", Some("Deploy release"), Some("Complete")),
+        ];
+
+        assert_eq!(
+            filtered_sessions(&sessions, "ALPHA")
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-id"]
+        );
+        assert_eq!(
+            filtered_sessions(&sessions, "REQUEST")
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-id"]
+        );
+        assert_eq!(
+            filtered_sessions(&sessions, "complete")
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta-id"]
+        );
+    }
+
+    #[test]
+    fn open_sessions_orders_by_updated_at_descending() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        let mut oldest = session("oldest", None, None);
+        oldest.updated_at = 10;
+        let mut newest = session("newest", None, None);
+        newest.updated_at = 30;
+        let mut middle = session("middle", None, None);
+        middle.updated_at = 20;
+        state.sessions = Some(SessionsState::Loading);
+
+        state.open_sessions(Ok(vec![oldest, newest, middle]));
+
+        let SessionsState::Sessions { sessions, .. } =
+            state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newest", "middle", "oldest"]
+        );
+    }
+
+    #[test]
+    fn escape_closes_loaded_session_overlay() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+        state.open_sessions(Ok(vec![session("other-session", None, None)]));
+
+        state.handle_sessions_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(state.sessions.is_none());
+    }
+
+    #[test]
+    fn escape_during_loading_stays_closed_after_sessions_arrive() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+
+        state.handle_sessions_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.sessions.is_none());
+
+        state.open_sessions(Ok(vec![session("other-session", None, None)]));
+        assert!(state.sessions.is_none());
+    }
+
+    #[test]
+    fn enter_on_active_session_closes_overlay_without_attaching() {
+        let mut state =
+            UiState::from_history(&[], "active-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+        state.open_sessions(Ok(vec![session("active-session", None, None)]));
+
+        assert_eq!(
+            state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        assert!(state.sessions.is_none());
+    }
+
+    #[test]
+    fn session_overlay_focus_clamps_and_enter_requests_attach() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+        state.open_sessions(Ok(vec![
+            session("older", None, None),
+            session("newer", None, None),
+        ]));
+
+        state.handle_sessions_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_sessions_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let SessionsState::Sessions { focus, .. } =
+            state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert_eq!(*focus, 1);
+
+        state.handle_sessions_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        state.handle_sessions_key(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let SessionsState::Sessions { focus, .. } =
+            state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert_eq!(*focus, 0);
+        assert_eq!(
+            state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some("older".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_session_overlay_has_no_attach_target() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+        state.open_sessions(Ok(Vec::new()));
+
+        assert_eq!(
+            state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        let SessionsState::Sessions {
+            sessions, focus, ..
+        } = state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(*focus, 0);
+
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_sessions(frame, state.sessions.as_ref().unwrap(), frame.area(), ""))
+            .expect("draw session picker");
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("No sessions found"));
     }
 
     #[test]
@@ -5261,7 +5807,14 @@ mod skill_picker_tests {
 
     #[test]
     fn model_selection_uses_advertised_efforts_and_preserves_the_current_choice() {
-        let mut state = UiState::from_history(&[], "secret", "old", Some("medium"), false);
+        let mut state = UiState::from_history(
+            &[],
+            "current-session",
+            "secret",
+            "old",
+            Some("medium"),
+            false,
+        );
         state.open_catalog(Ok(vec![ProviderModel {
             id: "openai/gpt-5.6-sol".to_owned(),
             efforts: Some(vec![
@@ -5292,7 +5845,7 @@ mod skill_picker_tests {
 
     #[test]
     fn effort_default_selection_does_not_shift_to_the_first_advertised_effort() {
-        let mut state = UiState::from_history(&[], "secret", "old", None, false);
+        let mut state = UiState::from_history(&[], "current-session", "secret", "old", None, false);
         state.open_catalog(Ok(vec![ProviderModel {
             id: "model".to_owned(),
             efforts: Some(vec!["high".to_owned(), "low".to_owned()]),
@@ -5307,7 +5860,8 @@ mod skill_picker_tests {
 
     #[test]
     fn reasoning_indicator_changes_to_complete_and_stays_dark_gray() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.show_thinking();
 
         let active_lines = transcript_lines(&state, 80);
@@ -5337,8 +5891,9 @@ mod skill_picker_tests {
 
     #[test]
     fn slash_picker_focuses_the_top_match_and_moves_within_filtered_results() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(skill_names());
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(skill_names());
         state.input = "/b".to_owned();
         state.input_changed();
 
@@ -5359,9 +5914,10 @@ mod skill_picker_tests {
 
     #[test]
     fn focused_builtins_are_distinguished_from_skills() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(command_names(skill_names()));
-        state.input = "/se".to_owned();
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(command_names(skill_names()));
+        state.input = "/set".to_owned();
         state.input_changed();
         assert_eq!(
             state.focused_builtin_command(),
@@ -5375,8 +5931,9 @@ mod skill_picker_tests {
 
     #[test]
     fn selecting_the_focused_skill_leaves_the_completed_command_ready_to_send() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(skill_names());
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(skill_names());
         state.input = "/b".to_owned();
         state.input_changed();
         state.move_skill_picker(true);
@@ -5396,8 +5953,9 @@ mod skill_picker_tests {
 
     #[test]
     fn slash_picker_overlays_without_reflowing_the_transcript_when_match_count_changes() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(skill_names());
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(skill_names());
         let area = Rect::new(0, 0, 40, 16);
         state.transcript = (0..20)
             .map(|index| TranscriptItem::Assistant(format!("message {index}")))
@@ -5447,8 +6005,9 @@ mod skill_picker_tests {
 
     #[test]
     fn slash_picker_is_rendered_immediately_above_the_input() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(skill_names());
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(skill_names());
         state.input = "/".to_owned();
         state.input_changed();
         let mut terminal =
@@ -5499,8 +6058,9 @@ mod skill_picker_tests {
 
     #[test]
     fn slash_picker_renders_count_with_bold_focus_on_the_picker_surface() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(skill_names());
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false)
+                .with_skill_names(skill_names());
         state.input = "/".to_owned();
         state.input_changed();
         let mut terminal =
