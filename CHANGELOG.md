@@ -6,6 +6,13 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.4](https://github.com/jwoo0122/lucy/compare/v1.8.3...v1.8.4) - 2026-07-25
+
+### Fixed
+
+- *(tui)* add subtle prompt background
+- *(tui)* remove prompt background effects
+
 ## [1.8.3](https://github.com/jwoo0122/lucy/compare/v1.8.2...v1.8.3) - 2026-07-25
 
 ### Fixed
