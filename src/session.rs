@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -41,173 +41,6 @@ impl std::error::Error for SessionError {}
 impl From<io::Error> for SessionError {
     fn from(_error: io::Error) -> Self {
         Self::new("session storage error")
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ChildSessionStatus {
-    Running,
-    Completed,
-    Failed,
-    Canceled,
-    Interrupted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "record")]
-enum ChildSessionRecord {
-    #[serde(rename = "subagent_session")]
-    Session {
-        version: u8,
-        session_id: String,
-        session_kind: String,
-        parent_session_id: String,
-        cwd: String,
-        boot_system_prompt: String,
-        llm: LlmSettings,
-        task: String,
-    },
-    #[serde(rename = "message")]
-    Message {
-        timestamp: u64,
-        message: ChatMessage,
-    },
-    #[serde(rename = "status")]
-    Status {
-        timestamp: u64,
-        status: ChildSessionStatus,
-        reason: Option<String>,
-        result: Option<Value>,
-    },
-}
-
-#[derive(Debug)]
-pub struct ChildSession {
-    pub id: String,
-    pub path: PathBuf,
-    pub parent_session_id: String,
-    pub cwd: PathBuf,
-    pub boot_system_prompt: String,
-    pub llm: LlmSettings,
-    pub task: String,
-    pub messages: Vec<ChatMessage>,
-    pub status: ChildSessionStatus,
-    secret: Option<String>,
-}
-
-impl ChildSession {
-    pub fn create(
-        home: &Path,
-        parent_session_id: &str,
-        cwd: &Path,
-        boot_system_prompt: String,
-        llm: LlmSettings,
-        task: String,
-        secret: Option<&str>,
-    ) -> Result<Self, SessionError> {
-        let cwd = fs::canonicalize(cwd)
-            .map_err(|_| SessionError::new("unable to resolve subagent cwd"))?;
-        let directory = sessions_dir(home);
-        ensure_private_dir(&lucy_dir(home))?;
-        ensure_private_dir(&directory)?;
-        let id = format!("subagent-{}", new_session_id());
-        let path = directory.join(format!("{id}.jsonl"));
-        let record = ChildSessionRecord::Session {
-            version: 1,
-            session_id: id.clone(),
-            session_kind: "subagent".to_owned(),
-            parent_session_id: parent_session_id.to_owned(),
-            cwd: cwd.display().to_string(),
-            boot_system_prompt: boot_system_prompt.clone(),
-            llm: llm.clone(),
-            task: task.clone(),
-        };
-        if let Some(secret) = secret {
-            if child_record_contains_secret(&record, secret) {
-                return Err(SessionError::new("subagent session record rejected"));
-            }
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&path)
-            .map_err(|_| SessionError::new("unable to create subagent session file"))?;
-        ensure_private_file(&path)?;
-        write_json_record(&mut file, &record)?;
-        write_json_record(
-            &mut file,
-            &ChildSessionRecord::Status {
-                timestamp: now(),
-                status: ChildSessionStatus::Running,
-                reason: None,
-                result: None,
-            },
-        )?;
-        Ok(Self {
-            id,
-            path,
-            parent_session_id: parent_session_id.to_owned(),
-            cwd,
-            boot_system_prompt,
-            llm,
-            task,
-            messages: Vec::new(),
-            status: ChildSessionStatus::Running,
-            secret: secret.map(str::to_owned),
-        })
-    }
-
-    pub fn append_message(&mut self, message: ChatMessage) -> Result<(), SessionError> {
-        let record = ChildSessionRecord::Message {
-            timestamp: now(),
-            message: message.clone(),
-        };
-        if self
-            .secret
-            .as_deref()
-            .is_some_and(|secret| child_record_contains_secret(&record, secret))
-        {
-            return Err(SessionError::new("subagent session record rejected"));
-        }
-        let mut file = open_session_for_append(&self.path)?;
-        write_json_record(&mut file, &record)?;
-        self.messages.push(message);
-        Ok(())
-    }
-
-    pub fn append_status(
-        &mut self,
-        status: ChildSessionStatus,
-        reason: Option<String>,
-        result: Option<Value>,
-    ) -> Result<(), SessionError> {
-        let record = ChildSessionRecord::Status {
-            timestamp: now(),
-            status,
-            reason,
-            result,
-        };
-        if self
-            .secret
-            .as_deref()
-            .is_some_and(|secret| child_record_contains_secret(&record, secret))
-        {
-            return Err(SessionError::new("subagent session record rejected"));
-        }
-        let mut file = open_session_for_append(&self.path)?;
-        write_json_record(&mut file, &record)?;
-        self.status = status;
-        Ok(())
-    }
-
-    pub fn provider_messages(&self) -> Vec<ChatMessage> {
-        let mut messages = Vec::with_capacity(self.messages.len() + 1);
-        messages.push(ChatMessage::system(self.boot_system_prompt.clone()));
-        messages.extend(self.messages.iter().cloned());
-        messages
     }
 }
 
@@ -255,10 +88,19 @@ enum SessionRecord {
         first_kept_message: usize,
         tokens_before: usize,
     },
+    // These records were written by Lucy versions that owned internal workers.
+    // Keep parsing them so the ordinary named session remains resumable, but do
+    // not reconstruct or expose the removed worker relationship.
     #[serde(rename = "background_result_pending")]
-    BackgroundResultPending(BackgroundResultPending),
+    LegacyPendingRecord {
+        #[serde(flatten)]
+        fields: HashMap<String, Value>,
+    },
     #[serde(rename = "background_result_delivered")]
-    BackgroundResultDelivered(BackgroundResultDelivered),
+    LegacyDeliveredRecord {
+        #[serde(flatten)]
+        fields: HashMap<String, Value>,
+    },
 }
 
 /// A bounded, secret-safe observation retained for a canceled tool call.
@@ -296,38 +138,6 @@ pub struct CompactionRecord {
     pub tokens_before: usize,
 }
 
-pub const BACKGROUND_RESULT_TOOL_NAME: &str = "background_result";
-
-/// The parent-owned source of truth for one terminal child result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BackgroundResultPending {
-    pub timestamp: u64,
-    pub completion_id: String,
-    pub task_id: String,
-    pub child_session_id: String,
-    pub task: String,
-    pub status: ChildSessionStatus,
-    pub result: Value,
-    pub completed_at: u64,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BackgroundResultDelivery {
-    Synthetic,
-    WaitSubagent,
-}
-
-/// An append-only commit marker. Its history position is the provider-context
-/// position at which an automatic synthetic observation is materialized.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BackgroundResultDelivered {
-    pub timestamp: u64,
-    pub completion_id: String,
-    pub logical_turn_id: String,
-    pub delivery: BackgroundResultDelivery,
-}
-
 /// The ordered, replayable records after a session header.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "record")]
@@ -354,10 +164,6 @@ pub enum SessionHistoryRecord {
     },
     #[serde(rename = "compaction")]
     Compaction(CompactionRecord),
-    #[serde(rename = "background_result_pending")]
-    BackgroundResultPending(BackgroundResultPending),
-    #[serde(rename = "background_result_delivered")]
-    BackgroundResultDelivered(BackgroundResultDelivered),
 }
 
 #[derive(Debug, Clone)]
@@ -637,52 +443,14 @@ impl Session {
                         tokens_before,
                     }));
                 }
-                SessionRecord::BackgroundResultPending(pending) => {
+                SessionRecord::LegacyPendingRecord { .. }
+                | SessionRecord::LegacyDeliveredRecord { .. } => {
                     if header.is_none() {
                         return Err(session_error(
-                            "background result precedes header",
+                            "legacy session record precedes header",
                             active_secret.as_deref(),
                         ));
                     }
-                    if history.iter().any(|record| {
-                        matches!(
-                            record,
-                            SessionHistoryRecord::BackgroundResultPending(existing)
-                                if existing.completion_id == pending.completion_id
-                        )
-                    }) {
-                        return Err(session_error(
-                            "duplicate pending background result",
-                            active_secret.as_deref(),
-                        ));
-                    }
-                    updated_at = Some(pending.timestamp);
-                    history.push(SessionHistoryRecord::BackgroundResultPending(pending));
-                }
-                SessionRecord::BackgroundResultDelivered(delivered) => {
-                    if header.is_none()
-                        || !history.iter().any(|record| {
-                            matches!(
-                                record,
-                                SessionHistoryRecord::BackgroundResultPending(pending)
-                                    if pending.completion_id == delivered.completion_id
-                            )
-                        })
-                        || history.iter().any(|record| {
-                            matches!(
-                                record,
-                                SessionHistoryRecord::BackgroundResultDelivered(existing)
-                                    if existing.completion_id == delivered.completion_id
-                            )
-                        })
-                    {
-                        return Err(session_error(
-                            "invalid delivered background result",
-                            active_secret.as_deref(),
-                        ));
-                    }
-                    updated_at = Some(delivered.timestamp);
-                    history.push(SessionHistoryRecord::BackgroundResultDelivered(delivered));
                 }
             }
         }
@@ -803,122 +571,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn append_background_result_pending(
-        &mut self,
-        mut pending: BackgroundResultPending,
-    ) -> Result<bool, SessionError> {
-        if let Some(existing) = self.history.iter().find_map(|record| match record {
-            SessionHistoryRecord::BackgroundResultPending(existing)
-                if existing.completion_id == pending.completion_id =>
-            {
-                Some(existing)
-            }
-            _ => None,
-        }) {
-            let same_completion = existing.task_id == pending.task_id
-                && existing.child_session_id == pending.child_session_id
-                && existing.task == pending.task
-                && existing.status == pending.status
-                && existing.result == pending.result
-                && existing.completed_at == pending.completed_at;
-            return if same_completion {
-                Ok(false)
-            } else {
-                Err(SessionError::new("background result identity collision"))
-            };
-        }
-        pending.timestamp = now();
-        let record = SessionRecord::BackgroundResultPending(pending.clone());
-        if self
-            .secret
-            .as_deref()
-            .is_some_and(|secret| record_contains_secret(&record, secret))
-        {
-            return Err(session_record_rejected(
-                self.secret.as_deref().unwrap_or_default(),
-            ));
-        }
-        let mut file = open_session_for_append(&self.path)?;
-        write_record(&mut file, &record)?;
-        self.updated_at = pending.timestamp;
-        self.history
-            .push(SessionHistoryRecord::BackgroundResultPending(pending));
-        Ok(true)
-    }
-
-    pub fn append_background_result_delivered(
-        &mut self,
-        completion_id: &str,
-        logical_turn_id: String,
-        delivery: BackgroundResultDelivery,
-    ) -> Result<bool, SessionError> {
-        let has_pending = self.history.iter().any(|record| {
-            matches!(
-                record,
-                SessionHistoryRecord::BackgroundResultPending(pending)
-                    if pending.completion_id == completion_id
-            )
-        });
-        if !has_pending {
-            return Err(SessionError::new("background result has no pending record"));
-        }
-        if self.history.iter().any(|record| {
-            matches!(
-                record,
-                SessionHistoryRecord::BackgroundResultDelivered(existing)
-                    if existing.completion_id == completion_id
-            )
-        }) {
-            return Ok(false);
-        }
-        let delivered = BackgroundResultDelivered {
-            timestamp: now(),
-            completion_id: completion_id.to_owned(),
-            logical_turn_id,
-            delivery,
-        };
-        let record = SessionRecord::BackgroundResultDelivered(delivered.clone());
-        if self
-            .secret
-            .as_deref()
-            .is_some_and(|secret| record_contains_secret(&record, secret))
-        {
-            return Err(session_record_rejected(
-                self.secret.as_deref().unwrap_or_default(),
-            ));
-        }
-        let mut file = open_session_for_append(&self.path)?;
-        write_record(&mut file, &record)?;
-        self.updated_at = delivered.timestamp;
-        self.history
-            .push(SessionHistoryRecord::BackgroundResultDelivered(delivered));
-        Ok(true)
-    }
-
-    pub fn undelivered_background_results(&self) -> Vec<BackgroundResultPending> {
-        let delivered = self
-            .history
-            .iter()
-            .filter_map(|record| match record {
-                SessionHistoryRecord::BackgroundResultDelivered(delivered) => {
-                    Some(delivered.completion_id.as_str())
-                }
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        self.history
-            .iter()
-            .filter_map(|record| match record {
-                SessionHistoryRecord::BackgroundResultPending(pending)
-                    if !delivered.contains(pending.completion_id.as_str()) =>
-                {
-                    Some(pending.clone())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Append a summary boundary without deleting the historical records that
     /// preceded it. `first_kept_message` counts ordinary message records from
     /// the start of the session, excluding the boot system prompt.
@@ -980,7 +632,6 @@ impl Session {
         );
         let mut declared_tool_calls = HashSet::new();
         let mut completed_tool_calls = HashSet::new();
-        let mut pending_background_results = std::collections::HashMap::new();
         messages.push(ChatMessage::system(self.boot_system_prompt.clone()));
         if let Some(compaction) = latest_compaction {
             messages.push(compaction_summary_message(&compaction.summary));
@@ -1029,24 +680,9 @@ impl Session {
                         completed_tool_calls.insert(observation.id.clone());
                     }
                 }
-                SessionHistoryRecord::BackgroundResultPending(pending) => {
-                    pending_background_results
-                        .insert(pending.completion_id.clone(), pending.clone());
-                }
-                SessionHistoryRecord::BackgroundResultDelivered(delivered)
-                    if delivered.delivery == BackgroundResultDelivery::Synthetic
-                        && first_kept_message
-                            .is_none_or(|boundary| message_ordinal >= boundary) =>
-                {
-                    if let Some(pending) = pending_background_results.get(&delivered.completion_id)
-                    {
-                        messages.extend(background_result_messages(pending));
-                    }
-                }
                 SessionHistoryRecord::ProviderSettings { .. }
                 | SessionHistoryRecord::Interruption { .. }
-                | SessionHistoryRecord::Compaction(_)
-                | SessionHistoryRecord::BackgroundResultDelivered(_) => {}
+                | SessionHistoryRecord::Compaction(_) => {}
             }
         }
         messages
@@ -1326,19 +962,8 @@ fn record_contains_secret(record: &SessionRecord, secret: &str) -> bool {
                 || first_kept_message.to_string().contains(secret)
                 || tokens_before.to_string().contains(secret)
         }
-        SessionRecord::BackgroundResultPending(pending) => {
-            pending.timestamp.to_string().contains(secret)
-                || pending.completion_id.contains(secret)
-                || pending.task_id.contains(secret)
-                || pending.child_session_id.contains(secret)
-                || pending.task.contains(secret)
-                || json_value_contains_secret(&pending.result, secret)
-                || pending.completed_at.to_string().contains(secret)
-        }
-        SessionRecord::BackgroundResultDelivered(delivered) => {
-            delivered.timestamp.to_string().contains(secret)
-                || delivered.completion_id.contains(secret)
-                || delivered.logical_turn_id.contains(secret)
+        SessionRecord::LegacyPendingRecord { .. } | SessionRecord::LegacyDeliveredRecord { .. } => {
+            false
         }
     }
 }
@@ -1441,44 +1066,6 @@ fn write_json_record<T: Serialize>(file: &mut File, record: &T) -> Result<(), Se
 
 fn write_record(file: &mut File, record: &SessionRecord) -> Result<(), SessionError> {
     write_json_record(file, record)
-}
-
-fn child_record_contains_secret<T: Serialize>(record: &T, secret: &str) -> bool {
-    !secret.is_empty()
-        && serde_json::to_vec(record)
-            .ok()
-            .is_some_and(|serialized| bytes_contain_secret(&serialized, secret))
-}
-
-fn background_result_messages(pending: &BackgroundResultPending) -> [ChatMessage; 2] {
-    let call_id = format!("background-result-{}", pending.completion_id);
-    let arguments = serde_json::json!({
-        "completion_id": pending.completion_id,
-        "task_id": pending.task_id,
-        "child_session_id": pending.child_session_id,
-    })
-    .to_string();
-    let content = serde_json::json!({
-        "completion_id": pending.completion_id,
-        "task_id": pending.task_id,
-        "child_session_id": pending.child_session_id,
-        "task": pending.task,
-        "status": pending.status,
-        "result": pending.result,
-        "completed_at": pending.completed_at,
-    })
-    .to_string();
-    [
-        ChatMessage::assistant(
-            String::new(),
-            vec![ChatToolCall {
-                id: call_id.clone(),
-                name: BACKGROUND_RESULT_TOOL_NAME.to_owned(),
-                arguments,
-            }],
-        ),
-        ChatMessage::tool(call_id, BACKGROUND_RESULT_TOOL_NAME.to_owned(), content),
-    ]
 }
 
 const COMPACTION_SUMMARY_PREFIX: &str = "<context_compaction>\nThe earlier conversation was compacted. Treat the following summary as authoritative context for the continued turn.\n\n";
@@ -1866,124 +1453,6 @@ mod tests {
     }
 
     #[test]
-    fn background_results_persist_and_materialize_once_at_delivery_position() {
-        let home = temporary_home();
-        let cwd = std::env::current_dir().expect("cwd");
-        let llm = LlmSettings {
-            base_url: "http://localhost".to_owned(),
-            model: "model".to_owned(),
-            api_key_env: "LUCY_BACKGROUND_RESULT_KEY".to_owned(),
-            effort: None,
-        };
-        let mut session = Session::create_with_secret(&home, &cwd, "prompt".to_owned(), llm, None)
-            .expect("create");
-        session
-            .append_message(ChatMessage::user("original request".to_owned()))
-            .expect("user");
-        let pending = BackgroundResultPending {
-            timestamp: 0,
-            completion_id: "completion-1".to_owned(),
-            task_id: "subagent-1".to_owned(),
-            child_session_id: "child-1".to_owned(),
-            task: "inspect".to_owned(),
-            status: ChildSessionStatus::Completed,
-            result: serde_json::json!({"output":"done"}),
-            completed_at: 10,
-        };
-        assert!(session
-            .append_background_result_pending(pending.clone())
-            .expect("pending"));
-        let undelivered = session.undelivered_background_results();
-        assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0].completion_id, pending.completion_id);
-        assert_eq!(undelivered[0].result, pending.result);
-        let mut collision = pending.clone();
-        collision.child_session_id = "different-child".to_owned();
-        assert!(session
-            .append_background_result_pending(collision)
-            .expect_err("identity collision rejected")
-            .to_string()
-            .contains("identity collision"));
-        assert!(session
-            .append_background_result_delivered(
-                "completion-1",
-                "turn-1".to_owned(),
-                BackgroundResultDelivery::Synthetic,
-            )
-            .expect("delivered"));
-        assert!(!session
-            .append_background_result_delivered(
-                "completion-1",
-                "turn-1".to_owned(),
-                BackgroundResultDelivery::Synthetic,
-            )
-            .expect("duplicate is idempotent"));
-        session
-            .append_message(ChatMessage::user("later request".to_owned()))
-            .expect("later user");
-
-        let messages = session.provider_messages();
-        let synthetic = messages
-            .iter()
-            .position(|message| {
-                message.role == "assistant"
-                    && message
-                        .tool_calls
-                        .first()
-                        .is_some_and(|call| call.name == BACKGROUND_RESULT_TOOL_NAME)
-            })
-            .expect("synthetic call");
-        assert_eq!(messages[synthetic + 1].role, "tool");
-        assert_eq!(
-            messages[synthetic + 1].name.as_deref(),
-            Some(BACKGROUND_RESULT_TOOL_NAME)
-        );
-        assert_eq!(
-            messages[synthetic + 2].content.as_deref(),
-            Some("later request")
-        );
-        assert!(session.undelivered_background_results().is_empty());
-
-        let resumed = Session::resume(&home, &session.id).expect("resume");
-        assert_eq!(resumed.provider_messages(), messages);
-        assert!(resumed.undelivered_background_results().is_empty());
-        fs::remove_dir_all(home).expect("cleanup");
-    }
-
-    #[test]
-    fn background_result_rejects_a_secret_without_appending() {
-        let home = temporary_home();
-        let cwd = std::env::current_dir().expect("cwd");
-        let secret = "provider-secret";
-        let llm = LlmSettings {
-            base_url: "http://localhost".to_owned(),
-            model: "model".to_owned(),
-            api_key_env: "LUCY_BACKGROUND_RESULT_SECRET".to_owned(),
-            effort: None,
-        };
-        let mut session =
-            Session::create_with_secret(&home, &cwd, "prompt".to_owned(), llm, Some(secret))
-                .expect("create");
-        let before = fs::read_to_string(&session.path).expect("before");
-        let error = session
-            .append_background_result_pending(BackgroundResultPending {
-                timestamp: 0,
-                completion_id: "completion-1".to_owned(),
-                task_id: "subagent-1".to_owned(),
-                child_session_id: "child-1".to_owned(),
-                task: "inspect".to_owned(),
-                status: ChildSessionStatus::Completed,
-                result: serde_json::json!({"output":secret}),
-                completed_at: 10,
-            })
-            .expect_err("secret result rejected");
-        assert!(error.to_string().contains("session record rejected"));
-        assert_eq!(fs::read_to_string(&session.path).expect("after"), before);
-        assert!(session.undelivered_background_results().is_empty());
-        fs::remove_dir_all(home).expect("cleanup");
-    }
-
-    #[test]
     fn reasoning_details_round_trip_through_session_and_provider_history() {
         let home = temporary_home();
         let cwd = std::env::current_dir().expect("cwd");
@@ -2041,55 +1510,6 @@ mod tests {
             .append_message(assistant)
             .expect_err("secret reasoning details");
         assert_eq!(error.to_string(), "session record rejected");
-        fs::remove_dir_all(home).expect("remove temp home");
-    }
-
-    #[test]
-    fn child_session_persists_parent_link_transcript_and_terminal_status() {
-        let home = temporary_home();
-        let cwd = std::env::current_dir().expect("cwd");
-        let key_env = format!("LUCY_CHILD_SESSION_KEY_{}", std::process::id());
-        std::env::set_var(&key_env, "provider-secret");
-        let llm = LlmSettings {
-            base_url: "http://localhost".to_owned(),
-            model: "model".to_owned(),
-            api_key_env: key_env.clone(),
-            effort: Some("medium".to_owned()),
-        };
-        let mut child = ChildSession::create(
-            &home,
-            "parent-session",
-            &cwd,
-            "boot context".to_owned(),
-            llm,
-            "inspect the worker".to_owned(),
-            Some("provider-secret"),
-        )
-        .expect("child session");
-        child
-            .append_message(ChatMessage::user("inspect the worker".to_owned()))
-            .expect("task message");
-        child
-            .append_message(ChatMessage::assistant("done".to_owned(), Vec::new()))
-            .expect("assistant message");
-        child
-            .append_status(
-                ChildSessionStatus::Completed,
-                None,
-                Some(serde_json::json!({"output":"done"})),
-            )
-            .expect("status");
-
-        let raw = fs::read_to_string(&child.path).expect("child JSONL");
-        assert!(raw.contains("\"record\":\"subagent_session\""));
-        assert!(raw.contains("\"parent_session_id\":\"parent-session\""));
-        assert!(raw.contains("\"session_kind\":\"subagent\""));
-        assert!(raw.contains("\"status\":\"completed\""));
-        assert!(!raw.contains("provider-secret"));
-        assert_eq!(child.provider_messages().len(), 3);
-        assert_eq!(child.status, ChildSessionStatus::Completed);
-
-        std::env::remove_var(key_env);
         fs::remove_dir_all(home).expect("remove temp home");
     }
 
@@ -2175,5 +1595,60 @@ mod tests {
                 .any(|call| call.id == "partial-call")
         }));
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn resume_ignores_legacy_internal_records_without_creating_relationships() {
+        let home = temporary_home();
+        let sessions = home.join(".lucy/sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let id = "legacy-main";
+        let header = serde_json::json!({
+            "record": "session",
+            "version": 1,
+            "session_id": id,
+            "created_at": 1,
+            "cwd": std::env::current_dir().expect("cwd").display().to_string(),
+            "boot_system_prompt": "prompt",
+            "llm": {
+                "base_url": "http://localhost",
+                "model": "model",
+                "api_key_env": "LUCY_LEGACY_KEY"
+            },
+            "skills": []
+        });
+        let message = serde_json::json!({
+            "record": "message",
+            "timestamp": 2,
+            "message": {"role":"user","content":"keep this"}
+        });
+        let legacy = serde_json::json!({
+            "record": "background_result_pending",
+            "timestamp": 3,
+            "completion_id": "old-completion",
+            "task_id": "old-task",
+            "child_session_id": "old-child",
+            "task": "old task",
+            "status": "completed",
+            "result": {"output":"old result"},
+            "completed_at": 3
+        });
+        fs::write(
+            sessions.join(format!("{id}.jsonl")),
+            format!("{}\n{}\n{}\n", header, message, legacy),
+        )
+        .expect("legacy session");
+
+        let resumed = Session::resume(&home, id).expect("legacy session resumes");
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].content.as_deref(), Some("keep this"));
+        assert!(resumed
+            .provider_messages()
+            .iter()
+            .all(|message| message.name.as_deref() != Some("background_result")));
+        let listed = Session::list(&home).expect("list legacy session");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, id);
+        fs::remove_dir_all(home).expect("cleanup");
     }
 }

@@ -130,7 +130,7 @@ pub fn execute_command(
 pub(crate) fn execute_command_with_cancellation(
     command: &str,
     cwd: &Path,
-    api_key_env: &str,
+    _api_key_env: &str,
     secret: Option<&str>,
     timeout: Duration,
     output_cap: usize,
@@ -143,12 +143,14 @@ pub(crate) fn execute_command_with_cancellation(
         );
     }
 
-    let mut process = Command::new("/bin/sh");
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    let mut process = Command::new(shell);
     process
         .arg("-lc")
         .arg(command)
         .current_dir(cwd)
-        .env_remove(api_key_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

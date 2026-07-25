@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,7 +28,7 @@ use ratatui_image::{Image as TuiImage, Resize};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{Harness, SubagentActivity};
+use crate::app::Harness;
 use crate::cancellation::CancellationToken;
 use crate::model::{estimate_context_tokens, ChatMessage};
 use crate::protocol::{EventSink, ProtocolEvent};
@@ -38,7 +38,6 @@ use crate::session::SessionHistoryRecord;
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
-const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Maximum number of wrapped input rows the input box grows to before it
 /// stops expanding and scrolls its contents internally.
 const MAX_INPUT_ROWS: u16 = 12;
@@ -117,15 +116,8 @@ const QUEUED_MESSAGE_COLOR: Color = Color::Rgb(150, 255, 245);
 const FLOATING_PANEL_BACKGROUND: Color = Color::Rgb(28, 28, 30);
 const SKILL_PICKER_BACKGROUND: Color = FLOATING_PANEL_BACKGROUND;
 const SECTION_CHROME_COLOR: Color = Color::Rgb(0, 180, 180);
-const SUBAGENT_TITLE_COLOR: Color = Color::Rgb(165, 35, 135);
 const SKILL_PICKER_MAX_ROWS: usize = 5;
-const SUBAGENT_TASK_PREVIEW_CHARS: usize = 25;
-const SUBAGENT_STREAM_PREVIEW_HEIGHT: u16 = 15;
-const SUBAGENT_STREAM_MAX_CHARS: usize = 12 * 1024;
-const SUBAGENT_NOTICE_DURATION: Duration = Duration::from_millis(600);
-const SUBAGENT_NOTICE_FLASH_INTERVAL: Duration = Duration::from_millis(100);
 const BUILTIN_COMMANDS: [&str; 2] = ["settings", "exit"];
-const SUBAGENT_OVERLAY_BACKGROUND: Color = FLOATING_PANEL_BACKGROUND;
 const SETTINGS_MIN_WIDTH: u16 = 36;
 const SETTINGS_MAX_WIDTH: u16 = 88;
 const SETTINGS_MIN_HEIGHT: u16 = 8;
@@ -158,7 +150,6 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
     .with_context(context_window, context_tokens);
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let (message_tx, message_rx) = mpsc::channel::<WorkerMessage>();
-    let subagent_activity_rx = harness.take_subagent_activity_receiver();
 
     let stdout = stdout;
     enable_raw_mode().map_err(|error| format!("unable to enable terminal input: {error}"))?;
@@ -220,14 +211,13 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
         &mut state,
         &request_tx,
         &message_rx,
-        &subagent_activity_rx,
     );
 
     if let Some(token) = state.active_cancel.take() {
         let _ = token.cancel();
     }
     let _ = request_tx.send(WorkerRequest::Shutdown);
-    wait_for_worker(worker, WORKER_SHUTDOWN_GRACE);
+    wait_for_worker(worker, Duration::from_secs(2));
     drop(terminal_guard);
     result
 }
@@ -252,25 +242,9 @@ fn worker_loop(
     }
 
     loop {
-        while let Some(activity) = harness.next_subagent_activity() {
-            let _ = messages.send(WorkerMessage::SubagentActivity(activity));
-        }
-        if let Err(error) = harness.collect_completed_subagents(&mut sink) {
-            let message = redact_secret(&error, Some(harness.provider.api_key()));
-            let _ = sink.emit_event(&ProtocolEvent::Error { message });
-        }
         let request = match requests.recv_timeout(EVENT_POLL) {
             Ok(request) => request,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                while let Some(activity) = harness.next_subagent_activity() {
-                    let _ = messages.send(WorkerMessage::SubagentActivity(activity));
-                }
-                if let Err(error) = harness.collect_completed_subagents(&mut sink) {
-                    let message = redact_secret(&error, Some(harness.provider.api_key()));
-                    let _ = sink.emit_event(&ProtocolEvent::Error { message });
-                }
-                continue;
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match request {
@@ -310,16 +284,12 @@ fn event_loop<W: Write>(
     state: &mut UiState,
     requests: &Sender<WorkerRequest>,
     messages: &Receiver<WorkerMessage>,
-    subagent_activities: &Receiver<SubagentActivity>,
 ) -> Result<(), String> {
     let mut quitting = false;
     loop {
         loop {
             match messages.try_recv() {
                 Ok(WorkerMessage::Event(event)) => state.apply_event(event),
-                Ok(WorkerMessage::SubagentActivity(activity)) => {
-                    state.apply_subagent_activity(activity);
-                }
                 Ok(WorkerMessage::Started { cancel, user_text }) => {
                     if let Some(text) = user_text {
                         state.start_queued_user(&text);
@@ -370,10 +340,6 @@ fn event_loop<W: Write>(
                     return Ok(());
                 }
             }
-        }
-
-        while let Ok(activity) = subagent_activities.try_recv() {
-            state.apply_subagent_activity(activity);
         }
 
         // Ratatui flushes the buffer diff (which issues MoveTo for every
@@ -437,32 +403,11 @@ fn event_loop<W: Write>(
                 continue;
             }
             if key.code == KeyCode::Esc {
-                if state.subagent_focus.is_some() {
-                    state.clear_subagent_focus();
-                    continue;
-                }
                 if let Some(token) = state.active_cancel.as_ref() {
                     if token.cancel() {
                         state.set_status("cancelling");
                     }
                 }
-                continue;
-            }
-            // While the background-worker list owns focus, swallow typing so it
-            // cannot mutate the prompt underneath the stream overlay.
-            if state.subagent_focus.is_some()
-                && matches!(
-                    key.code,
-                    KeyCode::Char(_)
-                        | KeyCode::Backspace
-                        | KeyCode::Enter
-                        | KeyCode::Tab
-                        | KeyCode::Left
-                        | KeyCode::Right
-                        | KeyCode::Home
-                        | KeyCode::End
-                )
-            {
                 continue;
             }
             match key.code {
@@ -559,24 +504,20 @@ fn event_loop<W: Write>(
                         .map_err(|error| format!("unable to read terminal size: {error}"))?;
                     let area = tui_viewport(Rect::new(0, 0, size.width, size.height));
                     let input_width = ui_prompt_content_width(area).max(1) as usize;
-                    if !move_up_from_input_or_subagent(state, input_width) {
+                    if !move_up_from_input(state, input_width) {
                         let max_scroll = max_scroll_for_area(state, size);
                         scroll_up(state, max_scroll);
                     }
                 }
                 KeyCode::Down => {
-                    if state.subagent_focus.is_some() {
-                        let _ = state.move_subagent_focus(true);
-                    } else {
-                        let size = terminal
-                            .size()
-                            .map_err(|error| format!("unable to read terminal size: {error}"))?;
-                        let area = tui_viewport(Rect::new(0, 0, size.width, size.height));
-                        let input_width = ui_prompt_content_width(area).max(1) as usize;
-                        if !move_down_from_input(state, input_width) {
-                            let max_scroll = max_scroll_for_area(state, size);
-                            scroll_down(state, max_scroll);
-                        }
+                    let size = terminal
+                        .size()
+                        .map_err(|error| format!("unable to read terminal size: {error}"))?;
+                    let area = tui_viewport(Rect::new(0, 0, size.width, size.height));
+                    let input_width = ui_prompt_content_width(area).max(1) as usize;
+                    if !move_down_from_input(state, input_width) {
+                        let max_scroll = max_scroll_for_area(state, size);
+                        scroll_down(state, max_scroll);
                     }
                 }
                 KeyCode::PageUp => {
@@ -822,7 +763,6 @@ enum WorkerMessage {
     },
     Catalog(Result<Vec<ProviderModel>, String>),
     SettingsApplied(Result<(), String>, String, Option<String>, Option<usize>),
-    SubagentActivity(SubagentActivity),
     Finished,
 }
 
@@ -877,67 +817,6 @@ impl EventSink for ChannelSink {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubagentStatus {
-    Queued,
-    Running,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SubagentStreamItem {
-    User(String),
-    Assistant(String),
-    Reasoning {
-        complete: bool,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: String,
-    },
-    ToolResult {
-        id: String,
-        name: String,
-        result: Value,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct SubagentTask {
-    call_id: String,
-    task_id: Option<String>,
-    task: String,
-    model: Option<String>,
-    effort: Option<String>,
-    status: SubagentStatus,
-    result: Option<Value>,
-    creation_completed: bool,
-    stream: Vec<SubagentStreamItem>,
-    stream_chars: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubagentToolActionKind {
-    Check,
-    Wait,
-    Send,
-    Cancel,
-}
-
-#[derive(Debug, Clone)]
-struct SubagentToolAction {
-    task_id: String,
-    kind: SubagentToolActionKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SubagentListNotice {
-    Flash { started_at: Instant, until: Instant },
-    Waiting,
-    Cancelling,
-}
-
 /// A bounded interpolation between the resting bars and a live pulse frame.
 /// Keeping the source frame lets a completed turn settle instead of snapping
 /// straight from its last pulse height to the resting indicator.
@@ -980,16 +859,6 @@ struct UiState {
     last_active_elapsed: Duration,
     welcome_visible: bool,
     attached_agents: Vec<String>,
-    subagents: Vec<SubagentTask>,
-    subagent_focus: Option<usize>,
-    completed_subagent_calls: HashSet<String>,
-    failed_subagent_calls: HashSet<String>,
-    terminal_subagents: HashSet<String>,
-    background_result_tasks: HashMap<String, String>,
-    pending_subagent_activities: HashMap<String, Vec<SubagentActivity>>,
-    subagent_tool_actions: HashMap<String, SubagentToolAction>,
-    subagent_list_notices: HashMap<String, SubagentListNotice>,
-    cancelling_subagents: HashSet<String>,
     cmd_result_started_at: HashMap<String, Instant>,
     skill_names: Vec<String>,
     skill_picker_focus: usize,
@@ -1030,16 +899,6 @@ impl UiState {
             last_active_elapsed: Duration::ZERO,
             welcome_visible: !resumed && history.is_empty(),
             attached_agents: Vec::new(),
-            subagents: Vec::new(),
-            subagent_focus: None,
-            completed_subagent_calls: HashSet::new(),
-            failed_subagent_calls: HashSet::new(),
-            terminal_subagents: HashSet::new(),
-            background_result_tasks: HashMap::new(),
-            pending_subagent_activities: HashMap::new(),
-            subagent_tool_actions: HashMap::new(),
-            subagent_list_notices: HashMap::new(),
-            cancelling_subagents: HashSet::new(),
             cmd_result_started_at: HashMap::new(),
             skill_names: Vec::new(),
             skill_picker_focus: 0,
@@ -1411,30 +1270,6 @@ impl UiState {
                 self.transcript
                     .push(TranscriptItem::Info(format!("! {reason} ({phase})")));
             }
-            SessionHistoryRecord::BackgroundResultPending(pending) => {
-                self.background_result_tasks
-                    .insert(pending.completion_id.clone(), pending.task_id.clone());
-                self.complete_subagent(&pending.task_id, pending.result.clone());
-                self.transcript.push(TranscriptItem::SubagentLifecycle {
-                    completion_id: pending.completion_id.clone(),
-                    task_id: pending.task_id.clone(),
-                    status: format!("{:?}", pending.status).to_lowercase(),
-                    delivered: false,
-                });
-            }
-            SessionHistoryRecord::BackgroundResultDelivered(delivered) => {
-                let task_id = self
-                    .background_result_tasks
-                    .get(&delivered.completion_id)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_owned());
-                self.transcript.push(TranscriptItem::SubagentLifecycle {
-                    completion_id: delivered.completion_id.clone(),
-                    task_id,
-                    status: String::new(),
-                    delivered: true,
-                });
-            }
             SessionHistoryRecord::Compaction(compaction) => {
                 self.transcript.push(TranscriptItem::Info(format!(
                     "↻ context compacted ({} before)",
@@ -1576,16 +1411,8 @@ impl UiState {
         self.record_tool_call(call, true);
     }
 
-    fn record_tool_call(&mut self, call: &crate::model::ChatToolCall, live: bool) {
+    fn record_tool_call(&mut self, call: &crate::model::ChatToolCall, _live: bool) {
         self.clear_thinking();
-        if is_subagent_tool(&call.name) {
-            if call.name == "spawn_subagent" {
-                self.register_subagent_call(&call.id, &call.arguments);
-            } else if live {
-                self.begin_subagent_tool_action(&call.id, &call.name, &call.arguments);
-            }
-            return;
-        }
         self.transcript.push(TranscriptItem::ToolCall {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -1602,20 +1429,6 @@ impl UiState {
     }
 
     fn record_tool_result(&mut self, id: &str, name: &str, result: Value, animate: bool) {
-        if is_subagent_tool(name) {
-            if name == "spawn_subagent" {
-                self.update_subagent_queued(id, &result);
-            } else if animate {
-                self.finish_subagent_tool_action(id, &result);
-            }
-            if subagent_tool_result_is_error(&result) {
-                self.transcript.push(TranscriptItem::Error(format!(
-                    "subagent {name}: {}",
-                    redact_secret(&subagent_tool_error_message(&result), Some(&self.secret))
-                )));
-            }
-            return;
-        }
         if animate && name == "cmd" {
             self.cmd_result_started_at
                 .insert(id.to_owned(), Instant::now());
@@ -1625,346 +1438,6 @@ impl UiState {
             name: name.to_owned(),
             result,
         });
-    }
-
-    fn begin_subagent_tool_action(&mut self, call_id: &str, name: &str, arguments: &str) {
-        let Some(kind) = subagent_tool_action_kind(name) else {
-            return;
-        };
-        let Some(task_id) = subagent_tool_task_id(arguments) else {
-            return;
-        };
-        self.subagent_tool_actions.insert(
-            call_id.to_owned(),
-            SubagentToolAction {
-                task_id: task_id.clone(),
-                kind,
-            },
-        );
-        if self.running_subagent_by_id(&task_id).is_none() {
-            return;
-        }
-        if kind == SubagentToolActionKind::Cancel {
-            self.cancelling_subagents.insert(task_id.clone());
-        }
-        let now = Instant::now();
-        let notice = match kind {
-            SubagentToolActionKind::Check | SubagentToolActionKind::Send => {
-                SubagentListNotice::Flash {
-                    started_at: now,
-                    until: now + SUBAGENT_NOTICE_DURATION,
-                }
-            }
-            SubagentToolActionKind::Wait => SubagentListNotice::Waiting,
-            SubagentToolActionKind::Cancel => SubagentListNotice::Cancelling,
-        };
-        self.subagent_list_notices.insert(task_id, notice);
-    }
-
-    fn finish_subagent_tool_action(&mut self, call_id: &str, result: &Value) {
-        let Some(action) = self.subagent_tool_actions.remove(call_id) else {
-            return;
-        };
-        if self.running_subagent_by_id(&action.task_id).is_none()
-            || subagent_tool_result_is_error(result)
-        {
-            self.subagent_list_notices.remove(&action.task_id);
-            if action.kind == SubagentToolActionKind::Cancel {
-                self.cancelling_subagents.remove(&action.task_id);
-            }
-            return;
-        }
-        match action.kind {
-            SubagentToolActionKind::Check | SubagentToolActionKind::Send => {
-                let now = Instant::now();
-                self.subagent_list_notices.insert(
-                    action.task_id,
-                    SubagentListNotice::Flash {
-                        started_at: now,
-                        until: now + SUBAGENT_NOTICE_DURATION,
-                    },
-                );
-            }
-            SubagentToolActionKind::Wait => {
-                self.subagent_list_notices.remove(&action.task_id);
-            }
-            SubagentToolActionKind::Cancel => {
-                self.cancelling_subagents.insert(action.task_id);
-            }
-        }
-    }
-
-    fn running_subagent_by_id(&self, task_id: &str) -> Option<&SubagentTask> {
-        self.subagents.iter().find(|task| {
-            task.status == SubagentStatus::Running && task.task_id.as_deref() == Some(task_id)
-        })
-    }
-
-    fn subagent_list_notice_at(&self, task_id: &str, now: Instant) -> Option<SubagentListNotice> {
-        if self.cancelling_subagents.contains(task_id) {
-            return Some(SubagentListNotice::Cancelling);
-        }
-        match self.subagent_list_notices.get(task_id).copied() {
-            Some(SubagentListNotice::Flash { until, .. }) if now >= until => None,
-            notice => notice,
-        }
-    }
-
-    fn register_subagent_call(&mut self, call_id: &str, arguments: &str) {
-        if self.subagents.iter().any(|task| task.call_id == call_id) {
-            return;
-        }
-        self.completed_subagent_calls.remove(call_id);
-        let parsed = serde_json::from_str::<Value>(arguments).ok();
-        let task = parsed
-            .as_ref()
-            .and_then(|value| value.get("task"))
-            .and_then(Value::as_str)
-            .map(|task| redact_secret(task.trim(), Some(&self.secret)))
-            .filter(|task| !task.is_empty())
-            .unwrap_or_else(|| "invalid task".to_owned());
-        let model = Some(self.model.clone());
-        let effort = self.effort.clone();
-        self.subagents.push(SubagentTask {
-            call_id: call_id.to_owned(),
-            task_id: None,
-            task: task.clone(),
-            model,
-            effort,
-            status: SubagentStatus::Queued,
-            result: None,
-            creation_completed: false,
-            stream: vec![SubagentStreamItem::User(task.clone())],
-            stream_chars: task.chars().count(),
-        });
-    }
-
-    fn update_subagent_queued(&mut self, call_id: &str, result: &Value) {
-        let task_id = {
-            let Some(task) = self
-                .subagents
-                .iter_mut()
-                .find(|task| task.call_id == call_id)
-            else {
-                return;
-            };
-            task.task_id = result
-                .get("task_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            task.status = if result.get("error").is_some() {
-                task.creation_completed = false;
-                SubagentStatus::Failed
-            } else {
-                // Creation is complete once the queued acknowledgement carries a
-                // task id; the worker itself remains live in the list.
-                task.creation_completed = task.task_id.is_some();
-                SubagentStatus::Running
-            };
-            task.result = Some(result.clone());
-            task.task_id.clone()
-        };
-
-        if let Some(task_id) = task_id {
-            if let Some(activities) = self.pending_subagent_activities.remove(&task_id) {
-                for activity in activities {
-                    self.apply_subagent_activity(activity);
-                }
-            }
-        }
-    }
-
-    fn complete_subagent(&mut self, task_id: &str, result: Value) {
-        // Completion is delivered to the main agent through the notification
-        // message. The task list is only a live background-work view, so do
-        // not retain finished workers there. Keep the call identity separately
-        // so its transcript line can still say "completed" after removal.
-        let removed_index = self
-            .subagents
-            .iter()
-            .position(|task| task.task_id.as_deref() == Some(task_id));
-        if let Some(index) = removed_index {
-            let call_id = self.subagents[index].call_id.clone();
-            if subagent_completion_status(&result) == "completed" {
-                self.completed_subagent_calls.insert(call_id);
-            } else {
-                self.failed_subagent_calls.insert(call_id);
-            }
-            self.subagents.remove(index);
-            self.subagent_focus = match self.subagent_focus {
-                None => None,
-                Some(_) if self.subagents.is_empty() => None,
-                Some(focus) if focus > index => Some(focus - 1),
-                Some(focus) if focus == index => Some(focus.min(self.subagents.len() - 1)),
-                Some(focus) => Some(focus),
-            };
-        }
-
-        self.pending_subagent_activities.remove(task_id);
-        self.subagent_list_notices.remove(task_id);
-        self.cancelling_subagents.remove(task_id);
-        self.terminal_subagents.insert(task_id.to_owned());
-    }
-
-    fn apply_subagent_activity(&mut self, activity: SubagentActivity) {
-        let task_id = match &activity {
-            SubagentActivity::Event { task_id, .. }
-            | SubagentActivity::ReasoningStarted { task_id }
-            | SubagentActivity::ReasoningCompleted { task_id } => Some(task_id.clone()),
-        };
-        if let Some(task_id) = task_id {
-            let registered = self
-                .subagents
-                .iter()
-                .any(|task| task.task_id.as_deref() == Some(task_id.as_str()));
-            if !registered {
-                if !self.terminal_subagents.contains(&task_id) {
-                    self.pending_subagent_activities
-                        .entry(task_id)
-                        .or_default()
-                        .push(activity);
-                }
-                return;
-            }
-        }
-
-        match activity {
-            SubagentActivity::ReasoningStarted { task_id } => {
-                let already_reasoning = self
-                    .subagents
-                    .iter()
-                    .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
-                    .is_some_and(|task| {
-                        matches!(
-                            task.stream.last(),
-                            Some(SubagentStreamItem::Reasoning { complete: false })
-                        )
-                    });
-                if !already_reasoning {
-                    self.append_subagent_stream_item(
-                        task_id,
-                        SubagentStreamItem::Reasoning { complete: false },
-                        0,
-                    );
-                }
-            }
-            SubagentActivity::ReasoningCompleted { task_id } => {
-                if let Some(task) = self
-                    .subagents
-                    .iter_mut()
-                    .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
-                {
-                    if let Some(SubagentStreamItem::Reasoning { complete }) = task.stream.last_mut()
-                    {
-                        *complete = true;
-                    }
-                }
-            }
-            SubagentActivity::Event { task_id, event } => {
-                let (item, chars) = match event {
-                    ProtocolEvent::AssistantDelta { text } => {
-                        let text = redact_secret(&text, Some(&self.secret));
-                        let chars = text.chars().count();
-                        (SubagentStreamItem::Assistant(text), chars)
-                    }
-                    ProtocolEvent::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    } => {
-                        let arguments = redact_secret(&arguments, Some(&self.secret));
-                        let chars = arguments.chars().count() + name.len() + id.len();
-                        (
-                            SubagentStreamItem::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                            },
-                            chars,
-                        )
-                    }
-                    ProtocolEvent::ToolResult { id, name, result } => {
-                        let encoded = result.to_string();
-                        let chars = encoded.chars().count() + name.len() + id.len();
-                        (SubagentStreamItem::ToolResult { id, name, result }, chars)
-                    }
-                    ProtocolEvent::Session { .. }
-                    | ProtocolEvent::BackgroundResultPending { .. }
-                    | ProtocolEvent::BackgroundResultDelivered { .. }
-                    | ProtocolEvent::TurnEnd
-                    | ProtocolEvent::TurnInterrupted { .. }
-                    | ProtocolEvent::Error { .. } => return,
-                };
-                self.append_subagent_stream_item(task_id, item, chars);
-            }
-        }
-    }
-
-    fn append_subagent_stream_item(
-        &mut self,
-        task_id: String,
-        item: SubagentStreamItem,
-        chars: usize,
-    ) {
-        let Some(task) = self
-            .subagents
-            .iter_mut()
-            .find(|task| task.task_id.as_deref() == Some(task_id.as_str()))
-        else {
-            return;
-        };
-        // Provider text arrives in deltas. Keep the same assistant message
-        // together in the preview instead of producing one row per chunk.
-        if let SubagentStreamItem::Assistant(delta) = &item {
-            if let Some(SubagentStreamItem::Assistant(existing)) = task.stream.last_mut() {
-                existing.push_str(delta);
-                task.stream_chars = task.stream_chars.saturating_add(chars);
-                trim_subagent_stream(task);
-                return;
-            }
-        }
-        task.stream.push(item);
-        task.stream_chars = task.stream_chars.saturating_add(chars);
-        trim_subagent_stream(task);
-    }
-
-    fn clear_subagent_focus(&mut self) {
-        self.subagent_focus = None;
-    }
-
-    fn running_subagent_indices(&self) -> Vec<usize> {
-        self.subagents
-            .iter()
-            .enumerate()
-            .filter_map(|(index, task)| (task.status == SubagentStatus::Running).then_some(index))
-            .collect()
-    }
-
-    fn focus_subagent_list_from_input(&mut self) -> bool {
-        let Some(index) = self.running_subagent_indices().first().copied() else {
-            return false;
-        };
-        self.subagent_focus = Some(index);
-        true
-    }
-
-    fn move_subagent_focus(&mut self, down: bool) -> bool {
-        let Some(focus) = self.subagent_focus else {
-            return false;
-        };
-        let running = self.running_subagent_indices();
-        let Some(position) = running.iter().position(|index| *index == focus) else {
-            self.subagent_focus = None;
-            return true;
-        };
-        self.subagent_focus = if down {
-            running.get(position + 1).copied()
-        } else {
-            position
-                .checked_sub(1)
-                .and_then(|previous| running.get(previous).copied())
-        };
-        true
     }
 
     fn apply_event(&mut self, event: ProtocolEvent) {
@@ -1982,38 +1455,6 @@ impl UiState {
             }),
             ProtocolEvent::ToolResult { id, name, result } => {
                 self.add_live_tool_result(&id, &name, result)
-            }
-            ProtocolEvent::BackgroundResultPending {
-                completion_id,
-                task_id,
-                status,
-                result,
-                ..
-            } => {
-                self.background_result_tasks
-                    .insert(completion_id.clone(), task_id.clone());
-                self.complete_subagent(&task_id, result);
-                self.transcript.push(TranscriptItem::SubagentLifecycle {
-                    completion_id,
-                    task_id,
-                    status,
-                    delivered: false,
-                });
-            }
-            ProtocolEvent::BackgroundResultDelivered {
-                completion_id,
-                task_id,
-                ..
-            } => {
-                self.terminal_subagents.insert(task_id.clone());
-                self.background_result_tasks
-                    .insert(completion_id.clone(), task_id.clone());
-                self.transcript.push(TranscriptItem::SubagentLifecycle {
-                    completion_id,
-                    task_id,
-                    status: String::new(),
-                    delivered: true,
-                });
             }
             ProtocolEvent::TurnEnd => {
                 self.complete_reasoning();
@@ -2036,108 +1477,6 @@ impl UiState {
     }
 }
 
-fn trim_subagent_stream(task: &mut SubagentTask) {
-    if task.stream_chars <= SUBAGENT_STREAM_MAX_CHARS {
-        return;
-    }
-
-    // Reserve one character for the marker so the retained stream visibly
-    // distinguishes omitted history from a complete worker message.
-    let mut chars_to_drop = task
-        .stream_chars
-        .saturating_sub(SUBAGENT_STREAM_MAX_CHARS)
-        .saturating_add(1);
-    while chars_to_drop > 0 && !task.stream.is_empty() {
-        let item = task.stream.remove(0);
-        let item_chars = subagent_stream_item_chars(&item);
-        task.stream_chars = task.stream_chars.saturating_sub(item_chars);
-        if item_chars <= chars_to_drop {
-            chars_to_drop -= item_chars;
-            continue;
-        }
-
-        match item {
-            SubagentStreamItem::User(text) => {
-                let text = truncate_subagent_stream_tail(
-                    &text,
-                    item_chars.saturating_sub(chars_to_drop).saturating_add(1),
-                );
-                task.stream_chars = task.stream_chars.saturating_add(text.chars().count());
-                task.stream.insert(0, SubagentStreamItem::User(text));
-            }
-            SubagentStreamItem::Assistant(text) => {
-                let text = truncate_subagent_stream_tail(
-                    &text,
-                    item_chars.saturating_sub(chars_to_drop).saturating_add(1),
-                );
-                task.stream_chars = task.stream_chars.saturating_add(text.chars().count());
-                task.stream.insert(0, SubagentStreamItem::Assistant(text));
-            }
-            // Never turn structured tool data into assistant text: doing so
-            // bypasses the shared tool renderer and exposes raw JSON in the
-            // worker overlay when its bounded history is trimmed.
-            SubagentStreamItem::Reasoning { .. }
-            | SubagentStreamItem::ToolCall { .. }
-            | SubagentStreamItem::ToolResult { .. } => {
-                task.stream
-                    .insert(0, SubagentStreamItem::Assistant("…".to_owned()));
-                task.stream_chars = task.stream_chars.saturating_add(1);
-            }
-        }
-        return;
-    }
-
-    if !task.stream.is_empty() {
-        task.stream
-            .insert(0, SubagentStreamItem::Assistant("…".to_owned()));
-        task.stream_chars = task.stream_chars.saturating_add(1);
-    }
-}
-
-fn subagent_stream_item_chars(item: &SubagentStreamItem) -> usize {
-    match item {
-        SubagentStreamItem::User(text) | SubagentStreamItem::Assistant(text) => {
-            text.chars().count()
-        }
-        SubagentStreamItem::Reasoning { .. } => 0,
-        SubagentStreamItem::ToolCall {
-            id,
-            name,
-            arguments,
-        } => id.len() + name.len() + arguments.chars().count(),
-        SubagentStreamItem::ToolResult { id, name, result } => {
-            id.len() + name.len() + result.to_string().chars().count()
-        }
-    }
-}
-
-fn truncate_subagent_stream_tail(text: &str, limit: usize) -> String {
-    let chars = text.chars().count();
-    if chars <= limit {
-        return text.to_owned();
-    }
-    if limit == 0 {
-        return String::new();
-    }
-    let tail = text
-        .chars()
-        .skip(chars.saturating_sub(limit.saturating_sub(1)))
-        .collect::<String>();
-    format!("…{tail}")
-}
-
-fn subagent_completion_status(result: &Value) -> &'static str {
-    if result.get("interrupted").is_some() {
-        "interrupted"
-    } else if result.get("cancelled").is_some() {
-        "canceled"
-    } else if result.get("error").is_some() {
-        "failed"
-    } else {
-        "completed"
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum TranscriptItem {
     User {
@@ -2157,12 +1496,6 @@ enum TranscriptItem {
     },
     Error(String),
     Info(String),
-    SubagentLifecycle {
-        completion_id: String,
-        task_id: String,
-        status: String,
-        delivered: bool,
-    },
     Reasoning {
         complete: bool,
     },
@@ -2186,7 +1519,7 @@ fn ui_layout(
     area: Rect,
 ) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>, Rect, Rect) {
     let prompt_rows = input_visible_rows(state, ui_prompt_content_width(area));
-    let list_height = subagent_list_height(state);
+    let list_height = 0;
     let queue_height = message_queue_height(state);
     let queue_separator_height = u16::from(queue_height > 0);
     let list_separator_height = u16::from(list_height > 0);
@@ -2224,7 +1557,7 @@ fn ui_layout(
             picker_height,
         )
     });
-    let stream_area = subagent_stream_overlay_area(state, input_area, area.y);
+    let stream_area = None;
     let queue_area =
         (content.queue > 0).then(|| Rect::new(inner.x, inner.y, inner.width, content.queue));
     let status_area = Rect::new(
@@ -2313,7 +1646,7 @@ fn bottom_content_heights(state: &UiState, input_area: Rect) -> BottomContentHei
     };
     available -= queue + queue_separator;
 
-    let requested_list = subagent_list_height(state);
+    let requested_list = 0;
     let (list, list_separator) = if requested_list > 0 && available >= 3 {
         (requested_list.min(available - 1), 1)
     } else {
@@ -2340,69 +1673,6 @@ fn prompt_area(input_area: Rect, state: &UiState) -> Rect {
         inner.width,
         content.prompt,
     )
-}
-
-fn subagent_list_area(state: &UiState, input_area: Rect) -> Option<Rect> {
-    let inner = console_content_area(input_area);
-    let content = bottom_content_heights(state, input_area);
-    (content.list > 0).then(|| {
-        Rect::new(
-            inner.x,
-            inner.y
-                + content.queue
-                + content.queue_separator
-                + content.prompt
-                + content.list_separator,
-            inner.width,
-            content.list,
-        )
-    })
-}
-
-#[cfg(test)]
-fn console_spacer_rows(
-    state: &UiState,
-    input_area: Rect,
-) -> (Option<u16>, Option<u16>, Option<u16>) {
-    let inner = console_content_area(input_area);
-    let content = bottom_content_heights(state, input_area);
-    let queue_prompt = (content.queue_separator > 0).then_some(inner.y + content.queue);
-    let list_prompt = (content.list_separator > 0)
-        .then_some(inner.y + content.queue + content.queue_separator + content.prompt);
-    let prompt_status = (content.status_separator > 0)
-        .then_some(inner.y + inner.height.saturating_sub(content.status + 1));
-    (queue_prompt, list_prompt, prompt_status)
-}
-
-fn subagent_list_height(state: &UiState) -> u16 {
-    let running = state
-        .subagents
-        .iter()
-        .filter(|task| task.status == SubagentStatus::Running)
-        .count()
-        .min(u16::MAX as usize - 1) as u16;
-    u16::from(running > 0) + running
-}
-
-/// Focused worker output uses the same transient slot as the slash picker:
-/// immediately above the input, without changing the transcript viewport.
-fn subagent_stream_overlay_area(state: &UiState, input_area: Rect, top: u16) -> Option<Rect> {
-    let focus = state.subagent_focus?;
-    let task = state.subagents.get(focus)?;
-    if task.status != SubagentStatus::Running {
-        return None;
-    }
-    let available = input_area.y.saturating_sub(top);
-    if available == 0 {
-        return None;
-    }
-    let height = SUBAGENT_STREAM_PREVIEW_HEIGHT.min(available);
-    Some(Rect::new(
-        input_area.x,
-        input_area.y - height,
-        input_area.width,
-        height,
-    ))
 }
 
 fn message_queue_height(state: &UiState) -> u16 {
@@ -2626,20 +1896,12 @@ fn cursor_row(input: &str, cursor: usize, width: usize) -> u16 {
     input_cursor_row(input, cursor, width).min(u16::MAX as usize) as u16
 }
 
-fn move_up_from_input_or_subagent(state: &mut UiState, width: usize) -> bool {
-    if state.subagent_focus.is_some() {
-        return state.move_subagent_focus(false);
-    }
+fn move_up_from_input(state: &mut UiState, width: usize) -> bool {
     state.move_skill_picker(false) || move_input_cursor_vertical(state, width, false)
 }
 
 fn move_down_from_input(state: &mut UiState, width: usize) -> bool {
     let width = width.max(1);
-    let rows = input_visual_rows(&state.input, width);
-    let on_last_row = input_cursor_row(&state.input, state.cursor, width) + 1 == rows.len();
-    if on_last_row && state.focus_subagent_list_from_input() {
-        return true;
-    }
     state.move_skill_picker(true) || move_input_cursor_vertical(state, width, true)
 }
 
@@ -2720,11 +1982,10 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     // cells in the one-column margins.
     frame.render_widget(Clear, full_area);
     let area = tui_viewport(full_area);
-    let (chat_chunk, picker_area, overlay_area, queue_area, input_chunk, status_area) =
-        ui_layout(state, area);
+    let (chat_chunk, picker_area, _, queue_area, input_chunk, status_area) = ui_layout(state, area);
 
-    // The queue, running workers, prompt, and status line share one background
-    // surface. Transient picker and worker-stream surfaces remain above it.
+    // The queue, prompt, and status line share one background surface.
+    // The transient picker remains above it.
     let visible_chat_area = chat_chunk;
 
     let width = chat_chunk.width;
@@ -2803,9 +2064,6 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     if let Some(queue_area) = queue_area {
         draw_message_queue(frame, state, queue_area);
     }
-    if let Some(list_area) = subagent_list_area(state, input_chunk) {
-        draw_subagent_list(frame, state, list_area);
-    }
 
     let input_text_style = Style::default().fg(Color::White);
     let prompt_area = prompt_area(input_chunk, state);
@@ -2840,13 +2098,6 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     );
 
     apply_console_background(frame, input_chunk, activity_elapsed, console_visibility);
-
-    // The task overlay is a floating surface: draw it after the transcript,
-    // picker, input, and status layers so none can cut through its left edge
-    // or upper-left corner on a constrained terminal layout.
-    if let Some(overlay_area) = overlay_area {
-        draw_subagent_stream_overlay(frame, state, overlay_area);
-    }
     if let Some(settings) = &state.settings {
         draw_settings(frame, settings, area);
     }
@@ -2893,223 +2144,6 @@ fn draw_message_queue(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
             }),
     );
     frame.render_widget(Paragraph::new(lines), area);
-}
-
-// Hashes vary HSV saturation at a fixed 315° magenta hue.
-const SUBAGENT_ID_COLORS: [Color; 8] = [
-    Color::Rgb(220, 36, 174),
-    Color::Rgb(220, 64, 181),
-    Color::Rgb(220, 92, 188),
-    Color::Rgb(220, 120, 195),
-    Color::Rgb(220, 148, 202),
-    Color::Rgb(220, 176, 209),
-    Color::Rgb(220, 204, 216),
-    Color::Rgb(220, 212, 218),
-];
-
-fn is_subagent_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "spawn_subagent" | "check_subagent" | "wait_subagent" | "send_subagent" | "cancel_subagent"
-    )
-}
-
-fn subagent_tool_action_kind(name: &str) -> Option<SubagentToolActionKind> {
-    match name {
-        "check_subagent" => Some(SubagentToolActionKind::Check),
-        "wait_subagent" => Some(SubagentToolActionKind::Wait),
-        "send_subagent" => Some(SubagentToolActionKind::Send),
-        "cancel_subagent" => Some(SubagentToolActionKind::Cancel),
-        _ => None,
-    }
-}
-
-fn subagent_tool_task_id(arguments: &str) -> Option<String> {
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("task_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .filter(|task_id| !task_id.trim().is_empty())
-}
-
-fn subagent_tool_result_is_error(result: &Value) -> bool {
-    result.get("error").is_some()
-        || matches!(
-            result.get("status").and_then(Value::as_str),
-            Some("unknown" | "failed" | "parent_canceled")
-        )
-}
-
-fn subagent_tool_error_message(result: &Value) -> String {
-    result
-        .get("error")
-        .and_then(Value::as_str)
-        .filter(|message| !message.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            result
-                .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "failed".to_owned())
-}
-
-fn subagent_id_color(id: &str) -> Color {
-    let hash = id.bytes().fold(0x811c9dc5u32, |hash, byte| {
-        hash.wrapping_mul(0x01000193) ^ u32::from(byte)
-    });
-    SUBAGENT_ID_COLORS[(hash as usize) % SUBAGENT_ID_COLORS.len()]
-}
-
-fn draw_subagent_list(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    if area.is_empty() {
-        return;
-    }
-    let chrome = Style::default().fg(SUBAGENT_TITLE_COLOR);
-    frame.render_widget(
-        Paragraph::new(Line::styled("Subagents", chrome)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-
-    let running = state.running_subagent_indices();
-    let item_height = area.height.saturating_sub(1) as usize;
-    let range = state
-        .subagent_focus
-        .and_then(|focus| running.iter().position(|index| *index == focus))
-        .map(|focus| selection_range(running.len(), focus, item_height))
-        .unwrap_or(0..running.len().min(item_height));
-    for (row, position) in range.enumerate() {
-        let index = running[position];
-        let task = &state.subagents[index];
-        let selected = state.subagent_focus == Some(index);
-        let id = task.task_id.as_deref().unwrap_or(&task.call_id);
-        let notice = state.subagent_list_notice_at(id, Instant::now());
-        let mut style = Style::default().fg(subagent_id_color(id));
-        if selected {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        let preview = truncate_chars(
-            &task.task.replace(['\n', '\r'], " ↵ "),
-            SUBAGENT_TASK_PREVIEW_CHARS,
-        );
-        let line = match notice {
-            Some(SubagentListNotice::Waiting) => {
-                format!("Waiting for {id} {} · {preview}", tool_spinner_frame(state))
-            }
-            Some(SubagentListNotice::Cancelling) => {
-                format!("Cancelling {id} {} · {preview}", tool_spinner_frame(state))
-            }
-            Some(SubagentListNotice::Flash { started_at, .. }) => {
-                if (Instant::now()
-                    .saturating_duration_since(started_at)
-                    .as_millis()
-                    / SUBAGENT_NOTICE_FLASH_INTERVAL.as_millis())
-                .is_multiple_of(2)
-                {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
-                format!("{id} · {preview}")
-            }
-            None => format!("{id} · {preview}"),
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("│ ", chrome),
-                Span::styled(line, style),
-            ])),
-            Rect::new(area.x, area.y + row as u16 + 1, area.width, 1),
-        );
-    }
-}
-
-fn draw_subagent_stream_overlay(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
-    let Some(index) = state.subagent_focus else {
-        return;
-    };
-    let Some(task) = state.subagents.get(index) else {
-        return;
-    };
-    if area.is_empty() {
-        return;
-    }
-    let inner = Rect::new(
-        area.x.saturating_add(2),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
-    );
-    frame.render_widget(Clear, area);
-    let buffer = frame.buffer_mut();
-    for y in area.y..area.y.saturating_add(area.height) {
-        for x in area.x..area.x.saturating_add(area.width) {
-            buffer[(x, y)].set_bg(SUBAGENT_OVERLAY_BACKGROUND);
-        }
-    }
-    if inner.is_empty() {
-        return;
-    }
-
-    let lines = latest_subagent_stream_lines(task, inner.width.max(1) as usize, state);
-    let start = lines.len().saturating_sub(inner.height as usize);
-    frame.render_widget(Paragraph::new(lines[start..].to_vec()), inner);
-}
-
-fn latest_subagent_stream_lines(
-    task: &SubagentTask,
-    width: usize,
-    state: &UiState,
-) -> Vec<Line<'static>> {
-    subagent_stream_lines(task, width, state)
-}
-
-fn subagent_stream_lines(task: &SubagentTask, width: usize, state: &UiState) -> Vec<Line<'static>> {
-    if task.stream.is_empty() {
-        return vec![Line::raw("waiting for worker output")];
-    }
-    let stream = task
-        .stream
-        .iter()
-        .map(|item| match item {
-            SubagentStreamItem::User(text) => TranscriptItem::User {
-                text: text.clone(),
-                skill_instruction_attached: false,
-            },
-            SubagentStreamItem::Assistant(text) => TranscriptItem::Assistant(text.clone()),
-            SubagentStreamItem::Reasoning { complete } => TranscriptItem::Reasoning {
-                complete: *complete,
-            },
-            SubagentStreamItem::ToolCall {
-                id,
-                name,
-                arguments,
-            } => TranscriptItem::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-            SubagentStreamItem::ToolResult { id, name, result } => TranscriptItem::ToolResult {
-                id: id.clone(),
-                name: name.clone(),
-                result: result.clone(),
-            },
-        })
-        .collect::<Vec<_>>();
-    // Worker content uses the same transcript formatting and suppression rules
-    // as the main stream; only the overlay viewport follows its own tail.
-    render_transcript_items(&stream, width.max(1), state, true)
-}
-
-fn truncate_chars(text: &str, limit: usize) -> String {
-    let mut value: String = text.chars().take(limit).collect();
-    if text.chars().count() > limit {
-        value.push('…');
-    }
-    value
 }
 
 fn single_line_preview(text: &str) -> String {
@@ -3534,14 +2568,13 @@ fn welcome_lines(attached_agents: &[String]) -> Vec<Line<'static>> {
 }
 
 fn transcript_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
-    render_transcript_items(&state.transcript, width.max(1) as usize, state, true)
+    render_transcript_items(&state.transcript, width.max(1) as usize, state)
 }
 
 fn render_transcript_items(
     transcript: &[TranscriptItem],
     width: usize,
     state: &UiState,
-    suppress_subagent_tools: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut rendered_item = false;
@@ -3550,15 +2583,6 @@ fn render_transcript_items(
         // Results are positioned on their matching call, even when the model
         // emitted several calls before execution produced any result.
         if is_result_attached_to_call(transcript, index) {
-            continue;
-        }
-        if suppress_subagent_tools
-            && matches!(
-                item,
-                TranscriptItem::ToolCall { name, .. } | TranscriptItem::ToolResult { name, .. }
-                    if is_subagent_tool(name)
-            )
-        {
             continue;
         }
         if rendered_item {
@@ -3585,14 +2609,12 @@ fn render_transcript_items(
                 arguments,
             } => {
                 let result = matching_tool_result(transcript, index, id);
-                if !suppress_subagent_tools || !is_subagent_tool(name) {
-                    let segments = if name == "cmd" {
-                        cmd_tool_segments(id, arguments, result, state)
-                    } else {
-                        generic_tool_segments(name, arguments, result, state)
-                    };
-                    push_spans_wrapped(&mut lines, &segments, width);
-                }
+                let segments = if name == "cmd" {
+                    cmd_tool_segments(id, arguments, result, state)
+                } else {
+                    generic_tool_segments(name, arguments, result, state)
+                };
+                push_spans_wrapped(&mut lines, &segments, width);
             }
             TranscriptItem::ToolResult {
                 id: _,
@@ -3611,34 +2633,6 @@ fn render_transcript_items(
                 let text = redact_secret(text, Some(&state.secret));
                 push_wrapped(&mut lines, &text, width, info_style());
             }
-            TranscriptItem::SubagentLifecycle {
-                completion_id,
-                task_id,
-                status,
-                delivered,
-            } => {
-                let (marker, text, style) = if *delivered {
-                    (
-                        "✓",
-                        format!("✓ subagent  {task_id}  · result delivered ({completion_id})"),
-                        tool_result_style(),
-                    )
-                } else {
-                    let marker = if status == "completed" { "·" } else { "!" };
-                    let style = if status == "completed" {
-                        info_style()
-                    } else {
-                        error_style()
-                    };
-                    (
-                        marker,
-                        format!("{marker} subagent  {task_id}  → {status} · result pending ({completion_id})"),
-                        style,
-                    )
-                };
-                let _ = marker;
-                push_wrapped(&mut lines, &text, width, style);
-            }
             TranscriptItem::Reasoning { complete } => {
                 let text = if *complete {
                     "Reasoning Complete".to_owned()
@@ -3656,8 +2650,7 @@ fn render_transcript_items(
     lines
 }
 
-/// Tool work can outlive a main-agent turn (for example, background
-/// subagents), so it uses its own clock instead of the main status animation.
+/// Tool work uses its own clock instead of the main status animation.
 fn running_tool_status(state: &UiState) -> String {
     tool_spinner_frame(state)
 }
@@ -4450,13 +3443,6 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
 
     #[test]
     fn turn_notifications_use_osc_777_with_fixed_secret_safe_messages() {
@@ -5370,13 +4356,6 @@ mod tests {
     }
 
     #[test]
-    fn floating_panel_backgrounds_are_neutral_gray_and_darker_than_the_console() {
-        assert_eq!(FLOATING_PANEL_BACKGROUND, Color::Rgb(28, 28, 30));
-        assert_eq!(SKILL_PICKER_BACKGROUND, FLOATING_PANEL_BACKGROUND);
-        assert_eq!(SUBAGENT_OVERLAY_BACKGROUND, FLOATING_PANEL_BACKGROUND);
-    }
-
-    #[test]
     fn console_accent_transition_changes_all_tui_glow_in_sync() {
         let elapsed = console_accent_cycle() / 4;
         let canvas = Rect::new(0, 0, 80, 20);
@@ -5430,147 +4409,6 @@ mod tests {
             buffer[(right_x, console.y - 1)].fg,
             "the reflection uses the shared accent phase"
         );
-    }
-
-    #[test]
-    fn borderless_console_contains_queue_running_subagent_prompt_and_statusline() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.queue_user("first task");
-        state.queue_user("second task");
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect the command UI".to_owned(),
-            model: Some("worker-model".to_owned()),
-            effort: Some("high".to_owned()),
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        state.input = "prompt text".to_owned();
-        state.cursor = state.input.chars().count();
-        let area = Rect::new(0, 0, 80, 14);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw bottom console");
-        let (_, _, _, queue_area, input_area, status_area) = ui_layout(&state, tui_viewport(area));
-        let queue_area = queue_area.expect("message queue area");
-        let list_area = subagent_list_area(&state, input_area).expect("subagent list area");
-        let prompt_area = prompt_area(input_area, &state);
-        assert_eq!(
-            queue_area.height, 3,
-            "the queue header precedes each message"
-        );
-        assert_eq!(
-            list_area.height, 2,
-            "the subagent header precedes each worker"
-        );
-        assert_eq!(queue_area.y, input_area.y + 1);
-        let (queue_spacer, list_spacer, status_spacer) = console_spacer_rows(&state, input_area);
-        let queue_spacer = queue_spacer.expect("queue/prompt spacer");
-        let list_spacer = list_spacer.expect("prompt/list spacer");
-        let status_spacer = status_spacer.expect("list/status spacer");
-        assert_eq!(queue_area.y + queue_area.height, queue_spacer);
-        assert_eq!(prompt_area.y, queue_spacer + 1);
-        assert_eq!(prompt_area.y + prompt_area.height, list_spacer);
-        assert_eq!(list_area.y, list_spacer + 1);
-        assert_eq!(list_area.y + list_area.height, status_spacer);
-        assert_eq!(status_area.y, status_spacer + 1);
-        assert_eq!(status_area.y + 1, input_area.y + input_area.height - 1);
-        for area in [queue_area, list_area, status_area] {
-            assert_eq!(area.x, input_area.x + 2);
-            assert_eq!(area.width, input_area.width.saturating_sub(4));
-        }
-        assert_eq!(prompt_area.x, input_area.x + 2);
-        assert_eq!(prompt_area.width, input_area.width.saturating_sub(4));
-
-        let buffer = terminal.backend().buffer();
-        let border_glyphs = ["┌", "┐", "└", "┘", "├", "┤", "─"];
-        for y in input_area.y..input_area.y + input_area.height {
-            for x in input_area.x..input_area.x + input_area.width {
-                assert!(
-                    !border_glyphs.contains(&buffer[(x, y)].symbol()),
-                    "console contains a border glyph at ({x}, {y})"
-                );
-                assert_eq!(buffer[(x, y)].bg, CONSOLE_BACKGROUND);
-            }
-        }
-
-        for y in [
-            input_area.y,
-            queue_spacer,
-            list_spacer,
-            status_spacer,
-            input_area.y + input_area.height - 1,
-        ] {
-            for x in input_area.x..input_area.x + input_area.width {
-                assert_eq!(buffer[(x, y)].symbol(), " ");
-            }
-        }
-        for (x, y) in [
-            (input_area.x, input_area.y),
-            (input_area.x + input_area.width - 1, input_area.y),
-            (input_area.x, input_area.y + input_area.height - 1),
-            (
-                input_area.x + input_area.width - 1,
-                input_area.y + input_area.height - 1,
-            ),
-        ] {
-            assert_eq!(buffer[(x, y)].symbol(), " ");
-            assert_eq!(buffer[(x, y)].bg, CONSOLE_BACKGROUND);
-        }
-
-        let queued_rows = (queue_area.y..queue_area.y + queue_area.height)
-            .map(|y| {
-                (queue_area.x..queue_area.x + queue_area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert!(queued_rows[0].starts_with("Queued"));
-        assert!(queued_rows[1].contains("│ 1) first task"));
-        assert!(queued_rows[2].contains("│ 2) second task"));
-        assert!(!queued_rows[1].contains("Queued 1"));
-        assert!(!queued_rows[2].contains("Queued 2"));
-        assert_eq!(
-            buffer[(queue_area.x, queue_area.y)].fg,
-            SECTION_CHROME_COLOR
-        );
-        assert_eq!(
-            buffer[(queue_area.x, queue_area.y + 1)].fg,
-            SECTION_CHROME_COLOR
-        );
-        assert_eq!(
-            buffer[(queue_area.x + 2, queue_area.y + 1)].fg,
-            QUEUED_MESSAGE_COLOR
-        );
-        assert_eq!(buffer[(list_area.x, list_area.y)].fg, SUBAGENT_TITLE_COLOR);
-        assert_eq!(
-            buffer[(list_area.x, list_area.y + 1)].fg,
-            SUBAGENT_TITLE_COLOR
-        );
-        assert_eq!(
-            buffer[(list_area.x + 2, list_area.y + 1)].fg,
-            subagent_id_color("subagent-1")
-        );
-        assert_eq!(
-            buffer[(status_area.x, status_area.y)].fg,
-            CONSOLE_STATUS_COLOR
-        );
-        let status_row = (status_area.x..status_area.x + status_area.width)
-            .map(|x| buffer[(x, status_area.y)].symbol())
-            .collect::<String>();
-        assert!(status_row.starts_with("model · default | Context: "));
-        terminal.backend_mut().assert_cursor_position((
-            prompt_area.x + UnicodeWidthStr::width(state.input.as_str()) as u16,
-            prompt_area.y,
-        ));
     }
 
     #[test]
@@ -5633,215 +4471,6 @@ mod tests {
         assert_eq!(prompt_content_width(3), 0);
         assert_eq!(prompt_content_width(4), 0);
         assert_eq!(prompt_content_width(5), 1);
-    }
-
-    #[test]
-    fn constrained_console_keeps_internal_rects_inside_without_borders() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.queue_user("first task");
-        state.queue_user("second task");
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-
-        for height in 3..=9 {
-            let area = Rect::new(0, 0, 60, height);
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                    .expect("test terminal");
-            terminal
-                .draw(|frame| draw(frame, &state))
-                .expect("draw constrained console");
-
-            let (_, _, _, queue, console, status) = ui_layout(&state, tui_viewport(area));
-            let content = console_content_area(console);
-            let prompt = prompt_area(console, &state);
-            let list = subagent_list_area(&state, console);
-            for child in queue.into_iter().chain(list).chain([prompt, status]) {
-                assert!(
-                    child.x >= content.x,
-                    "height {height}: {child:?} starts left of {content:?}"
-                );
-                assert!(
-                    child.y >= content.y,
-                    "height {height}: {child:?} starts above {content:?}"
-                );
-                assert!(
-                    child.x + child.width <= content.x + content.width,
-                    "height {height}: {child:?} ends right of {content:?}"
-                );
-                assert!(
-                    child.y + child.height <= content.y + content.height,
-                    "height {height}: {child:?} ends below {content:?}"
-                );
-            }
-
-            let buffer = terminal.backend().buffer();
-            let border_glyphs = ["┌", "┐", "└", "┘", "├", "┤", "─", "│"];
-            for y in console.y..console.y + console.height {
-                assert!(!border_glyphs.contains(&buffer[(console.x, y)].symbol()));
-                assert!(
-                    !border_glyphs.contains(&buffer[(console.x + console.width - 1, y)].symbol())
-                );
-                let expected_background = CONSOLE_BACKGROUND;
-                assert_eq!(buffer[(console.x, y)].bg, expected_background);
-                assert_eq!(
-                    buffer[(console.x + console.width - 1, y)].bg,
-                    expected_background
-                );
-            }
-            assert_eq!(
-                status.y + status.height,
-                console.y + console.height.saturating_sub(1)
-            );
-            let spacers = console_spacer_rows(&state, console);
-            assert_eq!(spacers.0.is_some(), queue.is_some());
-            assert_eq!(spacers.1.is_some(), list.is_some());
-            for y in spacers.0.into_iter().chain(spacers.1).chain(spacers.2) {
-                for x in console.x..console.x + console.width {
-                    assert_eq!(buffer[(x, y)].symbol(), " ");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn constrained_console_hides_sections_that_cannot_fit_a_header_and_entry() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.queue_user("queued");
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-
-        let cramped = bottom_content_heights(&state, Rect::new(0, 0, 80, 7));
-        assert_eq!(cramped.queue, 0);
-        assert_eq!(cramped.queue_separator, 0);
-        assert_eq!(cramped.list, 0);
-        assert_eq!(cramped.list_separator, 0);
-
-        let queue_only = bottom_content_heights(&state, Rect::new(0, 0, 80, 8));
-        assert_eq!(queue_only.queue, 2);
-        assert_eq!(queue_only.queue_separator, 1);
-        assert_eq!(queue_only.list, 0);
-    }
-
-    #[test]
-    fn constrained_multiline_prompt_scrolls_to_its_last_row_and_keeps_cursor_inside() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.queue_user("first task");
-        state.queue_user("second task");
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        state.input = "first\nsecond\nthird".to_owned();
-        state.cursor = state.input.chars().count();
-        let area = Rect::new(0, 0, 40, 6);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw constrained multiline prompt");
-
-        let outer = ui_layout(&state, tui_viewport(area)).4;
-        let prompt = prompt_area(outer, &state);
-        assert_eq!(prompt.height, 2);
-        let rendered = (prompt.y..prompt.y + prompt.height)
-            .map(|y| {
-                (prompt.x..prompt.x + prompt.width)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert!(rendered[0].starts_with("second"));
-        assert!(rendered[1].starts_with("third"));
-        terminal.backend_mut().assert_cursor_position((
-            prompt.x + UnicodeWidthStr::width("third") as u16,
-            prompt.y + prompt.height - 1,
-        ));
-    }
-
-    #[test]
-    fn constrained_picker_and_worker_overlay_remain_above_console() {
-        let mut picker_state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["release-notes".to_owned()]);
-        picker_state.input = "/".to_owned();
-        picker_state.input_changed();
-        for height in [3, 5] {
-            let area = Rect::new(0, 0, 60, height);
-            let (_, picker, _, _, outer, _) = ui_layout(&picker_state, tui_viewport(area));
-            if let Some(picker) = picker {
-                assert!(picker.y >= area.y);
-                assert!(picker.y + picker.height <= outer.y);
-            }
-        }
-
-        let mut worker_state = UiState::from_history(&[], "secret", "model", None, false);
-        worker_state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::Assistant("worker output".to_owned())],
-            stream_chars: 13,
-        });
-        assert!(worker_state.focus_subagent_list_from_input());
-        for height in [3, 5] {
-            let area = Rect::new(0, 0, 60, height);
-            let (_, _, overlay, _, outer, _) = ui_layout(&worker_state, tui_viewport(area));
-            if let Some(overlay) = overlay {
-                assert!(overlay.y >= area.y);
-                assert!(overlay.y + overlay.height <= outer.y);
-            }
-
-            let mut terminal =
-                Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                    .expect("test terminal");
-            terminal
-                .draw(|frame| draw(frame, &worker_state))
-                .expect("draw constrained worker overlay");
-            assert_eq!(
-                terminal.backend().buffer()[(outer.x, outer.y)].symbol(),
-                " ",
-                "height {height}"
-            );
-            assert_eq!(
-                terminal.backend().buffer()[(outer.x, outer.y)].bg,
-                CONSOLE_BACKGROUND,
-                "height {height}"
-            );
-        }
     }
 
     #[test]
@@ -7126,52 +5755,6 @@ mod tests {
     }
 
     #[test]
-    fn busy_queue_and_subagent_rows_preserve_the_console_glow_surface() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.busy = true;
-        state.console_animation_epoch = Instant::now() - CONSOLE_BOUNDARY_CYCLE / 4;
-        state.queue_user("send later");
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        let area = Rect::new(0, 0, 80, 18);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
-                .expect("test terminal");
-
-        terminal
-            .draw(|frame| draw(frame, &state))
-            .expect("draw busy TUI");
-
-        let viewport = tui_viewport(area);
-        let (_, _, _, queue, input, _) = ui_layout(&state, viewport);
-        let list = subagent_list_area(&state, input).expect("subagent list");
-        let elapsed = state.console_animation_elapsed_at(Instant::now());
-        let visibility = state.console_visibility_at(Instant::now());
-        let buffer = terminal.backend().buffer();
-        for section in [queue.expect("message queue"), list] {
-            let x = section.x + section.width / 2;
-            let y = section.y;
-            let glow = glow_color_at(elapsed, x, area.width, y, area, input, visibility)
-                .unwrap_or(TUI_GLOW_BACKGROUND);
-            let expected = console_glass_color_at(elapsed, glow, visibility);
-            assert!(
-                color_distance(buffer[(x, y)].bg, expected) <= 3,
-                "section ({x}, {y}) must retain the same glass surface as the console"
-            );
-        }
-    }
-
-    #[test]
     fn only_known_leading_skill_commands_activate_input_highlighting() {
         let skills = ["release-notes".to_owned()];
         assert_eq!(
@@ -7322,1109 +5905,6 @@ mod tests {
         assert_eq!(lines[0].to_string(), "✓ cmd  $ first");
         assert_eq!(lines[2].to_string(), "✓ cmd  $ second");
     }
-    #[test]
-    fn subagent_tasks_keep_metadata_until_completion_then_leave_live_list() {
-        let history = vec![
-            SessionHistoryRecord::Message {
-                timestamp: 1,
-                message: ChatMessage::assistant(
-                    String::new(),
-                    vec![crate::model::ChatToolCall {
-                        id: "call-worker".to_owned(),
-                        name: "spawn_subagent".to_owned(),
-                        arguments: serde_json::json!({
-                            "task": "Inspect the command UI"
-                        })
-                        .to_string(),
-                    }],
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 2,
-                message: ChatMessage::tool(
-                    "call-worker".to_owned(),
-                    "spawn_subagent".to_owned(),
-                    serde_json::json!({"task_id":"subagent-1","status":"queued"}).to_string(),
-                ),
-            },
-        ];
-        let mut state =
-            UiState::from_history(&history, "secret", "worker-model", Some("high"), false);
-        assert_eq!(state.subagents.len(), 1);
-        let task = &state.subagents[0];
-        assert_eq!(task.task, "Inspect the command UI");
-        assert_eq!(task.task_id.as_deref(), Some("subagent-1"));
-        assert_eq!(task.model.as_deref(), Some("worker-model"));
-        assert_eq!(task.effort.as_deref(), Some("high"));
-        assert_eq!(task.status, SubagentStatus::Running);
-        assert!(state.transcript.is_empty());
-
-        state.apply_event(ProtocolEvent::BackgroundResultPending {
-            completion_id: "completion-1".to_owned(),
-            task_id: "subagent-1".to_owned(),
-            child_session_id: "child-1".to_owned(),
-            status: "completed".to_owned(),
-            result: serde_json::json!({"model":"worker-model","output":"finished"}),
-            completed_at: 1,
-        });
-        state.apply_event(ProtocolEvent::BackgroundResultDelivered {
-            completion_id: "completion-1".to_owned(),
-            task_id: "subagent-1".to_owned(),
-            logical_turn_id: "turn-1".to_owned(),
-            delivery: "synthetic".to_owned(),
-        });
-        assert!(
-            state.subagents.is_empty(),
-            "completed workers are removed from the live background-task list"
-        );
-        let rendered = transcript_lines(&state, 100)
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>();
-        assert!(rendered.iter().any(|line| {
-            line.contains("subagent-1")
-                && line.contains("completed")
-                && line.contains("result pending")
-        }));
-
-        assert!(rendered
-            .iter()
-            .any(|line| { line.contains("subagent-1") && line.contains("result delivered") }));
-        assert_eq!(
-            state
-                .transcript
-                .iter()
-                .filter(|item| matches!(item, TranscriptItem::SubagentLifecycle { .. }))
-                .count(),
-            2,
-            "pending and delivered are separate transcript transitions"
-        );
-    }
-
-    #[test]
-    fn resumed_subagent_completion_clears_the_live_list_without_rendering_internal_prompt() {
-        let history = vec![
-            SessionHistoryRecord::Message {
-                timestamp: 1,
-                message: ChatMessage::assistant(
-                    String::new(),
-                    vec![crate::model::ChatToolCall {
-                        id: "call-worker".to_owned(),
-                        name: "spawn_subagent".to_owned(),
-                        arguments: serde_json::json!({"task":"Inspect"}).to_string(),
-                    }],
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 2,
-                message: ChatMessage::tool(
-                    "call-worker".to_owned(),
-                    "spawn_subagent".to_owned(),
-                    serde_json::json!({"task_id":"subagent-1","status":"queued"}).to_string(),
-                ),
-            },
-            SessionHistoryRecord::BackgroundResultPending(
-                crate::session::BackgroundResultPending {
-                    timestamp: 3,
-                    completion_id: "completion-1".to_owned(),
-                    task_id: "subagent-1".to_owned(),
-                    child_session_id: "child-1".to_owned(),
-                    task: "Inspect".to_owned(),
-                    status: crate::session::ChildSessionStatus::Completed,
-                    result: serde_json::json!({"output":"resumed result"}),
-                    completed_at: 3,
-                },
-            ),
-        ];
-        let state = UiState::from_history(&history, "secret", "model", None, true);
-        assert!(
-            state.subagents.is_empty(),
-            "a completed worker is not restored into the live background-task list"
-        );
-        assert!(!state.transcript.iter().any(|item| {
-            matches!(item, TranscriptItem::User { text, .. } if text.contains("Background subagent"))
-        }));
-        assert!(state.transcript.iter().any(|item| {
-            matches!(
-                item,
-                TranscriptItem::SubagentLifecycle { task_id, status, .. }
-                    if task_id == "subagent-1" && status == "completed"
-            )
-        }));
-    }
-
-    #[test]
-    fn subagent_list_reserves_rows_between_prompt_and_status() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect the command UI and report findings".to_owned(),
-            model: Some("worker-model".to_owned()),
-            effort: Some("high".to_owned()),
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        let area = Rect::new(0, 0, 80, 20);
-        let (_, _, _, _, input, status) = ui_layout(&state, area);
-        let list = subagent_list_area(&state, input).expect("worker list");
-        let prompt = prompt_area(input, &state);
-        assert_eq!(prompt.y, input.y + 1);
-        let (queue_spacer, list_spacer, status_spacer) = console_spacer_rows(&state, input);
-        assert_eq!(queue_spacer, None);
-        assert_eq!(list.height, 2);
-        assert_eq!(list_spacer, Some(prompt.y + prompt.height));
-        assert_eq!(list.y, list_spacer.expect("list spacer") + 1);
-        assert_eq!(status_spacer, Some(list.y + list.height));
-        assert_eq!(status.y, status_spacer.expect("status spacer") + 1);
-        assert_eq!(status.y + 2, input.y + input.height);
-
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("test terminal");
-        terminal.draw(|frame| draw(frame, &state)).expect("draw");
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("Subagents"));
-        assert!(screen.contains("│ subagent-1"));
-        assert!(!screen.contains("worker-model"));
-        assert!(!screen.contains("high"));
-        assert!(screen.contains("Inspect the command UI"));
-    }
-
-    #[test]
-    fn queued_and_terminal_subagents_do_not_appear_in_the_running_list() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-queued".to_owned(),
-            task_id: None,
-            task: "Queued".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Queued,
-            result: None,
-            creation_completed: false,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        state.subagents.push(SubagentTask {
-            call_id: "call-failed".to_owned(),
-            task_id: None,
-            task: "Failed".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Failed,
-            result: None,
-            creation_completed: false,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        assert_eq!(subagent_list_height(&state), 0);
-        assert!(subagent_list_area(&state, Rect::new(0, 0, 80, 10)).is_none());
-        assert!(!state.focus_subagent_list_from_input());
-    }
-
-    #[test]
-    fn subagent_rows_use_stable_id_hash_colors() {
-        assert_eq!(
-            subagent_id_color("subagent-1"),
-            subagent_id_color("subagent-1")
-        );
-        assert_ne!(
-            subagent_id_color("subagent-1"),
-            subagent_id_color("subagent-2")
-        );
-        assert!(SUBAGENT_ID_COLORS.iter().all(|color| {
-            matches!(color, Color::Rgb(220, green, blue)
-                if u16::from(*green) < u16::from(*blue)
-                    && u16::from(*blue) < 220
-                    && 4 * (u16::from(*blue) - u16::from(*green))
-                        == 3 * (220 - u16::from(*green)))
-        }));
-        assert!(SUBAGENT_ID_COLORS
-            .windows(2)
-            .all(|colors| colors[0] != colors[1]));
-
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(80, 2)).expect("test terminal");
-        let state = UiState::from_history(&[], "secret", "model", None, false);
-        let mut state = state;
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        terminal
-            .draw(|frame| draw_subagent_list(frame, &state, Rect::new(0, 0, 80, 2)))
-            .expect("draw subagent list");
-        assert_eq!(terminal.backend().buffer()[(0, 0)].fg, SUBAGENT_TITLE_COLOR);
-        assert_eq!(terminal.backend().buffer()[(0, 1)].fg, SUBAGENT_TITLE_COLOR);
-        assert_eq!(
-            terminal.backend().buffer()[(2, 1)].fg,
-            subagent_id_color("subagent-1")
-        );
-        assert_eq!(terminal.backend().buffer()[(0, 1)].bg, Color::Reset);
-    }
-
-    #[test]
-    fn clipped_subagent_list_keeps_the_focused_running_worker_visible() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        for (index, status) in [
-            SubagentStatus::Queued,
-            SubagentStatus::Running,
-            SubagentStatus::Running,
-            SubagentStatus::Failed,
-            SubagentStatus::Running,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            state.subagents.push(SubagentTask {
-                call_id: format!("call-{index}"),
-                task_id: Some(format!("subagent-{index}")),
-                task: format!("task-{index}"),
-                model: None,
-                effort: None,
-                status,
-                result: None,
-                creation_completed: status == SubagentStatus::Running,
-                stream: vec![SubagentStreamItem::Assistant(format!("output-{index}"))],
-                stream_chars: 8,
-            });
-        }
-        state.subagent_focus = Some(4);
-
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(60, 4)).expect("test terminal");
-        terminal
-            .draw(|frame| draw_subagent_list(frame, &state, Rect::new(0, 0, 60, 2)))
-            .expect("draw clipped subagent list");
-
-        let buffer = terminal.backend().buffer();
-        let rows = (0..2)
-            .map(|y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-        assert!(rows[0].contains("Subagents"));
-        assert!(rows[1].contains("subagent-4"));
-        assert!(buffer[(2, 1)].modifier.contains(Modifier::BOLD));
-
-        terminal
-            .draw(|frame| draw_subagent_stream_overlay(frame, &state, Rect::new(0, 0, 60, 3)))
-            .expect("draw focused worker overlay");
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("output-4"));
-    }
-
-    #[test]
-    fn focused_subagent_renders_live_stream_in_picker_slot() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: "worker output".to_owned(),
-            },
-        });
-        assert!(state.focus_subagent_list_from_input());
-        let area = tui_viewport(Rect::new(0, 0, 80, 30));
-        let (_, picker, stream, _, input, _) = ui_layout(&state, area);
-        let stream = stream.expect("stream overlay");
-        assert_eq!(stream.height, SUBAGENT_STREAM_PREVIEW_HEIGHT);
-        assert_eq!(stream.y + stream.height, input.y);
-        assert!(
-            picker.is_none(),
-            "focused worker replaces the skill overlay slot"
-        );
-
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("test terminal");
-        terminal.draw(|frame| draw(frame, &state)).expect("draw");
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("worker output"));
-        let buffer = terminal.backend().buffer();
-        for y in stream.y..stream.y + stream.height {
-            for x in [
-                stream.x,
-                stream.x + 1,
-                stream.x + stream.width - 2,
-                stream.x + stream.width - 1,
-            ] {
-                assert_eq!(buffer[(x, y)].symbol(), " ");
-                assert_eq!(buffer[(x, y)].bg, SUBAGENT_OVERLAY_BACKGROUND);
-            }
-        }
-        for x in stream.x..stream.x + stream.width {
-            assert_eq!(buffer[(x, stream.y)].symbol(), " ");
-            assert_eq!(buffer[(x, stream.y + stream.height - 1)].symbol(), " ");
-        }
-        assert_eq!(buffer[(stream.x + 2, stream.y + 1)].symbol(), "w");
-        assert_eq!(buffer[(stream.x + 2, stream.y + 1)].fg, Color::Reset);
-
-        let narrow_input = Rect::new(0, 4, 80, 2);
-        assert_eq!(
-            subagent_stream_overlay_area(&state, narrow_input, 0),
-            Some(Rect::new(0, 0, 80, 4)),
-            "only a terminal without 15 rows of space may shrink the preview"
-        );
-    }
-
-    #[test]
-    fn subagent_preview_reuses_normalized_events_and_keeps_the_message_stream() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: "first message ".to_owned(),
-            },
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: "continued message".to_owned(),
-            },
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::ToolCall {
-                id: "call-cmd".to_owned(),
-                name: "cmd".to_owned(),
-                arguments: serde_json::json!({"command":"pwd"}).to_string(),
-            },
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::ToolResult {
-                id: "call-cmd".to_owned(),
-                name: "cmd".to_owned(),
-                result: serde_json::json!({"stdout":"command output","stderr":""}),
-            },
-        });
-
-        let task = &state.subagents[0];
-        let lines = subagent_stream_lines(task, 80, &state);
-        let rendered = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
-        assert!(rendered.contains("first message continued message"));
-        assert!(rendered.contains("cmd  $ pwd"));
-        let expected = vec![
-            TranscriptItem::Assistant("first message continued message".to_owned()),
-            TranscriptItem::ToolCall {
-                id: "call-cmd".to_owned(),
-                name: "cmd".to_owned(),
-                arguments: serde_json::json!({"command":"pwd"}).to_string(),
-            },
-            TranscriptItem::ToolResult {
-                id: "call-cmd".to_owned(),
-                name: "cmd".to_owned(),
-                result: serde_json::json!({"stdout":"command output","stderr":""}),
-            },
-        ];
-        assert_eq!(
-            lines,
-            render_transcript_items(&expected, 80, &state, true),
-            "worker events use the same transcript-item renderer as the main stream"
-        );
-        assert_eq!(
-            task.stream
-                .iter()
-                .filter(|item| matches!(item, SubagentStreamItem::Assistant(_)))
-                .count(),
-            1,
-            "assistant deltas remain one message in the preview"
-        );
-    }
-
-    #[test]
-    fn oversized_subagent_assistant_stream_keeps_the_latest_tail() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
-            stream_chars: "Inspect".chars().count(),
-        });
-        let tail = "latest assistant output";
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: format!("{}{}", "x".repeat(SUBAGENT_STREAM_MAX_CHARS), tail),
-            },
-        });
-
-        let task = &state.subagents[0];
-        assert_eq!(task.stream_chars, SUBAGENT_STREAM_MAX_CHARS);
-        assert!(matches!(
-            task.stream.as_slice(),
-            [SubagentStreamItem::Assistant(text)] if text.starts_with('…') && text.ends_with(tail)
-        ));
-        let rendered = subagent_stream_lines(task, 80, &state)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains(tail));
-    }
-
-    #[test]
-    fn subagent_stream_trimming_keeps_the_tail_across_items() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        let earlier = "a".repeat(6_000);
-        let latest = "b".repeat(7_000);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::User(earlier)],
-            stream_chars: 6_000,
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: latest.clone(),
-            },
-        });
-
-        let task = &state.subagents[0];
-        assert_eq!(task.stream_chars, SUBAGENT_STREAM_MAX_CHARS);
-        assert!(matches!(
-            task.stream.as_slice(),
-            [SubagentStreamItem::User(prefix), SubagentStreamItem::Assistant(text)]
-                if prefix.starts_with('…') && prefix.ends_with('a') && text == &latest
-        ));
-    }
-
-    #[test]
-    fn subagent_stream_trimming_marks_a_wholly_evicted_item() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        let latest = "b".repeat(SUBAGENT_STREAM_MAX_CHARS - 1);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::User("a".repeat(8))],
-            stream_chars: 8,
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: latest.clone(),
-            },
-        });
-
-        let task = &state.subagents[0];
-        assert_eq!(task.stream_chars, SUBAGENT_STREAM_MAX_CHARS);
-        assert!(matches!(
-            task.stream.as_slice(),
-            [SubagentStreamItem::Assistant(marker), SubagentStreamItem::Assistant(text)]
-                if marker == "…" && text == &latest
-        ));
-    }
-
-    #[test]
-    fn oversized_subagent_tool_result_keeps_structured_truncation_marker() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
-            stream_chars: "Inspect".chars().count(),
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::ToolResult {
-                id: "call-cmd".to_owned(),
-                name: "cmd".to_owned(),
-                result: serde_json::json!({
-                    "stdout": "x".repeat(SUBAGENT_STREAM_MAX_CHARS),
-                    "zz_raw_marker": "must stay structured"
-                }),
-            },
-        });
-
-        let task = &state.subagents[0];
-        assert_eq!(task.stream_chars, 1);
-        assert!(matches!(
-            task.stream.as_slice(),
-            [SubagentStreamItem::Assistant(text)] if text == "…"
-        ));
-        let rendered = subagent_stream_lines(task, 80, &state)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(rendered, "…");
-        assert!(!rendered.contains("zz_raw_marker"));
-    }
-
-    #[test]
-    fn oversized_subagent_tool_call_keeps_structured_truncation_marker() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
-            stream_chars: "Inspect".chars().count(),
-        });
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::ToolCall {
-                id: "call-cmd".to_owned(),
-                name: "cmd".to_owned(),
-                arguments: format!(
-                    r#"{{"command":"{}","zz_raw_marker":"must stay structured"}}"#,
-                    "x".repeat(SUBAGENT_STREAM_MAX_CHARS)
-                ),
-            },
-        });
-
-        let task = &state.subagents[0];
-        assert_eq!(task.stream_chars, 1);
-        assert!(matches!(
-            task.stream.as_slice(),
-            [SubagentStreamItem::Assistant(text)] if text == "…"
-        ));
-        let rendered = subagent_stream_lines(task, 80, &state)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(rendered, "…");
-        assert!(!rendered.contains("zz_raw_marker"));
-    }
-
-    #[test]
-    fn empty_subagent_stream_shows_a_waiting_placeholder() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
-        let task = SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        };
-
-        assert_eq!(
-            subagent_stream_lines(&task, 80, &state)
-                .iter()
-                .map(line_text)
-                .collect::<Vec<_>>(),
-            ["waiting for worker output"]
-        );
-    }
-
-    #[test]
-    fn subagent_preview_replays_activity_that_arrives_before_spawn_acknowledgement() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.add_tool_call(&crate::model::ChatToolCall {
-            id: "call-worker".to_owned(),
-            name: "spawn_subagent".to_owned(),
-            arguments: serde_json::json!({"task":"Inspect"}).to_string(),
-        });
-
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: "early worker output".to_owned(),
-            },
-        });
-        assert_eq!(state.pending_subagent_activities.len(), 1);
-
-        state.add_live_tool_result(
-            "call-worker",
-            "spawn_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"queued"}),
-        );
-        assert!(state.pending_subagent_activities.is_empty());
-        let visible = subagent_stream_lines(&state.subagents[0], 80, &state)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(visible.contains("early worker output"));
-    }
-
-    #[test]
-    fn subagent_preview_stays_pinned_to_the_latest_stream_lines() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-
-        for index in 0..10 {
-            state.apply_subagent_activity(SubagentActivity::Event {
-                task_id: "subagent-1".to_owned(),
-                event: ProtocolEvent::ToolResult {
-                    id: format!("call-{index}"),
-                    name: "cmd".to_owned(),
-                    result: serde_json::json!({"stdout": format!("output-{index}")}),
-                },
-            });
-        }
-
-        let visible = latest_subagent_stream_lines(&state.subagents[0], 80, &state);
-        assert!(visible
-            .iter()
-            .any(|line| line_text(line).contains("output-0")));
-        assert!(visible
-            .last()
-            .is_some_and(|line| line_text(line).contains("output-9")));
-
-        state.apply_subagent_activity(SubagentActivity::Event {
-            task_id: "subagent-1".to_owned(),
-            event: ProtocolEvent::AssistantDelta {
-                text: "newest live message".to_owned(),
-            },
-        });
-        let visible = latest_subagent_stream_lines(&state.subagents[0], 80, &state);
-        assert!(visible
-            .last()
-            .is_some_and(|line| line_text(line).contains("newest live message")));
-
-        state.subagent_focus = Some(0);
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(80, 15)).expect("test terminal");
-        terminal
-            .draw(|frame| draw_subagent_stream_overlay(frame, &state, Rect::new(0, 0, 80, 15)))
-            .expect("draw clipped worker overlay");
-        let buffer = terminal.backend().buffer();
-        let inner_rows = (1..14)
-            .map(|y| (2..78).map(|x| buffer[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-        assert!(inner_rows
-            .iter()
-            .any(|row| row.contains("newest live message")));
-        assert!(!inner_rows.iter().any(|row| row.contains("output-0")));
-    }
-
-    #[test]
-    fn subagent_preview_shows_reasoning_state_and_initial_task_message() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: vec![SubagentStreamItem::User("Inspect".to_owned())],
-            stream_chars: 7,
-        });
-
-        state.apply_subagent_activity(SubagentActivity::ReasoningStarted {
-            task_id: "subagent-1".to_owned(),
-        });
-        let before = subagent_stream_lines(&state.subagents[0], 80, &state)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(before.contains("Inspect"));
-        assert!(before.contains("Reasoning"));
-
-        state.apply_subagent_activity(SubagentActivity::ReasoningCompleted {
-            task_id: "subagent-1".to_owned(),
-        });
-        let after = subagent_stream_lines(&state.subagents[0], 80, &state)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(after.contains("Reasoning Complete"));
-    }
-
-    #[test]
-    fn down_from_last_input_row_prioritizes_subagent_list_over_skill_picker() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false)
-            .with_skill_names(vec!["settings".to_owned()]);
-        state.input = "/".to_owned();
-        state.input_changed();
-        state.subagents.push(SubagentTask {
-            call_id: "call-one".to_owned(),
-            task_id: Some("one".to_owned()),
-            task: "one".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-
-        assert!(state.skill_picker_visible());
-        assert!(move_down_from_input(&mut state, 20));
-        assert_eq!(state.subagent_focus, Some(0));
-        assert_eq!(state.skill_picker_focus, 0);
-        assert!(subagent_stream_overlay_area(&state, Rect::new(0, 4, 80, 2), 0).is_some());
-        assert!(move_up_from_input_or_subagent(&mut state, 20));
-        assert_eq!(state.subagent_focus, None);
-        assert_eq!(state.skill_picker_focus, 0);
-    }
-
-    #[test]
-    fn subagent_focus_moves_from_prompt_to_list_on_down_and_returns_on_up() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.input = "prompt".to_owned();
-        state.cursor = state.input.chars().count();
-        for (call_id, task_id) in [("call-one", "one"), ("call-two", "two")] {
-            state.subagents.push(SubagentTask {
-                call_id: call_id.to_owned(),
-                task_id: Some(task_id.to_owned()),
-                task: task_id.to_owned(),
-                model: None,
-                effort: None,
-                status: SubagentStatus::Running,
-                result: None,
-                creation_completed: true,
-                stream: Vec::new(),
-                stream_chars: 0,
-            });
-        }
-
-        assert_eq!(input_cursor_row(&state.input, state.cursor, 20), 0);
-        assert!(state.focus_subagent_list_from_input());
-        assert_eq!(state.subagent_focus, Some(0));
-        assert!(state.move_subagent_focus(false));
-        assert_eq!(
-            state.subagent_focus, None,
-            "Up from the first row returns to the prompt"
-        );
-
-        assert!(state.focus_subagent_list_from_input());
-        assert!(state.move_subagent_focus(true));
-        assert_eq!(
-            state.subagent_focus,
-            Some(1),
-            "Down advances through the list"
-        );
-        assert!(state.move_subagent_focus(false));
-        assert_eq!(state.subagent_focus, Some(0));
-    }
-
-    #[test]
-    fn subagent_lifecycle_tool_cards_are_suppressed_from_the_transcript() {
-        let history = vec![
-            SessionHistoryRecord::Message {
-                timestamp: 1,
-                message: ChatMessage::assistant(
-                    String::new(),
-                    vec![crate::model::ChatToolCall {
-                        id: "call-worker".to_owned(),
-                        name: "spawn_subagent".to_owned(),
-                        arguments: serde_json::json!({"task":"Inspect"}).to_string(),
-                    }],
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 2,
-                message: ChatMessage::tool(
-                    "call-worker".to_owned(),
-                    "spawn_subagent".to_owned(),
-                    serde_json::json!({"task_id":"subagent-1","status":"queued"}).to_string(),
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 3,
-                message: ChatMessage::assistant(
-                    String::new(),
-                    vec![crate::model::ChatToolCall {
-                        id: "call-check".to_owned(),
-                        name: "check_subagent".to_owned(),
-                        arguments: serde_json::json!({"task_id":"subagent-1"}).to_string(),
-                    }],
-                ),
-            },
-            SessionHistoryRecord::Message {
-                timestamp: 4,
-                message: ChatMessage::tool(
-                    "call-check".to_owned(),
-                    "check_subagent".to_owned(),
-                    serde_json::json!({"task_id":"subagent-1","status":"running"}).to_string(),
-                ),
-            },
-        ];
-        let state = UiState::from_history(&history, "secret", "model", None, false);
-        assert_eq!(state.subagents.len(), 1);
-        assert!(state.transcript.is_empty());
-        assert_eq!(transcript_lines(&state, 100)[0].to_string(), "");
-    }
-
-    #[test]
-    fn suppressed_lifecycle_tools_do_not_leave_transcript_spacing() {
-        for name in [
-            "spawn_subagent",
-            "check_subagent",
-            "wait_subagent",
-            "send_subagent",
-            "cancel_subagent",
-        ] {
-            let state = UiState {
-                transcript: vec![
-                    TranscriptItem::Assistant("before".to_owned()),
-                    TranscriptItem::ToolCall {
-                        id: "call".to_owned(),
-                        name: name.to_owned(),
-                        arguments: "{}".to_owned(),
-                    },
-                    TranscriptItem::ToolResult {
-                        id: "call".to_owned(),
-                        name: name.to_owned(),
-                        result: serde_json::json!({"status":"running"}),
-                    },
-                    TranscriptItem::Assistant("after".to_owned()),
-                ],
-                ..UiState::from_history(&[], "secret", "model", None, false)
-            };
-            let lines = transcript_lines(&state, 80)
-                .iter()
-                .map(Line::to_string)
-                .collect::<Vec<_>>();
-            assert_eq!(lines, ["before", "", "after"], "{name}");
-        }
-    }
-
-    #[test]
-    fn subagent_lifecycle_actions_annotate_the_running_list() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-
-        let call = |id: &str, name: &str| crate::model::ChatToolCall {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            arguments: serde_json::json!({"task_id":"subagent-1"}).to_string(),
-        };
-        state.add_live_tool_call(&call("check", "check_subagent"));
-        assert!(matches!(
-            state.subagent_list_notice_at("subagent-1", Instant::now()),
-            Some(SubagentListNotice::Flash { .. })
-        ));
-        state.add_live_tool_result(
-            "check",
-            "check_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"running"}),
-        );
-
-        state.add_live_tool_call(&call("wait", "wait_subagent"));
-        assert!(matches!(
-            state.subagent_list_notice_at("subagent-1", Instant::now()),
-            Some(SubagentListNotice::Waiting)
-        ));
-        let mut terminal =
-            Terminal::new(ratatui::backend::TestBackend::new(80, 2)).expect("test terminal");
-        terminal
-            .draw(|frame| draw_subagent_list(frame, &state, Rect::new(0, 0, 80, 2)))
-            .expect("draw waiting worker");
-        let screen = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(screen.contains("Waiting for subagent-1"));
-        state.add_live_tool_result(
-            "wait",
-            "wait_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"waiting","timed_out":true}),
-        );
-        assert!(state
-            .subagent_list_notice_at("subagent-1", Instant::now())
-            .is_none());
-
-        state.add_live_tool_call(&call("send", "send_subagent"));
-        assert!(matches!(
-            state.subagent_list_notice_at("subagent-1", Instant::now()),
-            Some(SubagentListNotice::Flash { .. })
-        ));
-        state.add_live_tool_result(
-            "send",
-            "send_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"queued"}),
-        );
-        state.add_live_tool_call(&call("cancel", "cancel_subagent"));
-        state.add_live_tool_result(
-            "cancel",
-            "cancel_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"cancellation_requested"}),
-        );
-        assert!(matches!(
-            state.subagent_list_notice_at("subagent-1", Instant::now()),
-            Some(SubagentListNotice::Cancelling)
-        ));
-    }
-
-    #[test]
-    fn cancelling_notice_survives_other_lifecycle_results_until_terminal() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.subagents.push(SubagentTask {
-            call_id: "call-worker".to_owned(),
-            task_id: Some("subagent-1".to_owned()),
-            task: "Inspect".to_owned(),
-            model: None,
-            effort: None,
-            status: SubagentStatus::Running,
-            result: None,
-            creation_completed: true,
-            stream: Vec::new(),
-            stream_chars: 0,
-        });
-        for (id, name) in [("check", "check_subagent"), ("cancel", "cancel_subagent")] {
-            state.add_live_tool_call(&crate::model::ChatToolCall {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                arguments: serde_json::json!({"task_id":"subagent-1"}).to_string(),
-            });
-        }
-        state.add_live_tool_result(
-            "check",
-            "check_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"failed"}),
-        );
-        assert!(matches!(
-            state.subagent_list_notice_at("subagent-1", Instant::now()),
-            Some(SubagentListNotice::Cancelling)
-        ));
-        state.add_live_tool_result(
-            "cancel",
-            "cancel_subagent",
-            serde_json::json!({"task_id":"subagent-1","status":"cancellation_requested"}),
-        );
-        assert!(matches!(
-            state.subagent_list_notice_at("subagent-1", Instant::now()),
-            Some(SubagentListNotice::Cancelling)
-        ));
-
-        state.complete_subagent("subagent-1", serde_json::json!({"cancelled":true}));
-        assert!(state
-            .subagent_list_notice_at("subagent-1", Instant::now())
-            .is_none());
-    }
-
-    #[test]
-    fn failed_or_unknown_subagent_actions_remain_transcript_errors() {
-        let mut state = UiState::from_history(&[], "secret", "model", None, false);
-        state.add_live_tool_call(&crate::model::ChatToolCall {
-            id: "check-unknown".to_owned(),
-            name: "check_subagent".to_owned(),
-            arguments: serde_json::json!({"task_id":"unknown"}).to_string(),
-        });
-        let result = serde_json::json!({"task_id":"unknown","status":"unknown"});
-        assert!(subagent_tool_result_is_error(&result));
-        state.add_live_tool_result("check-unknown", "check_subagent", result);
-        assert!(
-            matches!(
-                state.transcript.as_slice(),
-                [TranscriptItem::Error(message)] if message.contains("unknown")
-            ),
-            "{:?}",
-            state.transcript
-        );
-    }
-
     #[test]
     fn clipped_slash_picker_uses_its_actual_item_rows_for_the_focused_item() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false)
@@ -8659,6 +6139,76 @@ mod skill_picker_tests {
         assert_eq!(selection_range(20, 4, 5), 0..5);
         assert_eq!(selection_range(20, 5, 5), 1..6);
         assert_eq!(selection_range(20, 19, 5), 15..20);
+    }
+
+    #[test]
+    fn is_inside_tmux_detection() {
+        std::env::set_var("TERM_PROGRAM", "tmux");
+        assert!(is_inside_tmux());
+        std::env::set_var("TERM_PROGRAM", "TMUX");
+        assert!(is_inside_tmux());
+        std::env::set_var("TERM_PROGRAM", "ghostty");
+        assert!(!is_inside_tmux());
+        std::env::remove_var("TERM_PROGRAM");
+        assert!(!is_inside_tmux());
+    }
+
+    #[test]
+    fn tui_glow_background_is_ghostty_base_101216() {
+        assert_eq!(TUI_GLOW_BACKGROUND_RGB, (16, 18, 22));
+        assert_eq!(TUI_GLOW_BACKGROUND, Color::Rgb(16, 18, 22));
+    }
+
+    #[test]
+    fn idle_console_has_external_gutters_uniform_background_and_no_borders() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.input = "prompt".to_owned();
+        state.cursor = state.input.chars().count();
+        let area = Rect::new(0, 0, 80, 10);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw idle console");
+
+        let input_area = ui_layout(&state, tui_viewport(area)).4;
+        let prompt_area = prompt_area(input_area, &state);
+        let buffer = terminal.backend().buffer();
+        let bottom_y = area.y + area.height - 1;
+        assert_eq!(buffer[(area.x, bottom_y)].bg, Color::Reset);
+        assert_eq!(buffer[(area.x + area.width - 1, bottom_y)].bg, Color::Reset);
+        for y in input_area.y..input_area.y + input_area.height {
+            assert_eq!(buffer[(0, y)].bg, Color::Reset);
+            assert_eq!(buffer[(79, y)].bg, Color::Reset);
+            for x in input_area.x..input_area.x + input_area.width {
+                assert_eq!(buffer[(x, y)].bg, CONSOLE_BACKGROUND);
+            }
+        }
+        assert_eq!(buffer[(input_area.x, input_area.y)].symbol(), " ");
+        assert_eq!(
+            buffer[(input_area.x + input_area.width - 1, input_area.y)].symbol(),
+            " "
+        );
+        assert_eq!(
+            buffer[(input_area.x, input_area.y + input_area.height - 1)].symbol(),
+            " "
+        );
+        assert_eq!(
+            buffer[(
+                input_area.x + input_area.width - 1,
+                input_area.y + input_area.height - 1
+            )]
+                .symbol(),
+            " "
+        );
+        assert_eq!(buffer[(prompt_area.x, prompt_area.y)].symbol(), "p");
+        assert_eq!(buffer[(prompt_area.x, prompt_area.y)].fg, Color::White);
+        terminal.backend_mut().assert_cursor_position((
+            prompt_area.x + UnicodeWidthStr::width(state.input.as_str()) as u16,
+            prompt_area.y,
+        ));
     }
 
     #[test]

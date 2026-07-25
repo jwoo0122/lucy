@@ -6,8 +6,8 @@ decisions:
     scope: harness
     decision_type: boundary
     summary: Lucy is a local macOS/Linux harness with a default TUI, an automatic/explicit
-      JSONL mode, one OpenAI-compatible provider, `cmd`, and a bounded `spawn_subagent`
-      model tool.
+      JSONL session protocol, one OpenAI-compatible provider, and the model-facing
+      cmd tool.
     applies_to:
       - Cargo.toml
       - src/**
@@ -59,8 +59,8 @@ decisions:
     status: accepted
     scope: harness
     decision_type: lifecycle
-    summary: Lucy persists named JSONL sessions, interruption records, and an immutable
-      boot-context snapshot on resume.
+    summary: Lucy persists named JSONL sessions, interruption records, compaction
+      boundaries, and an immutable boot-context snapshot on resume.
     applies_to:
       - src/**
       - tests/**

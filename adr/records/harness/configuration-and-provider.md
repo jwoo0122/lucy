@@ -42,7 +42,7 @@ Lucy MUST resolve config and ambient context at new-session boot and persist the
 
 ## Context and forces
 
-Users need to inspect and change the minimal model guidance without recompiling Lucy. Cargo installation has no portable user-home post-install hook, so first-run bootstrap is the reliable installation-independent behavior. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter durable user-controlled artifacts or the direct command environment. Command execution remains useful through the rest of the inherited process environment, without granting the shell the provider credential directly. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
+Users need to inspect and change the minimal model guidance without recompiling Lucy. Cargo installation has no portable user-home post-install hook, so first-run bootstrap is the reliable installation-independent behavior. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter durable user-controlled artifacts or serialized command output. Trusted command and context-discovery children inherit the terminal environment, including the provider credential, so the model can invoke another Lucy process through `cmd`; captured output is redacted before persistence. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
 
 ## Invariants
 
@@ -51,7 +51,7 @@ Users need to inspect and change the minimal model guidance without recompiling 
 - When no XDG config exists, a regular non-symlink legacy `~/.lucy/config.toml` is migrated once without changing its bytes; an existing XDG config always wins.
 - Existing config bytes are not replaced by defaults.
 - The active API key never appears in error text, JSONL output, or newly written session JSONL; unsafe key values are rejected before output.
-- The configured provider API-key environment variable is removed from every Lucy child environment, including context-discovery helpers and `cmd` shells.
+- The configured provider API-key environment variable remains available to trusted Lucy child environments, including context-discovery helpers and `cmd` shells; serialized output and persisted records still redact it.
 - Early fallback diagnostics scrub every non-empty inherited environment value, including short values; missing-key diagnostics do not echo the configured environment-variable name.
 - A resumed session whose current key is already present in its raw file is rejected rather than sent to the provider or exposed by listing.
 - The session header and every provider-settings audit record are secret-safe; an effort containing the active provider key is rejected like other provider-setting values.
