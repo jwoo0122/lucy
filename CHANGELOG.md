@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.1](https://github.com/jwoo0122/lucy/compare/v1.12.0...v1.12.1) - 2026-07-25
+
+### Fixed
+
+- *(tui)* sort sessions with sort_by_key to satisfy clippy::unnecessary_sort_by
+
+### Other
+
+- Merge branch 'main' into feat/session-command
+
 ## [1.12.0](https://github.com/jwoo0122/lucy/compare/v1.11.0...v1.12.0) - 2026-07-25
 
 ### Added
