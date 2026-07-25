@@ -219,7 +219,24 @@ fn worker_loop(
     loop {
         let request = match requests.recv_timeout(EVENT_POLL) {
             Ok(request) => request,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if harness.has_completed_background_commands() {
+                    let cancel = CancellationToken::new();
+                    let _ = messages.send(WorkerMessage::Started {
+                        cancel: cancel.clone(),
+                        user_text: None,
+                    });
+                    if let Err(error) =
+                        harness.handle_background_completions(&mut sink, Some(&cancel))
+                    {
+                        let message =
+                            redact_secret(&error, Some(harness.provider.api_key().as_str()));
+                        let _ = sink.emit_event(&ProtocolEvent::Error { message });
+                    }
+                    let _ = messages.send(WorkerMessage::Finished);
+                }
+                continue;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match request {
@@ -2778,6 +2795,13 @@ fn tool_result_color_rgb(color: Color) -> (u8, u8, u8) {
 
 fn cmd_result_status(result: &Value) -> (char, String, Style) {
     let target = cmd_result_target_color(result);
+    if result.get("status").and_then(Value::as_str) == Some("running") {
+        let id = result
+            .get("background_id")
+            .and_then(Value::as_str)
+            .unwrap_or("background");
+        return ('↗', id.to_owned(), Style::default().fg(target));
+    }
     if result
         .get("canceled")
         .and_then(Value::as_bool)
@@ -4645,6 +4669,16 @@ mod tests {
             cmd_result_target_color(&serde_json::json!({"timed_out": true})),
             TOOL_WARNING_COLOR
         );
+    }
+
+    #[test]
+    fn background_cmd_registration_shows_its_running_id() {
+        let (icon, status, _) = cmd_result_status(&serde_json::json!({
+            "background_id": "background-1",
+            "status": "running"
+        }));
+        assert_eq!(icon, '↗');
+        assert_eq!(status, "background-1");
     }
 
     #[test]

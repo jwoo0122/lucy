@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender},
     Arc,
 };
 use std::thread::{self, JoinHandle};
@@ -12,13 +14,129 @@ use std::time::{Duration, Instant};
 use std::os::fd::AsRawFd;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::cancellation::CancellationToken;
 
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub const COMMAND_OUTPUT_CAP: usize = 64 * 1024;
 const CAPTURE_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct CmdArguments {
+    command: String,
+    background: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackgroundCompletion {
+    pub id: String,
+    pub result: CmdResult,
+}
+
+#[derive(Debug)]
+struct BackgroundJob {
+    cancellation: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackgroundCommands {
+    next_id: u64,
+    jobs: HashMap<String, BackgroundJob>,
+    completed_tx: Sender<BackgroundCompletion>,
+    completed_rx: Receiver<BackgroundCompletion>,
+}
+
+impl Default for BackgroundCommands {
+    fn default() -> Self {
+        let (completed_tx, completed_rx) = mpsc::channel();
+        Self {
+            next_id: 1,
+            jobs: HashMap::new(),
+            completed_tx,
+            completed_rx,
+        }
+    }
+}
+
+impl BackgroundCommands {
+    fn start(
+        &mut self,
+        command: String,
+        cwd: &Path,
+        api_key_env: &str,
+        secret: Option<&str>,
+    ) -> Value {
+        let id = format!("background-{}", self.next_id);
+        self.next_id += 1;
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker_id = id.clone();
+        let worker_command = command.clone();
+        let worker_cwd = cwd.to_path_buf();
+        let worker_api_key_env = api_key_env.to_owned();
+        let worker_secret = secret.map(str::to_owned);
+        let completed = self.completed_tx.clone();
+        let handle = thread::spawn(move || {
+            let result = execute_command_with_cancellation(
+                &worker_command,
+                &worker_cwd,
+                &worker_api_key_env,
+                worker_secret.as_deref(),
+                COMMAND_TIMEOUT,
+                COMMAND_OUTPUT_CAP,
+                Some(&worker_cancellation),
+            );
+            let _ = completed.send(BackgroundCompletion {
+                id: worker_id,
+                result,
+            });
+        });
+        self.jobs.insert(
+            id.clone(),
+            BackgroundJob {
+                cancellation,
+                handle,
+            },
+        );
+        json!({
+            "background_id": id,
+            "status": "running",
+            "command": redact_secret(&command, secret),
+        })
+    }
+
+    pub(crate) fn take_completions(&mut self) -> Vec<BackgroundCompletion> {
+        let mut completions = Vec::new();
+        while let Ok(completion) = self.completed_rx.try_recv() {
+            if let Some(job) = self.jobs.remove(&completion.id) {
+                let _ = job.handle.join();
+            }
+            completions.push(completion);
+        }
+        completions
+    }
+
+    pub(crate) fn has_active(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    pub(crate) fn has_completed(&self) -> bool {
+        self.jobs.values().any(|job| job.handle.is_finished())
+    }
+}
+
+impl Drop for BackgroundCommands {
+    fn drop(&mut self) {
+        for job in self.jobs.values() {
+            job.cancellation.cancel();
+        }
+        for (_, job) in self.jobs.drain() {
+            let _ = job.handle.join();
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CmdResult {
@@ -86,27 +204,21 @@ pub(crate) fn execute_with_cancellation(
     secret: Option<&str>,
     cancellation: Option<&CancellationToken>,
 ) -> CmdResult {
-    let value: Value = match serde_json::from_str(arguments) {
-        Ok(value) => value,
-        Err(_) => return CmdResult::error("{}", "cmd arguments must be a JSON object"),
-    };
-    let Some(object) = value.as_object() else {
-        return CmdResult::error("{}", "cmd arguments must be a JSON object");
-    };
-    if object.len() != 1 || !object.contains_key("command") {
-        return CmdResult::error("{}", "cmd arguments must contain only command");
-    }
-    let Some(command) = object.get("command").and_then(Value::as_str) else {
-        return CmdResult::error("{}", "cmd command must be a string");
+    let parsed = match parse_arguments(arguments) {
+        Ok(parsed) if !parsed.background => parsed,
+        Ok(_) => {
+            return CmdResult::error("{}", "background cmd requires the managed command executor")
+        }
+        Err(result) => return result,
     };
     if cancellation.is_some_and(|token| token.is_cancelled()) {
         return CmdResult::canceled(
-            redact_secret(command, secret),
+            redact_secret(&parsed.command, secret),
             "command canceled before execution",
         );
     }
     execute_command_with_cancellation(
-        command,
+        &parsed.command,
         cwd,
         api_key_env,
         secret,
@@ -114,6 +226,75 @@ pub(crate) fn execute_with_cancellation(
         COMMAND_OUTPUT_CAP,
         cancellation,
     )
+}
+
+pub(crate) fn execute_managed(
+    arguments: &str,
+    cwd: &Path,
+    api_key_env: &str,
+    secret: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+    background_commands: &mut BackgroundCommands,
+) -> Value {
+    let parsed = match parse_arguments(arguments) {
+        Ok(parsed) => parsed,
+        Err(result) => return serde_json::to_value(result).expect("CmdResult serializes"),
+    };
+    if cancellation.is_some_and(|token| token.is_cancelled()) {
+        return serde_json::to_value(CmdResult::canceled(
+            redact_secret(&parsed.command, secret),
+            "command canceled before execution",
+        ))
+        .expect("CmdResult serializes");
+    }
+    if parsed.background {
+        return background_commands.start(parsed.command, cwd, api_key_env, secret);
+    }
+    serde_json::to_value(execute_command_with_cancellation(
+        &parsed.command,
+        cwd,
+        api_key_env,
+        secret,
+        COMMAND_TIMEOUT,
+        COMMAND_OUTPUT_CAP,
+        cancellation,
+    ))
+    .expect("CmdResult serializes")
+}
+
+fn parse_arguments(arguments: &str) -> Result<CmdArguments, CmdResult> {
+    let value: Value = serde_json::from_str(arguments)
+        .map_err(|_| CmdResult::error("{}", "cmd arguments must be a JSON object"))?;
+    let Some(object) = value.as_object() else {
+        return Err(CmdResult::error(
+            "{}",
+            "cmd arguments must be a JSON object",
+        ));
+    };
+    if object.is_empty()
+        || object.len() > 2
+        || !object.contains_key("command")
+        || object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "command" | "background"))
+    {
+        return Err(CmdResult::error(
+            "{}",
+            "cmd arguments must contain command and optional background",
+        ));
+    }
+    let Some(command) = object.get("command").and_then(Value::as_str) else {
+        return Err(CmdResult::error("{}", "cmd command must be a string"));
+    };
+    let background = match object.get("background") {
+        Some(Value::Bool(background)) => *background,
+        Some(_) => return Err(CmdResult::error("{}", "cmd background must be a boolean")),
+        None => false,
+    };
+    Ok(CmdArguments {
+        command: command.to_owned(),
+        background,
+    })
 }
 
 pub fn execute_command(
@@ -394,16 +575,9 @@ pub fn redact_secret(text: &str, secret: Option<&str>) -> String {
 }
 
 pub(crate) fn canceled_result(arguments: &str, secret: &str) -> CmdResult {
-    let command = serde_json::from_str::<Value>(arguments)
+    let command = parse_arguments(arguments)
         .ok()
-        .and_then(|value| {
-            value
-                .as_object()
-                .filter(|object| object.len() == 1)
-                .and_then(|object| object.get("command"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .map(|arguments| arguments.command)
         .map(|command| redact_secret(&command, Some(secret)))
         .unwrap_or_else(|| "{}".to_owned());
     CmdResult::canceled(command, "command canceled before execution")
@@ -643,8 +817,54 @@ mod tests {
         );
         assert_eq!(
             result.error.as_deref(),
-            Some("cmd arguments must contain only command")
+            Some("cmd arguments must contain command and optional background")
         );
+        let result = execute(r#"{"command":1}"#, &cwd, "LUCY_API_KEY", None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("cmd command must be a string")
+        );
+        let result = execute(
+            r#"{"command":"pwd","background":"yes"}"#,
+            &cwd,
+            "LUCY_API_KEY",
+            None,
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("cmd background must be a boolean")
+        );
+        fs::remove_dir_all(cwd).expect("remove temp directory");
+    }
+
+    #[test]
+    fn managed_background_command_returns_immediately_and_completes() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
+        let cwd = temporary_directory();
+        let mut background = BackgroundCommands::default();
+        let result = execute_managed(
+            r#"{"command":"sleep 0.2; printf done","background":true}"#,
+            &cwd,
+            "LUCY_API_KEY",
+            None,
+            None,
+            &mut background,
+        );
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["background_id"], "background-1");
+        assert!(background.has_active());
+        assert!(!background.has_completed());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !background.has_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let completions = background.take_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].id, "background-1");
+        assert_eq!(completions[0].result.exit_code, Some(0));
+        assert_eq!(completions[0].result.stdout, "done");
+        assert!(!background.has_active());
         fs::remove_dir_all(cwd).expect("remove temp directory");
     }
 }

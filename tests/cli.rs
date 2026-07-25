@@ -2028,3 +2028,100 @@ fn separate_lucy_processes_resume_the_same_named_session() {
 
     fs::remove_dir_all(home).expect("cleanup");
 }
+
+#[test]
+fn background_cmd_completion_starts_an_automatic_turn_after_turn_end() {
+    let server = MockServer::start(vec![
+        tool_response_with_arguments(
+            json!({
+                "command": "sleep 0.3; printf background-finished",
+                "background": true
+            })
+            .to_string(),
+            "call-background-slow",
+        ),
+        normal_response("foreground-finished"),
+        normal_response("automatic-follow-up"),
+    ]);
+    let (home, project) = temporary_tree("background-after-turn");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"start background work\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+
+    let records = parse_lines(&output.stdout);
+    let running = records
+        .iter()
+        .find(|record| record["type"] == "tool_result")
+        .expect("background registration result");
+    assert_eq!(running["result"]["background_id"], "background-1");
+    assert_eq!(running["result"]["status"], "running");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "turn_end")
+            .count(),
+        2
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[1].contains("Lucy background command completed"));
+    assert!(requests[2].contains("Lucy background command completed"));
+    assert!(requests[2].contains("background-finished"));
+    assert!(requests[2].contains("background-1"));
+
+    let session_file = fs::read_dir(home.join(".lucy/sessions"))
+        .expect("sessions")
+        .next()
+        .expect("session entry")
+        .expect("session file")
+        .path();
+    let session = fs::read_to_string(session_file).expect("session contents");
+    assert!(session.contains("Lucy background command completed"));
+    assert!(session.contains("background-finished"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn background_cmd_completion_is_delivered_before_the_active_turn_ends() {
+    let server = MockServer::start(vec![
+        tool_response_with_arguments(
+            json!({"command": "sleep 0.02; printf immediate-finished", "background": true})
+                .to_string(),
+            "call-background-fast",
+        ),
+        normal_response(&"continuing-work-".repeat(100)),
+        normal_response("completion-observed"),
+    ]);
+    let (home, project) = temporary_tree("background-before-turn-end");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"start fast background work\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    let records = parse_lines(&output.stdout);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "turn_end")
+            .count(),
+        1
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].contains("immediate-finished"));
+    assert!(requests[2].contains("Lucy background command completed"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
