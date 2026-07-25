@@ -14,13 +14,19 @@ depends_on:
   - harness.session-and-context-lifecycle
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-22"
+last_reviewed: "2026-07-26"
 enforcement:
   - id: background-command-contract
     path: tests/cli.rs
     must_contain:
       - "fn background_cmd_completion_starts_an_automatic_turn_after_turn_end()"
       - "fn background_cmd_completion_is_delivered_before_the_active_turn_ends()"
+    must_not_contain: []
+  - id: background-completion-is-an-observation
+    path: src/session.rs
+    must_contain:
+      - "fn resume_downgrades_legacy_system_background_completions_to_observations()"
+      - "fn downgrade_legacy_background_completion("
     must_not_contain: []
   - id: bounded-command-execution
     path: src/command.rs
@@ -47,6 +53,8 @@ Each command MUST have a 10-minute timeout. A `cmd` call MAY set `background: tr
 
 The model is explicitly trusted and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy treats the command environment as a trusted terminal environment and redacts the provider credential from captured/persisted tool output. The credential is therefore available to commands and may be observed by them; this does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the protocol or consuming the model context without limit.
 
+Trusting the model does not extend to trusting what a command prints. Captured output is attacker-influenced data whenever the command reads a file, a network response, or another process, so its authority in the request must stay below the harness prompt. Delivering background completion as `system` violated that: the Codex adapter joins every `system` message into one top-level `instructions` string, which both raised command output to boot-prompt authority and erased its position in the conversation.
+
 ## Invariants
 
 - The shell command string is passed without Lucy-side rewriting.
@@ -58,7 +66,8 @@ The model is explicitly trusted and the harness is local-only, so v1 does not ad
 - After timeout or cancellation, Lucy terminates the shell's process group and stops waiting for capture after a bounded grace period.
 - Descendants that deliberately escape the process group/session are outside the v1 containment boundary and may continue; any incomplete capture is marked truncated.
 - Foreground command output and exit status are persisted as part of the originating conversation turn.
-- Background completion is persisted as Lucy-owned system context containing the background ID and normalized command result.
+- Background completion is persisted as a Lucy-owned observation containing the background ID and normalized command result, never as system context.
+- A resumed session downgrades a legacy `system` background completion to an observation so an older transcript cannot replay the escalation.
 - A completed background command is delivered at the earliest provider-response boundary. If the originating user turn already ended, Lucy starts an automatic turn without waiting for another user message.
 - Active background commands are process-scoped: they continue across user-turn cancellation, are canceled when Lucy exits, and are not reconstructed when a session is resumed.
 - JSONL one-shot mode remains alive after input EOF while registered background commands are running so their completion can be delivered.

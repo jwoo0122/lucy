@@ -13,7 +13,7 @@ constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-19"
+last_reviewed: "2026-07-26"
 enforcement:
   - id: cmd-only-tool-schema
     path: src/provider.rs
@@ -32,6 +32,20 @@ enforcement:
       - "fn codex_request_uses_responses_shape()"
       - '"background":{"type":"boolean","default":false}'
     must_not_contain: []
+  - id: observation-role-is-downgraded-by-adapters
+    path: src/model.rs
+    must_contain:
+      - 'pub const OBSERVATION_ROLE: &str = "observation";'
+      - 'pub const OBSERVATION_WIRE_ROLE: &str = "user";'
+      - "fn wire_role(&self) -> &str"
+      - "fn observation_is_stored_apart_from_system_and_sent_as_user()"
+    must_not_contain: []
+  - id: observations-never-reach-codex-instructions
+    path: src/codex_provider.rs
+    must_contain:
+      - "fn codex_request_keeps_observations_out_of_instructions()"
+      - '"role": message.wire_role(),'
+    must_not_contain: []
 enforcement_exception: null
 ---
 
@@ -48,6 +62,8 @@ Lucy MUST run as a local macOS/Linux process and MUST retain its newline-delimit
 Lucy MUST expose only `cmd` as a model-facing tool and MUST NOT provide built-in `read`, `write`, `edit`, delegation, lifecycle, or other file-operation tools. Lucy MUST NOT be a network service in v1. The LLM integration MUST support the configurable OpenAI-compatible Chat Completions API and MAY use the explicit authenticated Codex subscription adapter. Provider-specific authentication MUST remain outside the model-facing protocol.
 
 The JSONL interface MUST accept newline-delimited `{"type":"message","text":"..."}` records and MUST emit only newline-delimited normalized events on stdout, with diagnostics on stderr. A normal client interaction MUST expose a `session` event, streamed assistant deltas, normalized `cmd` calls/results, and one `turn_end` event. A client MAY close stdin after one message; Lucy MUST finish that turn and exit after EOF. A client MAY resume a named session with `--session <id>` and send another message. Session identity and process lifetime are caller-managed; Lucy MUST NOT infer parent/child relationships between sessions.
+
+Lucy MUST keep a provider-neutral message role for harness observations of untrusted external output, distinct from `system`. Session state MUST store that role verbatim, and every provider adapter MUST downgrade it to the provider's lowest-privilege input role before building a request. An observation MUST NOT reach a provider's instruction channel, and its position in the conversation MUST be preserved.
 
 Provider SSE and tool-call chunks MUST be converted into Lucy-owned normalized events. Provider-specific response chunks MUST NOT become the public JSONL protocol or TUI output. One process handles one active turn at a time.
 Lucy MUST NOT impose a fixed count or provider-round limit on model tool calls within an active turn. Resource bounds remain in force for provider SSE bodies, tool-call fields and arguments, command execution time/output, cancellation, and process shutdown.

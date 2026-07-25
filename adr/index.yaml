@@ -18,7 +18,7 @@ decisions:
     depends_on: []
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-19'
+    last_reviewed: '2026-07-26'
     enforcement:
       - id: cmd-only-tool-schema
         path: src/provider.rs
@@ -36,6 +36,20 @@ decisions:
         must_contain:
           - fn codex_request_uses_responses_shape()
           - '"background":{"type":"boolean","default":false}'
+        must_not_contain: []
+      - id: observation-role-is-downgraded-by-adapters
+        path: src/model.rs
+        must_contain:
+          - 'pub const OBSERVATION_ROLE: &str = "observation";'
+          - 'pub const OBSERVATION_WIRE_ROLE: &str = "user";'
+          - fn wire_role(&self) -> &str
+          - fn observation_is_stored_apart_from_system_and_sent_as_user()
+        must_not_contain: []
+      - id: observations-never-reach-codex-instructions
+        path: src/codex_provider.rs
+        must_contain:
+          - fn codex_request_keeps_observations_out_of_instructions()
+          - '"role": message.wire_role(),'
         must_not_contain: []
     enforcement_exception: null
   - id: harness.command-execution
@@ -55,13 +69,19 @@ decisions:
       - harness.session-and-context-lifecycle
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-22'
+    last_reviewed: '2026-07-26'
     enforcement:
       - id: background-command-contract
         path: tests/cli.rs
         must_contain:
           - fn background_cmd_completion_starts_an_automatic_turn_after_turn_end()
           - fn background_cmd_completion_is_delivered_before_the_active_turn_ends()
+        must_not_contain: []
+      - id: background-completion-is-an-observation
+        path: src/session.rs
+        must_contain:
+          - fn resume_downgrades_legacy_system_background_completions_to_observations()
+          - fn downgrade_legacy_background_completion(
         must_not_contain: []
       - id: bounded-command-execution
         path: src/command.rs

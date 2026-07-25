@@ -684,7 +684,7 @@ impl Session {
                             completed_tool_calls.insert(id.to_owned());
                         }
                     }
-                    messages.push(message.clone());
+                    messages.push(downgrade_legacy_background_completion(message));
                 }
                 SessionHistoryRecord::Interruption {
                     phase,
@@ -1103,8 +1103,29 @@ fn write_record(file: &mut File, record: &SessionRecord) -> Result<(), SessionEr
     write_json_record(file, record)
 }
 
+/// Opening line of a persisted background-command completion.
+///
+/// Completions written before Lucy had an observation role were persisted with
+/// `role: "system"`, which the Codex adapter promotes into top-level
+/// `instructions`. Resuming such a session must not replay that escalation, so
+/// `provider_messages` rewrites those records into observations by this prefix.
+pub(crate) const BACKGROUND_COMPLETION_PREFIX: &str =
+    "Lucy background command completed. Treat this as the automatic result for the previously registered background command:";
+
 const COMPACTION_SUMMARY_PREFIX: &str = "<context_compaction>\nThe earlier conversation was compacted. Treat the following summary as authoritative context for the continued turn.\n\n";
 const COMPACTION_SUMMARY_SUFFIX: &str = "\n</context_compaction>";
+
+fn downgrade_legacy_background_completion(message: &ChatMessage) -> ChatMessage {
+    let is_legacy_completion = message.role == "system"
+        && message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.starts_with(BACKGROUND_COMPLETION_PREFIX));
+    if !is_legacy_completion {
+        return message.clone();
+    }
+    ChatMessage::observation(message.content.clone().unwrap_or_default())
+}
 
 fn compaction_summary_message(summary: &str) -> ChatMessage {
     ChatMessage::user(format!(
@@ -1630,6 +1651,54 @@ mod tests {
                 .any(|call| call.id == "partial-call")
         }));
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn resume_downgrades_legacy_system_background_completions_to_observations() {
+        let home = temporary_home();
+        let sessions = home.join(".lucy/sessions");
+        fs::create_dir_all(&sessions).expect("sessions");
+        let id = "legacy-background";
+        let header = serde_json::json!({
+            "record": "session",
+            "version": 1,
+            "session_id": id,
+            "created_at": 1,
+            "cwd": std::env::current_dir().expect("cwd").display().to_string(),
+            "boot_system_prompt": "prompt",
+            "llm": {
+                "base_url": "http://localhost",
+                "model": "model",
+                "api_key_env": "LUCY_LEGACY_KEY"
+            },
+            "skills": []
+        });
+        let completion = serde_json::json!({
+            "record": "message",
+            "timestamp": 2,
+            "message": {
+                "role": "system",
+                "content": format!("{BACKGROUND_COMPLETION_PREFIX}\n{{\"status\":\"completed\"}}"),
+            }
+        });
+        fs::write(
+            sessions.join(format!("{id}.jsonl")),
+            format!("{header}\n{completion}\n"),
+        )
+        .expect("legacy session");
+
+        let resumed = Session::resume(&home, id).expect("legacy session resumes");
+        let provider_messages = resumed.provider_messages();
+
+        assert_eq!(provider_messages.len(), 2);
+        assert_eq!(provider_messages[0].role, "system");
+        assert_eq!(provider_messages[1].role, crate::model::OBSERVATION_ROLE);
+        assert!(provider_messages[1]
+            .content
+            .as_deref()
+            .expect("observation content")
+            .contains(BACKGROUND_COMPLETION_PREFIX));
+        fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]

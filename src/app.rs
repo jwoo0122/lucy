@@ -17,7 +17,7 @@ use crate::redaction::{
     conflicts_with_protected_literal, conflicts_with_tui_literal, is_structural_key, redact_secret,
     redaction_marker,
 };
-use crate::session::Session;
+use crate::session::{Session, BACKGROUND_COMPLETION_PREFIX};
 
 #[derive(Debug)]
 struct CliOptions {
@@ -670,14 +670,14 @@ impl Harness {
                 "status": "completed",
                 "result": completion.result,
             });
-            let content = format!(
-                "Lucy background command completed. Treat this as the automatic result for the previously registered background command:
+            let body = format!(
+                "{BACKGROUND_COMPLETION_PREFIX}
 {}",
                 serde_json::to_string(&result)
                     .map_err(|error| format!("unable to encode background cmd result: {error}"))?
             );
             self.session
-                .append_message(ChatMessage::system(content))
+                .append_message(ChatMessage::observation(body))
                 .map_err(|error| error.to_string())?;
         }
         Ok(true)
