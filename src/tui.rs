@@ -4067,6 +4067,8 @@ const MODEL_GRAPH_WIDTH: usize = MODEL_GRAPH_TRACK_LENGTH + MODEL_GRAPH_TAIL_LEN
 const MODEL_GRAPH_BLOCK: char = '■';
 const MODEL_GRAPH_TAIL_OPACITY: [f32; MODEL_GRAPH_TAIL_LENGTH] = [0.55, 0.25];
 const MODEL_GRAPH_PERIOD_TICKS: u128 = (MODEL_GRAPH_TRACK_LENGTH as u128 - 1) * 2;
+// 62.5ms per cell makes the graph move at 80% of its former speed.
+const MODEL_GRAPH_TICK: Duration = Duration::from_micros(62_500);
 const PULSE_TICK: Duration = Duration::from_millis(50);
 const TOOL_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const TOOL_SPINNER_FRAME_DURATION: Duration = Duration::from_millis(100);
@@ -4108,7 +4110,7 @@ fn pulse_frame(levels: [usize; PULSE_BAR_PERIODS.len()]) -> String {
 }
 
 fn model_graph_position_at(elapsed: Duration) -> (usize, bool) {
-    let tick = elapsed.as_millis() / PULSE_TICK.as_millis();
+    let tick = elapsed.as_micros() / MODEL_GRAPH_TICK.as_micros();
     let phase = tick % MODEL_GRAPH_PERIOD_TICKS;
     if phase < MODEL_GRAPH_TRACK_LENGTH as u128 {
         (phase as usize, phase < MODEL_GRAPH_TRACK_LENGTH as u128 - 1)
@@ -4541,7 +4543,7 @@ mod tests {
     #[test]
     fn model_graph_is_a_five_cell_bounce_with_a_two_cell_tail() {
         let frames = (0..=MODEL_GRAPH_PERIOD_TICKS)
-            .map(|tick| model_graph_frame_at(PULSE_TICK * tick as u32))
+            .map(|tick| model_graph_frame_at(MODEL_GRAPH_TICK * tick as u32))
             .collect::<Vec<_>>();
 
         assert_eq!(frames[0], "■      ");
@@ -4556,6 +4558,7 @@ mod tests {
             .all(|frame| frame.chars().count() == MODEL_GRAPH_WIDTH));
         assert_eq!(MODEL_GRAPH_TRACK_LENGTH, 5);
         assert_eq!(MODEL_GRAPH_TAIL_LENGTH, 2);
+        assert_eq!(MODEL_GRAPH_TICK, Duration::from_micros(62_500));
     }
 
     fn color_distance_from_console(color: Color) -> u32 {
