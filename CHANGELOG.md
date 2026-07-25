@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.2](https://github.com/jwoo0122/lucy/compare/v1.8.1...v1.8.2) - 2026-07-25
+
+### Fixed
+
+- move agent orchestration outside Lucy ([#24](https://github.com/jwoo0122/lucy/pull/24))
+
 ## [1.8.1](https://github.com/jwoo0122/lucy/compare/v1.8.0...v1.8.1) - 2026-07-25
 
 ### Fixed
