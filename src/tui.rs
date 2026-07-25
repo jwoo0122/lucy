@@ -2188,11 +2188,20 @@ fn ui_layout(
     )
 }
 
-/// Keep the console inset without allowing margins to consume all available
-/// width. A narrow terminal sheds margin cells before it sheds the console.
+/// Keep the content area inset without allowing margins to consume all
+/// available width. A narrow terminal sheds margin cells before it sheds the
+/// console.
+const CONTENT_HORIZONTAL_MARGIN: u16 = 7;
+const MIN_CONSOLE_WIDTH: u16 = 14;
+
 fn bottom_console_area(area: Rect, y: u16, height: u16) -> Rect {
     let horizontal_margin = area.width.saturating_sub(1) / 2;
-    let horizontal_margin = horizontal_margin.min(2);
+    let margin_cap = if area.width < MIN_CONSOLE_WIDTH {
+        2
+    } else {
+        CONTENT_HORIZONTAL_MARGIN.min(area.width.saturating_sub(MIN_CONSOLE_WIDTH) / 2)
+    };
+    let horizontal_margin = horizontal_margin.min(margin_cap);
     Rect::new(
         area.x.saturating_add(horizontal_margin),
         y,
@@ -4464,16 +4473,24 @@ mod tests {
 
         assert_eq!(chat.x, console.x);
         assert_eq!(chat.width, console.width);
-        assert_eq!(console, Rect::new(viewport.x + 2, 8, viewport.width - 4, 5));
+        assert_eq!(
+            console,
+            Rect::new(viewport.x + 7, 8, viewport.width - 14, 5)
+        );
         assert_eq!(console.y + console.height, viewport.y + viewport.height - 1);
         assert_eq!(content.x, console.x + 2);
         assert_eq!(content.width, console.width - 4);
         assert_eq!(content.y, console.y + 1);
         assert_eq!(content.y + content.height, console.y + console.height - 1);
 
-        for (width, margin, console_width) in
-            [(1, 0, 1), (2, 0, 2), (3, 1, 1), (4, 1, 2), (5, 2, 1)]
-        {
+        for (width, margin, console_width) in [
+            (1, 0, 1),
+            (2, 0, 2),
+            (3, 1, 1),
+            (4, 1, 2),
+            (5, 2, 1),
+            (15, 0, 15),
+        ] {
             let console = bottom_console_area(Rect::new(0, 0, width, 4), 0, 4);
             assert_eq!(console.x, margin, "width {width}");
             assert_eq!(console.width, console_width, "width {width}");
@@ -4489,7 +4506,7 @@ mod tests {
         let prompt = prompt_area(console, &state);
 
         assert_eq!(ui_prompt_content_width(viewport), prompt.width);
-        assert_eq!(prompt.width, 70);
+        assert_eq!(prompt.width, 60);
         assert_eq!(input_visible_rows(&state, prompt.width), 2);
         assert!(move_input_cursor_vertical(
             &mut state,
