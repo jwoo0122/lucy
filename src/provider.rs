@@ -3,6 +3,7 @@ use std::io::{self, BufRead};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client as AsyncClient;
 use serde_json::{json, Value};
 
@@ -31,6 +32,8 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
+const OPENROUTER_HOST: &str = "openrouter.ai";
+const APP_TITLE: &str = "Lucy";
 
 #[derive(Debug)]
 pub struct ProviderError {
@@ -165,6 +168,8 @@ pub struct Provider {
     api_key_env: String,
     api_key: String,
     codex: Option<CodexProvider>,
+    session_id: Option<String>,
+    is_openrouter: bool,
 }
 
 fn model_efforts(entry: &Value) -> Option<Vec<String>> {
@@ -222,6 +227,7 @@ fn chat_request(
     messages: &[ChatMessage],
     effort: &Option<String>,
     include_tools: bool,
+    session_id: Option<&str>,
 ) -> Value {
     let mut request = json!({
         "model": model,
@@ -247,7 +253,55 @@ fn chat_request(
     if let Some(effort) = effort {
         request["reasoning_effort"] = json!(effort);
     }
+    if let Some(session_id) = session_id {
+        request["session_id"] = json!(session_id);
+    }
     request
+}
+
+fn is_openrouter_base_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case(OPENROUTER_HOST))
+}
+
+fn provider_headers(is_openrouter: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if is_openrouter {
+        headers.insert("x-openrouter-title", HeaderValue::from_static(APP_TITLE));
+    }
+    headers
+}
+
+fn provider_clients(
+    is_openrouter: bool,
+    api_key: &str,
+) -> Result<(Client, AsyncClient), ProviderError> {
+    let headers = provider_headers(is_openrouter);
+    let client = Client::builder()
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .timeout(PROVIDER_TIMEOUT)
+        .default_headers(headers.clone())
+        .build()
+        .map_err(|_| {
+            ProviderError::new(redact_secret(
+                "unable to initialize HTTP client",
+                Some(api_key),
+            ))
+        })?;
+    let async_client = AsyncClient::builder()
+        .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+        .read_timeout(PROVIDER_TIMEOUT)
+        .default_headers(headers)
+        .build()
+        .map_err(|_| {
+            ProviderError::new(redact_secret(
+                "unable to initialize HTTP client",
+                Some(api_key),
+            ))
+        })?;
+    Ok((client, async_client))
 }
 
 impl Provider {
@@ -291,26 +345,8 @@ impl Provider {
             "{}/chat/completions",
             settings.base_url.trim_end_matches('/')
         );
-        let client = Client::builder()
-            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
-            .timeout(PROVIDER_TIMEOUT)
-            .build()
-            .map_err(|_| {
-                ProviderError::new(redact_secret(
-                    "unable to initialize HTTP client",
-                    Some(&api_key),
-                ))
-            })?;
-        let async_client = AsyncClient::builder()
-            .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
-            .read_timeout(PROVIDER_TIMEOUT)
-            .build()
-            .map_err(|_| {
-                ProviderError::new(redact_secret(
-                    "unable to initialize HTTP client",
-                    Some(&api_key),
-                ))
-            })?;
+        let is_openrouter = is_openrouter_base_url(&settings.base_url);
+        let (client, async_client) = provider_clients(is_openrouter, &api_key)?;
         Ok(Self {
             client,
             async_client,
@@ -320,6 +356,8 @@ impl Provider {
             api_key_env: settings.api_key_env.clone(),
             api_key,
             codex: None,
+            session_id: None,
+            is_openrouter,
         })
     }
 
@@ -348,7 +386,17 @@ impl Provider {
             api_key_env: codex.api_key_env().to_owned(),
             api_key,
             codex: Some(codex),
+            session_id: None,
+            is_openrouter: false,
         })
+    }
+
+    pub(crate) fn with_session_id(mut self, session_id: &str) -> Self {
+        self.session_id = Some(session_id.to_owned());
+        if let Some(codex) = self.codex.take() {
+            self.codex = Some(codex.with_session_id(session_id));
+        }
+        self
     }
 
     pub fn api_key(&self) -> String {
@@ -565,7 +613,15 @@ impl Provider {
                 reasoning_details: Vec::new(),
             }));
         }
-        let request = chat_request(&self.model, messages, &self.effort, include_tools);
+        let request = chat_request(
+            &self.model,
+            messages,
+            &self.effort,
+            include_tools,
+            self.is_openrouter
+                .then_some(self.session_id.as_deref())
+                .flatten(),
+        );
         let request = self
             .async_client
             .post(&self.endpoint)
@@ -1186,6 +1242,46 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn openrouter_requests_include_session_and_app_metadata() {
+        let request = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            true,
+            Some("lucy-session"),
+        );
+        assert_eq!(request["session_id"], "lucy-session");
+        assert!(is_openrouter_base_url("https://openrouter.ai/api/v1"));
+        assert!(!is_openrouter_base_url("https://example.com/v1"));
+
+        let headers = provider_headers(true);
+        assert_eq!(headers.get("x-openrouter-title").unwrap(), "Lucy");
+
+        let compact = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            false,
+            Some("lucy-session"),
+        );
+        assert_eq!(compact["session_id"], request["session_id"]);
+    }
+
+    #[test]
+    fn compatible_requests_omit_provider_specific_session_metadata() {
+        let request = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            true,
+            None,
+        );
+        assert!(request.get("session_id").is_none());
+
+        assert!(provider_headers(false).get("x-openrouter-title").is_none());
+    }
+
+    #[test]
     fn retry_policy_only_marks_transient_http_statuses() {
         for status in [408, 429, 500, 502, 503, 504] {
             assert!(transient_http_status(status));
@@ -1202,6 +1298,7 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            None,
         );
         let tools = request["tools"].as_array().expect("model tools");
         assert_eq!(tools.len(), 1);
@@ -1215,12 +1312,14 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            None,
         );
         let compact = chat_request(
             "model",
             &[ChatMessage::user("hello".to_owned())],
             &None,
             false,
+            None,
         );
 
         assert!(normal.get("tools").is_some());
