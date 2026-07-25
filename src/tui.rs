@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -59,6 +60,8 @@ const WELCOME_END_COLOR: (u8, u8, u8) = (0, 180, 180);
 const USER_BORDER_COLOR: Color = Color::Rgb(192, 154, 0);
 const USER_BORDER_GLYPH: &str = "▌";
 const PROMPT_BACKGROUND: Color = Color::Rgb(24, 24, 27);
+const BACKGROUND_INDICATOR_BACKGROUND: Color = Color::Rgb(40, 24, 56);
+const BACKGROUND_INDICATOR_COLOR: Color = Color::Rgb(190, 140, 255);
 const BUSY_INDICATOR_FADE_BASE_RGB: (u8, u8, u8) = (42, 42, 46);
 const CONSOLE_STATUS_COLOR: Color = Color::Rgb(144, 144, 148);
 const CONSOLE_ACCENT_LAVENDER: (u8, u8, u8) = (145, 70, 220);
@@ -123,6 +126,7 @@ pub(crate) fn run<W: Write>(mut harness: Harness, resumed: bool, stdout: W) -> R
     .with_attached_agents(harness.attached_agents.clone())
     .with_skill_names(skill_names)
     .with_context(context_window, context_tokens);
+    state.background_active_count = harness.background_active_count();
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let (message_tx, message_rx) = mpsc::channel::<WorkerMessage>();
 
@@ -844,6 +848,7 @@ struct UiState {
     skill_picker_focus: usize,
     skill_picker_suppressed: bool,
     settings: Option<SettingsState>,
+    background_active_count: Arc<AtomicUsize>,
 }
 
 impl UiState {
@@ -883,6 +888,7 @@ impl UiState {
             skill_picker_focus: 0,
             skill_picker_suppressed: false,
             settings: None,
+            background_active_count: Arc::new(AtomicUsize::new(0)),
         };
         for record in history {
             state.add_history_record(record);
@@ -1471,6 +1477,21 @@ fn tui_viewport(area: Rect) -> Rect {
     Rect::new(x, area.y, width, area.height)
 }
 
+fn background_indicator_height(state: &UiState) -> u16 {
+    u16::from(state.background_active_count.load(Ordering::Relaxed) > 0)
+}
+
+fn background_indicator_area(state: &UiState, input_area: Rect) -> Option<Rect> {
+    (background_indicator_height(state) > 0).then(|| {
+        Rect::new(
+            input_area.x,
+            input_area.y + input_area.height,
+            input_area.width,
+            1,
+        )
+    })
+}
+
 fn ui_layout(
     state: &UiState,
     area: Rect,
@@ -1492,7 +1513,10 @@ fn ui_layout(
              // console at all. On a one-row terminal the console takes that row rather
              // than collapsing to an unusable rectangle.
     let bottom_margin = u16::from(area.height > 1);
-    let usable_height = area.height.saturating_sub(bottom_margin);
+    let usable_height = area
+        .height
+        .saturating_sub(bottom_margin)
+        .saturating_sub(background_indicator_height(state));
     let input_height = requested_input_height.min(usable_height);
     let transcript_gap_height = u16::from(usable_height >= input_height.saturating_add(2));
     let chat_height = usable_height.saturating_sub(input_height + transcript_gap_height);
@@ -2055,6 +2079,21 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         Block::default().style(Style::default().bg(PROMPT_BACKGROUND)),
         input_chunk,
     );
+    if let Some(indicator_area) = background_indicator_area(state, input_chunk) {
+        let active_count = state.background_active_count.load(Ordering::Relaxed);
+        let indicator_style = Style::default()
+            .fg(BACKGROUND_INDICATOR_COLOR)
+            .bg(BACKGROUND_INDICATOR_BACKGROUND);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(BACKGROUND_INDICATOR_BACKGROUND)),
+            indicator_area,
+        );
+        frame.render_widget(
+            Paragraph::new(format!("Background task(s) {active_count} is running..."))
+                .style(indicator_style),
+            indicator_area,
+        );
+    }
 
     if let Some(layout) = welcome_image_layout {
         let image = welcome_image(layout.image_size);
@@ -5042,6 +5081,65 @@ mod tests {
                         "busy={busy}: unexpected background at ({x}, {y})"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn background_indicator_fills_the_row_below_the_prompt_surface() {
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        state.background_active_count.store(2, Ordering::Relaxed);
+        let area = Rect::new(0, 0, 80, 10);
+        let viewport = tui_viewport(area);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw background indicator");
+
+        let (_, _, _, _, input_area, _) = ui_layout(&state, viewport);
+        let indicator_area =
+            background_indicator_area(&state, input_area).expect("visible background indicator");
+        assert_eq!(indicator_area.y, input_area.y + input_area.height);
+        assert!(indicator_area.y + indicator_area.height <= viewport.y + viewport.height);
+        let buffer = terminal.backend().buffer();
+        for x in indicator_area.x..indicator_area.x + indicator_area.width {
+            assert_eq!(
+                buffer[(x, indicator_area.y)].bg,
+                BACKGROUND_INDICATOR_BACKGROUND
+            );
+        }
+        let expected = "Background task(s) 2 is running...";
+        let rendered = (indicator_area.x..indicator_area.x + indicator_area.width)
+            .map(|x| buffer[(x, indicator_area.y)].symbol())
+            .collect::<String>();
+        assert!(rendered.starts_with(expected));
+        for x in indicator_area.x..indicator_area.x + expected.len() as u16 {
+            assert_eq!(buffer[(x, indicator_area.y)].fg, BACKGROUND_INDICATOR_COLOR);
+        }
+    }
+
+    #[test]
+    fn background_indicator_is_hidden_when_no_background_tasks_are_active() {
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let area = Rect::new(0, 0, 80, 10);
+        let viewport = tui_viewport(area);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw without background indicator");
+
+        let (_, _, _, _, input_area, _) = ui_layout(&state, viewport);
+        assert_eq!(background_indicator_area(&state, input_area), None);
+        let buffer = terminal.backend().buffer();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                assert_ne!(buffer[(x, y)].bg, BACKGROUND_INDICATOR_BACKGROUND);
             }
         }
     }
