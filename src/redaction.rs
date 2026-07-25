@@ -75,6 +75,7 @@ const PROTECTED_LITERALS: &[&str] = &[
     "message",
     "null",
     "object",
+    "observation",
     "provider",
     "provider_stream",
     "session",
@@ -187,6 +188,7 @@ mod tests {
         for secret in [
             "session",
             "tool",
+            "observation",
             "cmd",
             "command",
             "0",

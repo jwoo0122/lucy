@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub const OBSERVATION_ROLE: &str = "observation";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
@@ -109,6 +111,17 @@ impl ChatMessage {
         }
     }
 
+    pub fn observation(content: String) -> Self {
+        Self {
+            role: OBSERVATION_ROLE.to_owned(),
+            content: Some(content),
+            reasoning_details: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
     pub fn assistant(content: String, tool_calls: Vec<ChatToolCall>) -> Self {
         Self {
             role: "assistant".to_owned(),
@@ -132,8 +145,13 @@ impl ChatMessage {
     }
 
     pub fn to_openai_value(&self) -> Value {
+        let role = if self.role == OBSERVATION_ROLE {
+            "user"
+        } else {
+            &self.role
+        };
         let mut message = json!({
-            "role": self.role,
+            "role": role,
             "content": self.content,
         });
         if self.role == "assistant" {
@@ -208,6 +226,19 @@ mod tests {
         );
         assert_eq!(tool.to_openai_value()["tool_call_id"], "call-1");
         assert_eq!(tool.to_openai_value()["name"], "cmd");
+    }
+
+    #[test]
+    fn observation_keeps_its_session_role_but_uses_the_openai_user_role() {
+        let observation = ChatMessage::observation("untrusted output".to_owned());
+
+        assert_eq!(observation.role, OBSERVATION_ROLE);
+        assert_eq!(
+            serde_json::to_value(&observation).expect("serialize observation")["role"],
+            OBSERVATION_ROLE
+        );
+        assert_eq!(observation.to_openai_value()["role"], "user");
+        assert_eq!(observation.to_openai_value()["content"], "untrusted output");
     }
 
     #[test]
