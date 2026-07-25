@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.2](https://github.com/jwoo0122/lucy/compare/v1.12.1...v1.12.2) - 2026-07-25
+
+### Fixed
+
+- deliver background cmd completions as low-privilege observations
+
 ## [1.12.1](https://github.com/jwoo0122/lucy/compare/v1.12.0...v1.12.1) - 2026-07-25
 
 ### Fixed
