@@ -55,7 +55,7 @@ decisions:
       - harness.session-and-context-lifecycle
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-22'
+    last_reviewed: '2026-07-26'
     enforcement:
       - id: background-command-contract
         path: tests/cli.rs
@@ -68,6 +68,30 @@ decisions:
         must_contain:
           - 'pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);'
           - 'pub const COMMAND_OUTPUT_CAP: usize = 64 * 1024;'
+        must_not_contain: []
+      - id: background-completion-is-not-system-context
+        path: src/app.rs
+        must_contain:
+          - ChatMessage::observation(content)
+        must_not_contain:
+          - ChatMessage::system(content)
+      - id: observation-wire-mapping
+        path: src/model.rs
+        must_contain:
+          - fn observations_are_stored_apart_from_system_and_sent_as_user()
+          - fn wire_role(&self) -> &str
+        must_not_contain: []
+      - id: codex-observation-mapping
+        path: src/codex_provider.rs
+        must_contain:
+          - fn codex_request_keeps_observations_out_of_instructions()
+          - '"role": message.wire_role(),'
+        must_not_contain: []
+      - id: legacy-background-completion-demotion
+        path: src/session.rs
+        must_contain:
+          - 'fn demote_legacy_background_completion(message: &ChatMessage) -> ChatMessage'
+          - fn background_completions_reach_the_provider_as_observations_not_system_context()
         must_not_contain: []
     enforcement_exception: null
   - id: harness.configuration-and-provider

@@ -23,6 +23,19 @@ pub struct ChatToolCall {
     pub arguments: String,
 }
 
+/// Session-level role for harness context that carries untrusted program
+/// output. No provider accepts this role on the wire, so every adapter maps it
+/// down to the lowest-authority role the provider does accept.
+pub(crate) const OBSERVATION_ROLE: &str = "observation";
+
+/// Opening line of a background-completion observation.
+///
+/// Sessions written before observations existed persisted the completion as a
+/// `system` message that started with this same line, so it doubles as the
+/// legacy marker that lets `provider_messages()` reinterpret those records
+/// instead of promoting them into the provider instructions.
+pub(crate) const BACKGROUND_COMPLETION_MARKER: &str = "Lucy background command completed.";
+
 /// Reasoning detail formats whose `reasoning.text` entries are rejected by the
 /// upstream provider when they carry no signature.
 ///
@@ -131,9 +144,36 @@ impl ChatMessage {
         }
     }
 
+    /// Harness-owned context that carries untrusted program output.
+    ///
+    /// Observations must never reach a provider as `system`: the Codex adapter
+    /// joins every system message into the top-level `instructions`, which
+    /// would give captured stdout/stderr the authority of the boot system
+    /// prompt and strip its position in the conversation.
+    pub fn observation(content: String) -> Self {
+        Self {
+            role: OBSERVATION_ROLE.to_owned(),
+            content: Some(content),
+            reasoning_details: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// The role this message is sent as. Identical to the stored role except
+    /// for observations, which no provider accepts verbatim.
+    pub(crate) fn wire_role(&self) -> &str {
+        if self.role == OBSERVATION_ROLE {
+            "user"
+        } else {
+            &self.role
+        }
+    }
+
     pub fn to_openai_value(&self) -> Value {
         let mut message = json!({
-            "role": self.role,
+            "role": self.wire_role(),
             "content": self.content,
         });
         if self.role == "assistant" {
@@ -208,6 +248,20 @@ mod tests {
         );
         assert_eq!(tool.to_openai_value()["tool_call_id"], "call-1");
         assert_eq!(tool.to_openai_value()["name"], "cmd");
+    }
+
+    #[test]
+    fn observations_are_stored_apart_from_system_and_sent_as_user() {
+        let observation = ChatMessage::observation("captured stdout".to_owned());
+
+        assert_eq!(observation.role, OBSERVATION_ROLE);
+        assert_ne!(observation.role, "system");
+        assert_eq!(observation.to_openai_value()["role"], "user");
+        assert_eq!(observation.to_openai_value()["content"], "captured stdout");
+        assert_eq!(
+            ChatMessage::system("boot".to_owned()).to_openai_value()["role"],
+            "system"
+        );
     }
 
     #[test]

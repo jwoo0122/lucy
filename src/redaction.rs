@@ -75,6 +75,7 @@ const PROTECTED_LITERALS: &[&str] = &[
     "message",
     "null",
     "object",
+    "observation",
     "provider",
     "provider_stream",
     "session",
