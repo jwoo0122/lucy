@@ -20,6 +20,7 @@ use crate::redaction::{conflicts_with_protected_literal, redact_secret};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+const LEGACY_BACKGROUND_COMPLETION_PREFIX: &str = "Lucy background command completed";
 
 #[derive(Debug)]
 pub struct SessionError(String);
@@ -684,7 +685,17 @@ impl Session {
                             completed_tool_calls.insert(id.to_owned());
                         }
                     }
-                    messages.push(message.clone());
+                    if message.role == "system"
+                        && message.content.as_deref().is_some_and(|content| {
+                            content.starts_with(LEGACY_BACKGROUND_COMPLETION_PREFIX)
+                        })
+                    {
+                        messages.push(ChatMessage::observation(
+                            message.content.clone().unwrap_or_default(),
+                        ));
+                    } else {
+                        messages.push(message.clone());
+                    }
                 }
                 SessionHistoryRecord::Interruption {
                     phase,
@@ -1383,6 +1394,50 @@ mod tests {
         assert!(file.lines().count() >= 3);
         assert!(!file.contains("TEST_KEY_VALUE"));
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn provider_messages_downgrade_legacy_background_system_records() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_LEGACY_BACKGROUND_KEY".to_owned(),
+            effort: None,
+        };
+        let mut session =
+            Session::create(&home, &cwd, "genuine boot prompt".to_owned(), llm).expect("create");
+        session
+            .append_message(ChatMessage::system(format!(
+                "{LEGACY_BACKGROUND_COMPLETION_PREFIX}. legacy output"
+            )))
+            .expect("append legacy background completion");
+        let id = session.id.clone();
+        let path = session.path.clone();
+        let raw_before = fs::read_to_string(&path).expect("session JSONL");
+        assert!(raw_before.contains(
+            r#""role":"system","content":"Lucy background command completed. legacy output""#
+        ));
+
+        let resumed = Session::resume(&home, &id).expect("resume");
+        let provider_messages = resumed.provider_messages();
+        assert_eq!(provider_messages.len(), 2);
+        assert_eq!(provider_messages[0].role, "system");
+        assert_eq!(
+            provider_messages[0].content.as_deref(),
+            Some("genuine boot prompt")
+        );
+        assert_eq!(provider_messages[1].role, crate::model::OBSERVATION_ROLE);
+        assert_eq!(
+            provider_messages[1].content.as_deref(),
+            Some("Lucy background command completed. legacy output")
+        );
+        assert_eq!(
+            fs::read_to_string(path).expect("session JSONL after provider messages"),
+            raw_before
+        );
+        fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]

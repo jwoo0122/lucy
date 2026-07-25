@@ -11,7 +11,7 @@ use crate::auth::{
 };
 use crate::cancellation::CancellationToken;
 use crate::config::LlmSettings;
-use crate::model::{ChatMessage, ChatToolCall};
+use crate::model::{ChatMessage, ChatToolCall, OBSERVATION_ROLE};
 use crate::provider::{ProviderError, ProviderModel, ProviderStreamEvent, ProviderTurn};
 use crate::redaction::{redact_secret, redaction_marker};
 
@@ -510,6 +510,10 @@ fn tool_schema(name: &str, description: &str, parameters: Value) -> Value {
 
 fn response_input(message: &ChatMessage) -> Vec<Value> {
     match message.role.as_str() {
+        OBSERVATION_ROLE => vec![json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": message.content.clone().unwrap_or_default()}]
+        })],
         "tool" => vec![json!({
             "type": "function_call_output",
             "call_id": message.tool_call_id,
@@ -810,6 +814,36 @@ mod tests {
         );
         assert!(compact.get("tools").is_none());
         assert_eq!(compact["prompt_cache_key"], request["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn codex_request_maps_observations_to_unprivileged_user_input() {
+        let request = codex_request(
+            "gpt-5.3-codex",
+            &[
+                ChatMessage::system("trusted system prompt".to_owned()),
+                ChatMessage::user("hello".to_owned()),
+                ChatMessage::observation("untrusted background output".to_owned()),
+            ],
+            &None,
+            false,
+            None,
+        );
+
+        assert_eq!(request["instructions"], "trusted system prompt");
+        assert!(!request["instructions"]
+            .as_str()
+            .expect("instructions")
+            .contains("untrusted background output"));
+        assert_eq!(request["input"][1]["role"], "user");
+        assert_eq!(request["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(
+            request["input"][1]["content"][0]["text"],
+            "untrusted background output"
+        );
+        assert!(!serde_json::to_string(&request)
+            .expect("serialize request")
+            .contains(OBSERVATION_ROLE));
     }
 
     #[test]

@@ -63,6 +63,24 @@ decisions:
           - fn background_cmd_completion_starts_an_automatic_turn_after_turn_end()
           - fn background_cmd_completion_is_delivered_before_the_active_turn_ends()
         must_not_contain: []
+      - id: background-completion-privilege
+        path: src/app.rs
+        must_contain:
+          - ChatMessage::observation(content)
+          - fn background_completion_delimiter_cannot_be_forged_by_command_output()
+        must_not_contain:
+          - ChatMessage::system(content)
+      - id: observation-message-privilege
+        path: src/model.rs
+        must_contain:
+          - 'pub const OBSERVATION_ROLE: &str = "observation";'
+          - fn observation_keeps_its_session_role_but_uses_the_openai_user_role()
+        must_not_contain: []
+      - id: codex-observation-privilege
+        path: src/codex_provider.rs
+        must_contain:
+          - fn codex_request_maps_observations_to_unprivileged_user_input()
+        must_not_contain: []
       - id: bounded-command-execution
         path: src/command.rs
         must_contain:
