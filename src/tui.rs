@@ -79,7 +79,7 @@ const PENDING_TOOL_COLOR: Color = Color::Rgb(
 );
 /// A completed `cmd` call first retains its pending orange, then sweeps to the
 /// final result colour from the left edge of the compact tool line.
-const TOOL_RESULT_SWEEP_DURATION: Duration = Duration::from_millis(1200);
+const TOOL_RESULT_SWEEP_DURATION: Duration = Duration::from_millis(600);
 /// Each character spends this portion of the sweep cross-fading. The remaining
 /// time staggers those fades from the first character to the last.
 const TOOL_RESULT_CHARACTER_FADE_PORTION: f32 = 0.4;
@@ -2366,6 +2366,43 @@ fn max_scroll_for_area(state: &UiState, size: Size) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
+const TRANSCRIPT_SCROLLBAR_TRACK: &str = "┆";
+const TRANSCRIPT_SCROLLBAR_THUMB: &str = "█";
+const TRANSCRIPT_SCROLLBAR_TRACK_COLOR: Color = Color::Rgb(72, 72, 76);
+
+fn draw_transcript_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    total_lines: usize,
+    max_scroll: u16,
+    scroll: u16,
+) {
+    if area.width == 0 || area.height == 0 || total_lines == 0 || max_scroll == 0 {
+        return;
+    }
+
+    let track_height = area.height as usize;
+    let thumb_height = ((track_height * track_height) / total_lines)
+        .max(1)
+        .min(track_height);
+    let thumb_range = track_height.saturating_sub(thumb_height);
+    let thumb_start = (usize::from(scroll.min(max_scroll)) * thumb_range / usize::from(max_scroll))
+        .min(thumb_range);
+    let x = area.x + area.width - 1;
+    let buffer = frame.buffer_mut();
+
+    for offset in 0..track_height {
+        let y = area.y + offset as u16;
+        buffer[(x, y)].set_symbol(TRANSCRIPT_SCROLLBAR_TRACK);
+        buffer[(x, y)].set_fg(TRANSCRIPT_SCROLLBAR_TRACK_COLOR);
+    }
+    for offset in thumb_start..thumb_start + thumb_height {
+        let y = area.y + offset as u16;
+        buffer[(x, y)].set_symbol(TRANSCRIPT_SCROLLBAR_THUMB);
+        buffer[(x, y)].set_fg(CONSOLE_STATUS_COLOR);
+    }
+}
+
 /// Number of wrapped rows the current input occupies at `width`.
 fn input_visible_rows(state: &UiState, width: u16) -> u16 {
     let width = width as usize;
@@ -2718,8 +2755,12 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         } else {
             state.scroll.min(max_scroll)
         };
+        let total_lines = lines.len();
         let transcript = Paragraph::new(lines).scroll((scroll, 0));
         frame.render_widget(transcript, visible_chat_area);
+        if !state.auto_scroll {
+            draw_transcript_scrollbar(frame, visible_chat_area, total_lines, max_scroll, scroll);
+        }
     }
 
     if let Some(layout) = welcome_image_layout {
@@ -5565,6 +5606,58 @@ mod tests {
     }
 
     #[test]
+    fn transcript_scrollbar_appears_only_when_the_stream_is_scrolled() {
+        let mut state = UiState::from_history(&[], "provider-secret", "model", None, false);
+        state.welcome_visible = false;
+        state.transcript = (0..40)
+            .map(|index| TranscriptItem::Info(format!("message {index}")))
+            .collect();
+        state.auto_scroll = false;
+        state.scroll = 3;
+
+        let area = Rect::new(0, 0, 80, 14);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw scrolled transcript");
+
+        let chat_area = ui_layout(&state, tui_viewport(area)).0;
+        let scrollbar_x = chat_area.x + chat_area.width - 1;
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (chat_area.y..chat_area.y + chat_area.height).any(|y| {
+                buffer[(scrollbar_x, y)].symbol() == TRANSCRIPT_SCROLLBAR_THUMB
+                    && buffer[(scrollbar_x, y)].fg == CONSOLE_STATUS_COLOR
+            }),
+            "a scrolled transcript should show a scrollbar thumb"
+        );
+        assert!(
+            (chat_area.y..chat_area.y + chat_area.height)
+                .any(|y| { buffer[(scrollbar_x, y)].symbol() == TRANSCRIPT_SCROLLBAR_TRACK }),
+            "a scrolled transcript should show a scrollbar track"
+        );
+
+        state.auto_scroll = true;
+        state.scroll = 0;
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw following transcript");
+        let buffer = terminal.backend().buffer();
+        assert!((chat_area.y..chat_area.y + chat_area.height)
+            .all(|y| buffer[(scrollbar_x, y)].symbol() != TRANSCRIPT_SCROLLBAR_THUMB));
+    }
+
+    #[test]
+    fn tool_result_sweep_is_now_twice_as_fast() {
+        assert_eq!(TOOL_RESULT_SWEEP_DURATION, Duration::from_millis(600));
+    }
+
+    #[test]
     fn wrap_text_breaks_long_lines_and_preserves_empty_lines() {
         let rows = wrap_text("12345\n\nabc", 3);
         assert_eq!(rows, vec!["123", "45", "", "abc"]);
@@ -5812,9 +5905,9 @@ mod tests {
                 assert!(frames.windows(2).all(|pair| {
                     let (before_red, before_green, before_blue) = tool_result_color_rgb(pair[0]);
                     let (after_red, after_green, after_blue) = tool_result_color_rgb(pair[1]);
-                    before_red.abs_diff(after_red) <= 45
-                        && before_green.abs_diff(after_green) <= 45
-                        && before_blue.abs_diff(after_blue) <= 45
+                    before_red.abs_diff(after_red) <= 90
+                        && before_green.abs_diff(after_green) <= 90
+                        && before_blue.abs_diff(after_blue) <= 90
                 }));
                 assert_eq!(frames.last(), Some(&target));
             }
