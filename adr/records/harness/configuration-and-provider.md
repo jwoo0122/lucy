@@ -14,6 +14,28 @@ depends_on:
 supersedes: []
 superseded_by: []
 last_reviewed: "2026-07-25"
+enforcement:
+  - id: config-bootstrap-and-migration
+    path: src/config.rs
+    must_contain:
+      - "fn bootstraps_config_without_overwriting_existing_bytes()"
+      - "fn migrates_a_legacy_config_once_without_overwriting_xdg_config()"
+      - "fn auth_provider_rejects_mixed_credentials()"
+    must_not_contain: []
+  - id: openrouter-session-identity-and-attribution
+    path: src/provider.rs
+    must_contain:
+      - "fn openrouter_requests_include_session_and_app_metadata()"
+      - "fn compatible_requests_omit_provider_specific_session_metadata()"
+      - 'const APP_URL: &str = "https://lucyna.run";'
+    must_not_contain: []
+  - id: codex-session-identity
+    path: src/codex_provider.rs
+    must_contain:
+      - "fn codex_request_uses_responses_shape()"
+      - 'request["prompt_cache_key"] = json!(session_id);'
+    must_not_contain: []
+enforcement_exception: null
 ---
 
 # User-owned configuration and provider boundary

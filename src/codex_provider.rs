@@ -496,8 +496,8 @@ fn codex_request(
     if include_tools {
         let tools = vec![tool_schema(
             "cmd",
-            "Execute a finite shell command in the session starting directory.",
-            json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}),
+            "Execute a shell command in the session starting directory. Set background to return immediately and receive the completed result automatically.",
+            json!({"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","default":false}},"required":["command"],"additionalProperties":false}),
         )];
         request["tools"] = Value::Array(tools);
     }
@@ -797,6 +797,9 @@ mod tests {
         assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["tools"][0]["name"], "cmd");
         assert_eq!(request["prompt_cache_key"], "lucy-session");
+        let background = &request["tools"][0]["parameters"]["properties"]["background"];
+        assert_eq!(background["type"], "boolean");
+        assert_eq!(background["default"], false);
 
         let compact = codex_request(
             "gpt-5.3-codex",

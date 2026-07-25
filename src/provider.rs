@@ -243,8 +243,8 @@ fn chat_request(
             "type": "function",
             "function": {
                 "name": "cmd",
-                "description": "Execute a finite shell command in the session starting directory.",
-                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": false}
+                "description": "Execute a shell command in the session starting directory. Set background to return immediately and receive the completed result automatically.",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "background": {"type": "boolean", "default": false}}, "required": ["command"], "additionalProperties": false}
             }
         })];
         request["tools"] = Value::Array(tools);
@@ -1308,6 +1308,9 @@ mod tests {
         let tools = request["tools"].as_array().expect("model tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "cmd");
+        let background = &tools[0]["function"]["parameters"]["properties"]["background"];
+        assert_eq!(background["type"], "boolean");
+        assert_eq!(background["default"], false);
     }
 
     #[test]
