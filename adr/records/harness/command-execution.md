@@ -25,18 +25,19 @@ What execution semantics does the v1 `cmd` tool provide?
 
 ## Current decision
 
-Lucy MUST target macOS/Linux in v1 and execute `cmd` arguments through `/bin/sh -lc`. The command MUST run from the session's starting cwd and inherit the Lucy process environment except for the configured provider API-key environment variable, which MUST be removed before spawning the shell. stdin MUST be disconnected. Lucy MUST support finite commands only; interactive, daemon, and long-lived process management are out of scope.
+Lucy MUST target macOS/Linux in v1 and execute `cmd` arguments through the user environment's `$SHELL -lc`, falling back to `/bin/sh -lc` when `SHELL` is unset or empty. The command MUST run from the session's starting cwd and inherit the Lucy process environment, including the configured provider API-key environment variable. stdin MUST be disconnected. Lucy MUST support finite commands only; interactive, daemon, and long-lived process management are out of scope.
 
 Each command MUST have a 10-minute timeout. stdout and stderr MUST each be bounded to 64 KiB; truncation MUST be represented in the normalized tool result. A non-zero exit is a successful tool invocation with its exit code and captured output, not a harness-level protocol error.
 
 ## Context and forces
 
-The model is explicitly trusted and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy removes the provider credential from the direct child environment and redacts it from captured/persisted tool output. This does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the single-turn protocol or consuming the model context without limit.
+The model is explicitly trusted and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy treats the command environment as a trusted terminal environment and redacts the provider credential from captured/persisted tool output. The credential is therefore available to commands and may be observed by them; this does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the single-turn protocol or consuming the model context without limit.
 
 ## Invariants
 
 - The shell command string is passed without Lucy-side rewriting.
-- The configured provider API-key variable is absent from the child environment.
+- The shell executable is inherited from `SHELL` when set, with `/bin/sh` as the empty/unset fallback.
+- The configured provider API-key variable remains available in the child environment.
 - Captured command output is redacted before protocol or session serialization.
 - The command cwd is stable across invocations; shell-local `cd` does not mutate the session cwd.
 - Timeout and output truncation produce a tool result that the model can handle.
@@ -46,7 +47,7 @@ The model is explicitly trusted and the harness is local-only, so v1 does not ad
 
 ## Alternatives and trade-offs
 
-A dedicated argv API would reduce shell interpretation but would not satisfy the intended command-line agent experience. Interactive process support would enable servers and REPLs but requires stdin multiplexing, cancellation, and process lifecycle APIs. Lucy defers that complexity.
+A dedicated argv API would reduce shell interpretation but would not satisfy the intended command-line agent experience. A fixed `/bin/sh` would be more predictable, but would ignore the user's configured shell and startup behavior. Interactive process support would enable servers and REPLs but requires stdin multiplexing, cancellation, and process lifecycle APIs. Lucy defers that complexity.
 
 ## Consequences
 

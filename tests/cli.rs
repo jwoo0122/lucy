@@ -587,7 +587,7 @@ fn parse_lines(output: &[u8]) -> Vec<Value> {
 }
 
 #[test]
-fn cmd_removes_provider_key_but_inherits_other_environment_values() {
+fn cmd_inherits_provider_key_but_redacts_captured_output() {
     let server = MockServer::start(vec![
         provider_environment_tool_response(),
         normal_response("finished"),
@@ -611,7 +611,7 @@ fn cmd_removes_provider_key_but_inherits_other_environment_values() {
         .iter()
         .find(|record| record["type"] == "tool_result")
         .expect("tool result event");
-    assert_eq!(tool_result["result"]["stdout"], "");
+    assert_eq!(tool_result["result"]["stdout"], "[REDACTED]");
     assert_eq!(tool_result["result"]["stderr"], "ordinary-value");
     assert!(!serde_json::to_string(tool_result)
         .expect("tool result JSON")
@@ -865,7 +865,7 @@ fn list_omits_existing_sessions_when_the_current_key_collides_with_literals() {
 }
 
 #[test]
-fn git_context_discovery_removes_the_configured_provider_environment() {
+fn git_context_discovery_uses_the_project_root_with_the_normal_terminal_environment() {
     let server = MockServer::start(vec![normal_response("finished")]);
     let (home, project) = temporary_tree("git-provider-environment");
     let nested = project.join("nested");
@@ -876,16 +876,14 @@ fn git_context_discovery_removes_the_configured_provider_environment() {
         &server.base_url,
         "base prompt",
         "mock-model",
-        "GIT_DIR",
+        "LUCY_API_KEY",
     );
 
-    let output = run_lucy_with_key_env(
+    let output = run_lucy(
         &home,
         &nested,
         &[],
         "{\"type\":\"message\",\"text\":\"hello\"}\n",
-        "GIT_DIR",
-        "provider-secret",
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
@@ -1983,124 +1981,50 @@ fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
 }
 
 #[test]
-fn spawn_subagent_queues_immediately_and_automatically_delivers_completion() {
-    let arguments = json!({"task": "inspect only this task"}).to_string();
-    let tool = json!({"id":"provider-id","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"delegate-1","type":"function","function":{"name":"spawn_subagent","arguments":arguments}}]},"finish_reason":"tool_calls"}]});
-    let response = format!("data: {tool}\n\ndata: [DONE]\n\n");
+fn separate_lucy_processes_resume_the_same_named_session() {
     let server = MockServer::start(vec![
-        response,
-        normal_response("parent continued without waiting"),
-        normal_response("worker result"),
-        normal_response("completion acknowledged"),
+        normal_response("first answer"),
+        normal_response("second answer"),
     ]);
-    let (home, project) = temporary_tree("queued-subagent");
-    write_config_with_effort(
-        &home,
-        &server.base_url,
-        "base prompt",
-        "parent-model",
-        "high",
-    );
-    let output = run_lucy(
+    let (home, project) = temporary_tree("external-session-orchestration");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let first = run_lucy(
         &home,
         &project,
         &["--jsonl"],
-        "{\"type\":\"message\",\"text\":\"delegate this\"}\n",
+        "{\"type\":\"message\",\"text\":\"first request\"}\n",
     );
-    assert!(output.status.success(), "stderr: {:?}", output.stderr);
-    let records = parse_lines(&output.stdout);
-    let queued = records
-        .iter()
-        .find(|record| record["type"] == "tool_result" && record["name"] == "spawn_subagent")
-        .expect("queued result");
-    assert_eq!(queued["result"]["status"], "queued");
-    assert!(queued["result"]["task_id"]
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    let first_records = parse_lines(&first.stdout);
+    let session_id = first_records[0]["session_id"]
         .as_str()
-        .unwrap_or_default()
-        .starts_with("subagent-"));
-    assert!(records
+        .expect("session id")
+        .to_owned();
+    assert_eq!(first_records[0]["resumed"], false);
+
+    let second = run_lucy(
+        &home,
+        &project,
+        &["--jsonl", "--session", &session_id],
+        "{\"type\":\"message\",\"text\":\"second request\"}\n",
+    );
+    assert!(second.status.success(), "stderr: {:?}", second.stderr);
+    let second_records = parse_lines(&second.stdout);
+    assert_eq!(second_records[0]["session_id"], session_id);
+    assert_eq!(second_records[0]["resumed"], true);
+    assert!(second_records
         .iter()
-        .any(|record| record["type"] == "assistant_delta"
-            && record["text"] == "completion acknowledged"));
+        .any(|record| record["type"] == "assistant_delta" && record["text"] == "second answer"));
 
     let requests = server.join();
-    assert_eq!(requests.len(), 4);
-    let worker: Value = requests
-        .iter()
-        .map(|request| serde_json::from_str(request).expect("request JSON"))
-        .find(|request: &Value| {
-            request["messages"].as_array().is_some_and(|messages| {
-                messages
-                    .iter()
-                    .any(|message| message["content"] == "inspect only this task")
-            })
-        })
-        .expect("worker request");
-    assert_eq!(worker["model"], "parent-model");
-    assert_eq!(worker["reasoning_effort"], "high");
-    assert_eq!(
-        worker["messages"]
-            .as_array()
-            .expect("worker messages")
-            .len(),
-        2
-    );
-    assert_eq!(worker["messages"][1]["content"], "inspect only this task");
-    assert!(worker["tools"]
-        .as_array()
-        .expect("worker tools")
-        .iter()
-        .all(|tool| tool["function"]["name"] != "spawn_subagent"));
-    let lifecycle = records
-        .iter()
-        .filter(|record| {
-            matches!(
-                record["type"].as_str(),
-                Some("background_result_pending" | "background_result_delivered")
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(lifecycle.len(), 2);
-    assert_eq!(lifecycle[0]["type"], "background_result_pending");
-    assert_eq!(lifecycle[1]["type"], "background_result_delivered");
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| record["type"] == "turn_end")
-            .count(),
-        1
-    );
-    let resumed_parent = requests
-        .iter()
-        .map(|request| serde_json::from_str::<Value>(request).expect("request JSON"))
-        .find(|request| {
-            request["messages"].as_array().is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message["role"] == "tool" && message["name"] == "background_result"
-                })
-            })
-        })
-        .expect("same-turn resumed parent request");
-    let messages = resumed_parent["messages"].as_array().expect("messages");
-    let synthetic = messages
-        .iter()
-        .position(|message| {
-            message["role"] == "assistant"
-                && message["tool_calls"][0]["function"]["name"] == "background_result"
-        })
-        .expect("synthetic assistant call");
-    assert_eq!(messages[synthetic + 1]["role"], "tool");
-    assert_eq!(messages[synthetic + 1]["name"], "background_result");
-    assert!(messages.iter().all(|message| {
-        message["role"] != "user"
-            || !message["content"]
-                .as_str()
-                .is_some_and(|text| text.contains("worker result"))
-    }));
-    assert!(resumed_parent["tools"]
-        .as_array()
-        .expect("model tools")
-        .iter()
-        .all(|tool| tool["function"]["name"] != "background_result"));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("first request"));
+    assert!(requests[1].contains("second request"));
+    let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
+    let tools = resumed_request["tools"].as_array().expect("model tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "cmd");
+
     fs::remove_dir_all(home).expect("cleanup");
 }
