@@ -3984,18 +3984,35 @@ fn model_status_line_at(state: &UiState, effort: &str, elapsed: Duration) -> Lin
     } else {
         context_status_style(state)
     };
-    let graph = if state.busy {
-        format!(" {}", model_graph_frame_at(elapsed))
-    } else {
-        String::new()
-    };
-    Line::from(vec![
-        Span::styled(format!("{model}{graph}"), model_style),
-        Span::styled(
-            format!(" · {effort} | {}", context_status_text(state)),
-            context_status_style(state),
-        ),
-    ])
+    let mut spans = vec![Span::styled(
+        if state.busy {
+            format!("{model} ")
+        } else {
+            model
+        },
+        model_style,
+    )];
+    if state.busy {
+        let accent = console_accent_at(elapsed);
+        let (head, _) = model_graph_position_at(elapsed);
+        for (index, character) in model_graph_frame_at(elapsed).chars().enumerate() {
+            let distance = if character == MODEL_GRAPH_BLOCK && index != head {
+                Some(index.abs_diff(head))
+            } else {
+                None
+            };
+            let color = model_graph_color(accent, distance);
+            spans.push(Span::styled(
+                character.to_string(),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    spans.push(Span::styled(
+        format!(" · {effort} | {}", context_status_text(state)),
+        context_status_style(state),
+    ));
+    Line::from(spans)
 }
 
 fn console_accent_cycle() -> Duration {
@@ -4047,8 +4064,8 @@ const PULSE_BAR_PHASES: [u128; 5] = [0, 5, 13, 9, 3];
 const MODEL_GRAPH_TRACK_LENGTH: usize = 5;
 const MODEL_GRAPH_TAIL_LENGTH: usize = 2;
 const MODEL_GRAPH_WIDTH: usize = MODEL_GRAPH_TRACK_LENGTH + MODEL_GRAPH_TAIL_LENGTH;
-const MODEL_GRAPH_HEAD: char = '■';
-const MODEL_GRAPH_TAIL: char = '▪';
+const MODEL_GRAPH_BLOCK: char = '■';
+const MODEL_GRAPH_TAIL_OPACITY: [f32; MODEL_GRAPH_TAIL_LENGTH] = [0.55, 0.25];
 const MODEL_GRAPH_PERIOD_TICKS: u128 = (MODEL_GRAPH_TRACK_LENGTH as u128 - 1) * 2;
 const PULSE_TICK: Duration = Duration::from_millis(50);
 const TOOL_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
@@ -4090,16 +4107,20 @@ fn pulse_frame(levels: [usize; PULSE_BAR_PERIODS.len()]) -> String {
         .collect()
 }
 
-fn model_graph_frame_at(elapsed: Duration) -> String {
+fn model_graph_position_at(elapsed: Duration) -> (usize, bool) {
     let tick = elapsed.as_millis() / PULSE_TICK.as_millis();
     let phase = tick % MODEL_GRAPH_PERIOD_TICKS;
-    let (head, moving_right) = if phase < MODEL_GRAPH_TRACK_LENGTH as u128 {
+    if phase < MODEL_GRAPH_TRACK_LENGTH as u128 {
         (phase as usize, phase < MODEL_GRAPH_TRACK_LENGTH as u128 - 1)
     } else {
         ((MODEL_GRAPH_PERIOD_TICKS - phase) as usize, false)
-    };
+    }
+}
+
+fn model_graph_frame_at(elapsed: Duration) -> String {
+    let (head, moving_right) = model_graph_position_at(elapsed);
     let mut frame = vec![' '; MODEL_GRAPH_WIDTH];
-    frame[head] = MODEL_GRAPH_HEAD;
+    frame[head] = MODEL_GRAPH_BLOCK;
     for distance in 1..=MODEL_GRAPH_TAIL_LENGTH {
         let tail = if moving_right {
             head.checked_sub(distance)
@@ -4107,10 +4128,30 @@ fn model_graph_frame_at(elapsed: Duration) -> String {
             head.checked_add(distance)
         };
         if let Some(tail) = tail.filter(|&index| index < MODEL_GRAPH_WIDTH) {
-            frame[tail] = MODEL_GRAPH_TAIL;
+            frame[tail] = MODEL_GRAPH_BLOCK;
         }
     }
     frame.into_iter().collect()
+}
+
+/// Terminals do not support alpha in a cell foreground, so fade the tail by
+/// blending the accent toward the console background color.
+fn model_graph_color(accent: Color, distance: Option<usize>) -> Color {
+    let Some(distance) = distance else {
+        return accent;
+    };
+    let Color::Rgb(red, green, blue) = accent else {
+        return accent;
+    };
+    let opacity = MODEL_GRAPH_TAIL_OPACITY
+        .get(distance.saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0);
+    Color::Rgb(
+        interpolate_color(CONSOLE_BACKGROUND_RGB.0, red, opacity),
+        interpolate_color(CONSOLE_BACKGROUND_RGB.1, green, opacity),
+        interpolate_color(CONSOLE_BACKGROUND_RGB.2, blue, opacity),
+    )
 }
 
 fn pulse_levels_at(elapsed: Duration) -> [usize; PULSE_BAR_PERIODS.len()] {
@@ -4475,12 +4516,13 @@ mod tests {
 
         assert_eq!(start.spans[0].style.fg, Some(start_accent));
         assert_eq!(middle.spans[0].style.fg, Some(middle_accent));
-        assert_ne!(start.spans[0].content, middle.spans[0].content);
-        assert_eq!(start.spans[1].style.fg, Some(CONSOLE_STATUS_COLOR));
-        assert!(start.spans[0].content.starts_with("model "));
+        assert_eq!(start.spans[0].content, "model ");
+        assert_eq!(start.spans[1].content, MODEL_GRAPH_BLOCK.to_string());
+        assert_eq!(start.spans[1].style.fg, Some(start_accent));
+        assert_eq!(start.spans.len(), MODEL_GRAPH_WIDTH + 2);
         assert_eq!(
-            start.spans[0].content.chars().count(),
-            "model ".chars().count() + MODEL_GRAPH_WIDTH
+            start.spans.last().unwrap().style.fg,
+            Some(CONSOLE_STATUS_COLOR)
         );
     }
 
@@ -4503,17 +4545,38 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(frames[0], "■      ");
-        assert_eq!(frames[1], "▪■     ");
-        assert_eq!(frames[2], "▪▪■    ");
-        assert_eq!(frames[4], "    ■▪▪");
-        assert_eq!(frames[5], "   ■▪▪ ");
-        assert_eq!(frames[7], " ■▪▪   ");
+        assert_eq!(frames[1], "■■     ");
+        assert_eq!(frames[2], "■■■    ");
+        assert_eq!(frames[4], "    ■■■");
+        assert_eq!(frames[5], "   ■■■ ");
+        assert_eq!(frames[7], " ■■■   ");
         assert_eq!(frames[8], frames[0]);
         assert!(frames
             .iter()
             .all(|frame| frame.chars().count() == MODEL_GRAPH_WIDTH));
         assert_eq!(MODEL_GRAPH_TRACK_LENGTH, 5);
         assert_eq!(MODEL_GRAPH_TAIL_LENGTH, 2);
+    }
+
+    fn color_distance_from_console(color: Color) -> u32 {
+        let Color::Rgb(red, green, blue) = color else {
+            return 0;
+        };
+        u32::from(red.abs_diff(CONSOLE_BACKGROUND_RGB.0))
+            + u32::from(green.abs_diff(CONSOLE_BACKGROUND_RGB.1))
+            + u32::from(blue.abs_diff(CONSOLE_BACKGROUND_RGB.2))
+    }
+
+    #[test]
+    fn model_graph_tail_uses_same_block_with_progressively_fainter_colors() {
+        let accent = Color::Rgb(180, 120, 240);
+        let near = model_graph_color(accent, Some(1));
+        let far = model_graph_color(accent, Some(2));
+
+        assert_eq!(MODEL_GRAPH_BLOCK, '■');
+        assert_ne!(near, accent);
+        assert_ne!(far, near);
+        assert!(color_distance_from_console(near) > color_distance_from_console(far));
     }
 
     #[test]
