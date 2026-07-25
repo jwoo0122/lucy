@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader};
 use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
@@ -15,8 +16,12 @@ use crate::provider::{ProviderError, ProviderModel, ProviderStreamEvent, Provide
 use crate::redaction::{redact_secret, redaction_marker};
 
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 pub const CODEX_ENV_SENTINEL: &str = crate::config::CODEX_API_KEY_ENV_SENTINEL;
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_SSE_STREAM_BYTES: usize = 8 * 1024 * 1024;
@@ -33,6 +38,13 @@ pub struct CodexProvider {
     model: String,
     effort: Option<String>,
     initial_access: String,
+    model_cache: Mutex<Option<(Instant, String, Vec<CodexModelMetadata>)>>,
+}
+
+#[derive(Clone)]
+struct CodexModelMetadata {
+    model: ProviderModel,
+    context_window: Option<usize>,
 }
 
 impl CodexProvider {
@@ -75,6 +87,7 @@ impl CodexProvider {
             credentials: Mutex::new(credentials),
             model: settings.model.clone(),
             effort,
+            model_cache: Mutex::new(None),
         })
     }
 
@@ -94,22 +107,71 @@ impl CodexProvider {
     }
 
     pub fn models(&self) -> Vec<ProviderModel> {
-        [
-            ("gpt-5.3-codex", Some(vec!["low", "medium", "high"])),
-            ("gpt-5.3-codex-spark", Some(vec!["low", "medium", "high"])),
-            ("gpt-5.4", Some(vec!["low", "medium", "high"])),
-            ("gpt-5.4-mini", Some(vec!["low", "medium", "high"])),
-        ]
-        .into_iter()
-        .map(|(id, efforts)| ProviderModel {
-            id: id.to_owned(),
-            efforts: efforts.map(|values| values.into_iter().map(str::to_owned).collect()),
-        })
-        .collect()
+        self.model_catalog()
+            .map(|catalog| catalog.into_iter().map(|entry| entry.model).collect())
+            .unwrap_or_else(|_| bundled_models())
     }
 
     pub fn context_window(&self) -> Option<usize> {
-        Some(400_000)
+        match self.model_catalog() {
+            Ok(catalog) => catalog
+                .iter()
+                .find(|entry| entry.model.id == self.model)
+                .and_then(|entry| entry.context_window)
+                .or(Some(400_000)),
+            Err(_) => Some(400_000),
+        }
+    }
+
+    fn model_catalog(&self) -> Result<Vec<CodexModelMetadata>, ProviderError> {
+        let (access, mut account_id) = self.access_token()?;
+        if let Some((fetched_at, cached_account_id, catalog)) = self
+            .model_cache
+            .lock()
+            .map_err(|_| ProviderError::new("Codex model cache unavailable"))?
+            .as_ref()
+        {
+            if cached_account_id == &account_id && fetched_at.elapsed() < MODEL_CACHE_TTL {
+                return Ok(catalog.clone());
+            }
+        }
+
+        let mut response =
+            send_model_catalog_request(&self.client, CODEX_MODELS_ENDPOINT, &access, &account_id)?;
+        if response.status().as_u16() == 401 {
+            let (new_access, new_account_id) = self.refresh_after_unauthorized(&access)?;
+            response = send_model_catalog_request(
+                &self.client,
+                CODEX_MODELS_ENDPOINT,
+                &new_access,
+                &new_account_id,
+            )?;
+            account_id = new_account_id;
+        }
+        if !response.status().is_success() {
+            return Err(ProviderError::new(format!(
+                "Codex model catalog returned HTTP status {}",
+                response.status().as_u16()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|_| ProviderError::new("unable to load Codex model catalog"))?;
+        if bytes.len() > MAX_MODEL_METADATA_BYTES {
+            return Err(ProviderError::new(
+                "Codex model catalog exceeded the response limit",
+            ));
+        }
+        let catalog = parse_model_catalog(&bytes)?;
+        if catalog.is_empty() {
+            return Err(ProviderError::new("Codex model catalog was empty"));
+        }
+        *self
+            .model_cache
+            .lock()
+            .map_err(|_| ProviderError::new("Codex model cache unavailable"))? =
+            Some((Instant::now(), account_id, catalog.clone()));
+        Ok(catalog)
     }
 
     fn access_token(&self) -> Result<(String, String), ProviderError> {
@@ -131,6 +193,43 @@ impl CodexProvider {
         }
         let now = now_seconds();
         if credentials.near_expiry(now) {
+            let refreshed =
+                refresh_credentials(&credentials, DEFAULT_TOKEN_ENDPOINT, DEFAULT_CLIENT_ID)
+                    .map_err(|error| {
+                        ProviderError::new(redact_secret(
+                            &error.to_string(),
+                            Some(&credentials.access),
+                        ))
+                    })?;
+            self.store
+                .save(&refreshed)
+                .map_err(|error| ProviderError::new(error.to_string()))?;
+            *credentials = refreshed;
+        }
+        Ok((credentials.access.clone(), credentials.account_id.clone()))
+    }
+
+    fn refresh_after_unauthorized(
+        &self,
+        active_access: &str,
+    ) -> Result<(String, String), ProviderError> {
+        let _refresh_guard = refresh_lock()
+            .lock()
+            .map_err(|_| ProviderError::new("Codex refresh lock unavailable"))?;
+        let mut credentials = self
+            .credentials
+            .lock()
+            .map_err(|_| ProviderError::new("Codex credential lock unavailable"))?;
+        if let Some(stored) = self
+            .store
+            .load()
+            .map_err(|error| ProviderError::new(error.to_string()))?
+        {
+            if stored.access != credentials.access || stored.refresh != credentials.refresh {
+                *credentials = stored;
+            }
+        }
+        if credentials.access == active_access {
             let refreshed =
                 refresh_credentials(&credentials, DEFAULT_TOKEN_ENDPOINT, DEFAULT_CLIENT_ID)
                     .map_err(|error| {
@@ -210,39 +309,7 @@ impl CodexProvider {
             self.send_request_cancellable(&request, &access, &account_id, cancellation)?;
         let mut active_access = access;
         if response.status().as_u16() == 401 {
-            let _refresh_guard = refresh_lock()
-                .lock()
-                .map_err(|_| ProviderError::new("Codex refresh lock unavailable"))?;
-            let (new_access, new_account) = {
-                let mut current = self
-                    .credentials
-                    .lock()
-                    .map_err(|_| ProviderError::new("Codex credential lock unavailable"))?;
-                if let Some(stored) = self
-                    .store
-                    .load()
-                    .map_err(|error| ProviderError::new(error.to_string()))?
-                {
-                    if stored.access != current.access || stored.refresh != current.refresh {
-                        *current = stored;
-                    }
-                }
-                if current.access == active_access {
-                    let refreshed =
-                        refresh_credentials(&current, DEFAULT_TOKEN_ENDPOINT, DEFAULT_CLIENT_ID)
-                            .map_err(|error| {
-                                ProviderError::new(redact_secret(
-                                    &error.to_string(),
-                                    Some(&current.access),
-                                ))
-                            })?;
-                    self.store
-                        .save(&refreshed)
-                        .map_err(|error| ProviderError::new(error.to_string()))?;
-                    *current = refreshed;
-                }
-                (current.access.clone(), current.account_id.clone())
-            };
+            let (new_access, new_account) = self.refresh_after_unauthorized(&active_access)?;
             active_access = new_access.clone();
             response =
                 self.send_request_cancellable(&request, &new_access, &new_account, cancellation)?;
@@ -255,6 +322,88 @@ impl CodexProvider {
         }
         parse_stream_cancellable(response, active_access, cancellation, on_event)
     }
+}
+
+fn bundled_models() -> Vec<ProviderModel> {
+    [
+        ("gpt-5.3-codex", Some(vec!["low", "medium", "high"])),
+        ("gpt-5.3-codex-spark", Some(vec!["low", "medium", "high"])),
+        ("gpt-5.4", Some(vec!["low", "medium", "high"])),
+        ("gpt-5.4-mini", Some(vec!["low", "medium", "high"])),
+    ]
+    .into_iter()
+    .map(|(id, efforts)| ProviderModel {
+        id: id.to_owned(),
+        efforts: efforts.map(|values| values.into_iter().map(str::to_owned).collect()),
+    })
+    .collect()
+}
+
+fn send_model_catalog_request(
+    client: &Client,
+    endpoint: &str,
+    access: &str,
+    account_id: &str,
+) -> Result<reqwest::blocking::Response, ProviderError> {
+    client
+        .get(endpoint)
+        .query(&[("client_version", env!("CARGO_PKG_VERSION"))])
+        .bearer_auth(access)
+        .header("chatgpt-account-id", account_id)
+        .header("originator", "lucy")
+        .header("accept", "application/json")
+        .timeout(MODEL_METADATA_TIMEOUT)
+        .send()
+        .map_err(|_| ProviderError::new("unable to load Codex model catalog"))
+}
+
+fn parse_model_catalog(bytes: &[u8]) -> Result<Vec<CodexModelMetadata>, ProviderError> {
+    let payload: Value = serde_json::from_slice(bytes)
+        .map_err(|_| ProviderError::new("invalid Codex model catalog"))?;
+    let models = payload
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::new("invalid Codex model catalog"))?;
+    Ok(models
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("slug").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let efforts = entry
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| {
+                            level.get("effort").and_then(Value::as_str).map(str::trim)
+                        })
+                        .filter(|effort| !effort.is_empty())
+                        .fold(Vec::new(), |mut efforts, effort| {
+                            if !efforts.iter().any(|existing| existing == effort) {
+                                efforts.push(effort.to_owned());
+                            }
+                            efforts
+                        })
+                })
+                .filter(|efforts| !efforts.is_empty());
+            let context_window = [entry.get("context_window"), entry.get("max_context_window")]
+                .into_iter()
+                .flatten()
+                .find_map(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0);
+            Some(CodexModelMetadata {
+                model: ProviderModel {
+                    id: id.to_owned(),
+                    efforts,
+                },
+                context_window,
+            })
+        })
+        .collect())
 }
 
 fn parse_stream_cancellable(
@@ -670,6 +819,60 @@ mod tests {
         assert_eq!(turn.content, "hello");
         assert_eq!(turn.tool_calls[0].id, "call-1");
         assert_eq!(turn.tool_calls[0].name, "cmd");
+    }
+
+    #[test]
+    fn codex_model_catalog_reads_server_metadata() {
+        let catalog = parse_model_catalog(
+            br#"{"models":[
+                {"slug":"gpt-test","supported_reasoning_levels":[
+                    {"effort":"low"},{"effort":"high"},{"effort":"low"}
+                ],"context_window":273000,"max_context_window":400000},
+                {"slug":"gpt-max-only","supported_reasoning_levels":[],
+                 "max_context_window":128000}
+            ]}"#,
+        )
+        .expect("catalog");
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].model.id, "gpt-test");
+        assert_eq!(
+            catalog[0].model.efforts,
+            Some(vec!["low".to_owned(), "high".to_owned()])
+        );
+        assert_eq!(catalog[0].context_window, Some(273_000));
+        assert_eq!(catalog[1].context_window, Some(128_000));
+    }
+
+    #[test]
+    fn codex_model_catalog_request_uses_subscription_auth() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("address");
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).expect("request");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{{\"models\":[]}}")
+                .expect("response");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let response = send_model_catalog_request(
+            &Client::new(),
+            &format!("http://{address}/models"),
+            "access-token",
+            "account-1",
+        )
+        .expect("response");
+        assert!(response.status().is_success());
+        let request = thread.join().expect("server");
+        assert!(request.starts_with(&format!(
+            "GET /models?client_version={} HTTP/1.1",
+            env!("CARGO_PKG_VERSION")
+        )));
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer access-token"));
+        assert!(request.contains("chatgpt-account-id: account-1"));
+        assert!(request.contains("originator: lucy"));
     }
 
     #[test]
