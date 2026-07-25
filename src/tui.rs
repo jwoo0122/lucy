@@ -99,7 +99,7 @@ const PENDING_TOOL_COLOR: Color = Color::Rgb(
 );
 /// A completed `cmd` call first retains its pending orange, then sweeps to the
 /// final result colour from the left edge of the compact tool line.
-const TOOL_RESULT_SWEEP_DURATION: Duration = Duration::from_millis(1200);
+const TOOL_RESULT_SWEEP_DURATION: Duration = Duration::from_millis(600);
 /// Each character spends this portion of the sweep cross-fading. The remaining
 /// time staggers those fades from the first character to the last.
 const TOOL_RESULT_CHARACTER_FADE_PORTION: f32 = 0.4;
@@ -1576,11 +1576,20 @@ fn ui_layout(
     )
 }
 
-/// Keep the console inset without allowing margins to consume all available
-/// width. A narrow terminal sheds margin cells before it sheds the console.
+/// Keep the content area inset without allowing margins to consume all
+/// available width. A narrow terminal sheds margin cells before it sheds the
+/// console.
+const CONTENT_HORIZONTAL_MARGIN: u16 = 7;
+const MIN_CONSOLE_WIDTH: u16 = 14;
+
 fn bottom_console_area(area: Rect, y: u16, height: u16) -> Rect {
     let horizontal_margin = area.width.saturating_sub(1) / 2;
-    let horizontal_margin = horizontal_margin.min(2);
+    let margin_cap = if area.width < MIN_CONSOLE_WIDTH {
+        2
+    } else {
+        CONTENT_HORIZONTAL_MARGIN.min(area.width.saturating_sub(MIN_CONSOLE_WIDTH) / 2)
+    };
+    let horizontal_margin = horizontal_margin.min(margin_cap);
     Rect::new(
         area.x.saturating_add(horizontal_margin),
         y,
@@ -1689,6 +1698,43 @@ fn max_scroll_for_area(state: &UiState, size: Size) -> u16 {
         .len()
         .saturating_sub(chat_height as usize)
         .min(u16::MAX as usize) as u16
+}
+
+const TRANSCRIPT_SCROLLBAR_TRACK: &str = "┆";
+const TRANSCRIPT_SCROLLBAR_THUMB: &str = "█";
+const TRANSCRIPT_SCROLLBAR_TRACK_COLOR: Color = Color::Rgb(72, 72, 76);
+
+fn draw_transcript_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    total_lines: usize,
+    max_scroll: u16,
+    scroll: u16,
+) {
+    if area.width == 0 || area.height == 0 || total_lines == 0 || max_scroll == 0 {
+        return;
+    }
+
+    let track_height = area.height as usize;
+    let thumb_height = ((track_height * track_height) / total_lines)
+        .max(1)
+        .min(track_height);
+    let thumb_range = track_height.saturating_sub(thumb_height);
+    let thumb_start = (usize::from(scroll.min(max_scroll)) * thumb_range / usize::from(max_scroll))
+        .min(thumb_range);
+    let x = area.x + area.width - 1;
+    let buffer = frame.buffer_mut();
+
+    for offset in 0..track_height {
+        let y = area.y + offset as u16;
+        buffer[(x, y)].set_symbol(TRANSCRIPT_SCROLLBAR_TRACK);
+        buffer[(x, y)].set_fg(TRANSCRIPT_SCROLLBAR_TRACK_COLOR);
+    }
+    for offset in thumb_start..thumb_start + thumb_height {
+        let y = area.y + offset as u16;
+        buffer[(x, y)].set_symbol(TRANSCRIPT_SCROLLBAR_THUMB);
+        buffer[(x, y)].set_fg(CONSOLE_STATUS_COLOR);
+    }
 }
 
 /// Number of wrapped rows the current input occupies at `width`.
@@ -2034,8 +2080,12 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         } else {
             state.scroll.min(max_scroll)
         };
+        let total_lines = lines.len();
         let transcript = Paragraph::new(lines).scroll((scroll, 0));
         frame.render_widget(transcript, visible_chat_area);
+        if !state.auto_scroll {
+            draw_transcript_scrollbar(frame, visible_chat_area, total_lines, max_scroll, scroll);
+        }
     }
 
     let activity_now = Instant::now();
@@ -2093,7 +2143,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
 
     let effort = state.effort.as_deref().unwrap_or("default");
     frame.render_widget(
-        Paragraph::new(model_status_line(state, effort)),
+        Paragraph::new(model_status_line(state, effort, status_area.width)),
         status_area,
     );
 
@@ -3031,13 +3081,62 @@ fn format_context_tokens(tokens: usize) -> String {
     }
 }
 
-fn model_status_line(state: &UiState, effort: &str) -> Line<'static> {
+fn model_status_line(state: &UiState, effort: &str, width: u16) -> Line<'static> {
+    model_status_line_at(
+        state,
+        effort,
+        state.console_animation_elapsed_at(Instant::now()),
+        width,
+    )
+}
+
+fn model_status_line_at(
+    state: &UiState,
+    effort: &str,
+    elapsed: Duration,
+    width: u16,
+) -> Line<'static> {
     let model = redact_secret(&state.model, Some(&state.secret));
     let effort = redact_secret(effort, Some(&state.secret));
-    Line::styled(
-        format!("{model} · {effort} | {}", context_status_text(state)),
-        context_status_style(state),
-    )
+    let context = context_status_text(state);
+    let context_width = UnicodeWidthStr::width(context.as_str());
+    let model_style = if state.busy {
+        Style::default().fg(console_accent_at(elapsed))
+    } else {
+        context_status_style(state)
+    };
+    let status_style = context_status_style(state);
+    let mut spans = vec![
+        Span::styled(model, model_style),
+        Span::styled(format!(" · {effort}"), status_style),
+    ];
+    if state.busy {
+        let accent = console_accent_at(elapsed);
+        let (head, _) = busy_indicator_position_at(elapsed);
+        spans.push(Span::raw(" "));
+        for (index, character) in busy_indicator_frame_at(elapsed).chars().enumerate() {
+            let distance = if character == BUSY_INDICATOR_BLOCK && index != head {
+                Some(index.abs_diff(head))
+            } else {
+                None
+            };
+            let color = busy_indicator_color(accent, distance);
+            spans.push(Span::styled(
+                character.to_string(),
+                Style::default().fg(color),
+            ));
+        }
+    }
+    let left_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let gap = usize::from(width).saturating_sub(left_width + context_width);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.push(Span::styled(context, status_style));
+    Line::from(spans)
 }
 
 fn blend_rgb(from: Color, to: Color, progress: f32) -> Color {
@@ -3294,6 +3393,14 @@ fn thinking_style() -> Style {
 const PULSE_LEVELS: [char; 7] = ['▁', '▂', '▃', '▅', '▆', '▇', '█'];
 const PULSE_BAR_PERIODS: [u128; 5] = [12, 16, 20, 24, 15];
 const PULSE_BAR_PHASES: [u128; 5] = [0, 5, 13, 9, 3];
+const BUSY_INDICATOR_TRACK_LENGTH: usize = 5;
+const BUSY_INDICATOR_TAIL_LENGTH: usize = 2;
+const BUSY_INDICATOR_WIDTH: usize = BUSY_INDICATOR_TRACK_LENGTH + BUSY_INDICATOR_TAIL_LENGTH;
+const BUSY_INDICATOR_BLOCK: char = '■';
+const BUSY_INDICATOR_TAIL_OPACITY: [f32; BUSY_INDICATOR_TAIL_LENGTH] = [0.55, 0.25];
+const BUSY_INDICATOR_PERIOD_TICKS: u128 = (BUSY_INDICATOR_TRACK_LENGTH as u128 - 1) * 2;
+// 62.5ms per cell makes the busy indicator move at 80% of its former speed.
+const BUSY_INDICATOR_TICK: Duration = Duration::from_micros(62_500);
 const PULSE_TICK: Duration = Duration::from_millis(50);
 const TOOL_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const TOOL_SPINNER_FRAME_DURATION: Duration = Duration::from_millis(100);
@@ -3334,6 +3441,55 @@ fn pulse_frame(levels: [usize; PULSE_BAR_PERIODS.len()]) -> String {
         .collect()
 }
 
+fn busy_indicator_position_at(elapsed: Duration) -> (usize, bool) {
+    let tick = elapsed.as_micros() / BUSY_INDICATOR_TICK.as_micros();
+    let phase = tick % BUSY_INDICATOR_PERIOD_TICKS;
+    if phase < BUSY_INDICATOR_TRACK_LENGTH as u128 {
+        (
+            phase as usize,
+            phase < BUSY_INDICATOR_TRACK_LENGTH as u128 - 1,
+        )
+    } else {
+        ((BUSY_INDICATOR_PERIOD_TICKS - phase) as usize, false)
+    }
+}
+
+fn busy_indicator_frame_at(elapsed: Duration) -> String {
+    let (head, moving_right) = busy_indicator_position_at(elapsed);
+    let mut frame = vec![' '; BUSY_INDICATOR_WIDTH];
+    frame[head] = BUSY_INDICATOR_BLOCK;
+    for distance in 1..=BUSY_INDICATOR_TAIL_LENGTH {
+        let tail = if moving_right {
+            head.checked_sub(distance)
+        } else {
+            head.checked_add(distance)
+        };
+        if let Some(tail) = tail.filter(|&index| index < BUSY_INDICATOR_WIDTH) {
+            frame[tail] = BUSY_INDICATOR_BLOCK;
+        }
+    }
+    frame.into_iter().collect()
+}
+
+/// Terminals do not support alpha in a cell foreground, so fade the tail by
+/// blending the accent toward the console background color.
+fn busy_indicator_color(accent: Color, distance: Option<usize>) -> Color {
+    let Some(distance) = distance else {
+        return accent;
+    };
+    let Color::Rgb(red, green, blue) = accent else {
+        return accent;
+    };
+    let opacity = BUSY_INDICATOR_TAIL_OPACITY
+        .get(distance.saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0);
+    Color::Rgb(
+        interpolate_color(CONSOLE_BACKGROUND_RGB.0, red, opacity),
+        interpolate_color(CONSOLE_BACKGROUND_RGB.1, green, opacity),
+        interpolate_color(CONSOLE_BACKGROUND_RGB.2, blue, opacity),
+    )
+}
 fn pulse_levels_at(elapsed: Duration) -> [usize; PULSE_BAR_PERIODS.len()] {
     let tick = elapsed.as_millis() / PULSE_TICK.as_millis();
     std::array::from_fn(|index| {
@@ -3540,7 +3696,7 @@ mod tests {
     }
 
     #[test]
-    fn context_status_keeps_percentage_and_bar_consistent_at_capacity() {
+    fn context_status_keeps_percentage_consistent_at_capacity() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false)
             .with_context(Some(100_000), 99_001);
 
@@ -3608,16 +3764,24 @@ mod tests {
 
         assert_eq!(chat.x, console.x);
         assert_eq!(chat.width, console.width);
-        assert_eq!(console, Rect::new(viewport.x + 2, 8, viewport.width - 4, 5));
+        assert_eq!(
+            console,
+            Rect::new(viewport.x + 7, 8, viewport.width - 14, 5)
+        );
         assert_eq!(console.y + console.height, viewport.y + viewport.height - 1);
         assert_eq!(content.x, console.x + 2);
         assert_eq!(content.width, console.width - 4);
         assert_eq!(content.y, console.y + 1);
         assert_eq!(content.y + content.height, console.y + console.height - 1);
 
-        for (width, margin, console_width) in
-            [(1, 0, 1), (2, 0, 2), (3, 1, 1), (4, 1, 2), (5, 2, 1)]
-        {
+        for (width, margin, console_width) in [
+            (1, 0, 1),
+            (2, 0, 2),
+            (3, 1, 1),
+            (4, 1, 2),
+            (5, 2, 1),
+            (15, 0, 15),
+        ] {
             let console = bottom_console_area(Rect::new(0, 0, width, 4), 0, 4);
             assert_eq!(console.x, margin, "width {width}");
             assert_eq!(console.width, console_width, "width {width}");
@@ -3633,7 +3797,7 @@ mod tests {
         let prompt = prompt_area(console, &state);
 
         assert_eq!(ui_prompt_content_width(viewport), prompt.width);
-        assert_eq!(prompt.width, 70);
+        assert_eq!(prompt.width, 60);
         assert_eq!(input_visible_rows(&state, prompt.width), 2);
         assert!(move_input_cursor_vertical(
             &mut state,
@@ -3643,7 +3807,7 @@ mod tests {
     }
 
     #[test]
-    fn context_immediately_follows_the_left_status_flow_in_uniform_gray() {
+    fn context_status_is_right_aligned_in_uniform_gray() {
         let state =
             UiState::from_history(&[], "secret", "model", None, false).with_context(Some(100), 81);
         let mut terminal =
@@ -3655,23 +3819,98 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let status_area = ui_layout(&state, tui_viewport(Rect::new(0, 0, 80, 10))).5;
-        let expected = "model · default | Context: 81/100 (81%) █████████░";
-        let rendered = (status_area.x..status_area.x + expected.chars().count() as u16)
+        let expected_context = "Context: 81/100 (81%) █████████░";
+        let rendered = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert_eq!(rendered, expected);
+        assert!(rendered.ends_with(expected_context));
         assert_eq!(
-            buffer[(
-                status_area.x + expected.chars().count() as u16,
-                status_area.y
-            )]
-                .symbol(),
-            " ",
+            buffer[(status_area.x + status_area.width - 1, status_area.y)].symbol(),
+            "░",
             "context is not pushed to the right edge"
         );
-        for x in status_area.x..status_area.x + expected.chars().count() as u16 {
-            assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
+        assert!(rendered.starts_with("model · default"));
+        for x in status_area.x..status_area.x + status_area.width {
+            if buffer[(x, status_area.y)].symbol() != " " {
+                assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
+            }
         }
+    }
+
+    #[test]
+    fn busy_model_name_and_indicator_share_the_animated_accent_gradient() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.busy = true;
+        let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
+        let start_accent = console_accent_at(Duration::ZERO);
+        let middle_accent = console_accent_at(console_accent_cycle() / 2);
+
+        assert_eq!(start.spans[0].style.fg, Some(start_accent));
+        assert_eq!(middle.spans[0].style.fg, Some(middle_accent));
+        assert_eq!(start.spans[0].content, "model");
+        assert_eq!(start.spans[1].content, " · default");
+        assert_eq!(start.spans[2].content, " ");
+        assert_eq!(start.spans[3].content, BUSY_INDICATOR_BLOCK.to_string());
+        assert_eq!(start.spans[3].style.fg, Some(start_accent));
+        assert_eq!(
+            start.spans.last().unwrap().style.fg,
+            Some(CONSOLE_STATUS_COLOR)
+        );
+    }
+
+    #[test]
+    fn idle_model_status_has_no_busy_indicator() {
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
+
+        assert_eq!(start.spans[0].content, "model");
+        assert_eq!(middle.spans[0].content, "model");
+        assert_eq!(start.spans[0].style.fg, Some(CONSOLE_STATUS_COLOR));
+        assert_eq!(middle.spans[0].style.fg, Some(CONSOLE_STATUS_COLOR));
+    }
+
+    #[test]
+    fn busy_indicator_is_a_five_cell_bounce_with_a_two_cell_tail() {
+        let frames = (0..=BUSY_INDICATOR_PERIOD_TICKS)
+            .map(|tick| busy_indicator_frame_at(BUSY_INDICATOR_TICK * tick as u32))
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames[0], "■      ");
+        assert_eq!(frames[1], "■■     ");
+        assert_eq!(frames[2], "■■■    ");
+        assert_eq!(frames[4], "    ■■■");
+        assert_eq!(frames[5], "   ■■■ ");
+        assert_eq!(frames[7], " ■■■   ");
+        assert_eq!(frames[8], frames[0]);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.chars().count() == BUSY_INDICATOR_WIDTH));
+        assert_eq!(BUSY_INDICATOR_TRACK_LENGTH, 5);
+        assert_eq!(BUSY_INDICATOR_TAIL_LENGTH, 2);
+        assert_eq!(BUSY_INDICATOR_TICK, Duration::from_micros(62_500));
+    }
+
+    fn color_distance_from_console(color: Color) -> u32 {
+        let Color::Rgb(red, green, blue) = color else {
+            return 0;
+        };
+        u32::from(red.abs_diff(CONSOLE_BACKGROUND_RGB.0))
+            + u32::from(green.abs_diff(CONSOLE_BACKGROUND_RGB.1))
+            + u32::from(blue.abs_diff(CONSOLE_BACKGROUND_RGB.2))
+    }
+
+    #[test]
+    fn busy_indicator_tail_uses_same_block_with_progressively_fainter_colors() {
+        let accent = Color::Rgb(180, 120, 240);
+        let near = busy_indicator_color(accent, Some(1));
+        let far = busy_indicator_color(accent, Some(2));
+
+        assert_eq!(BUSY_INDICATOR_BLOCK, '■');
+        assert_ne!(near, accent);
+        assert_ne!(far, near);
+        assert!(color_distance_from_console(near) > color_distance_from_console(far));
     }
 
     #[test]
@@ -4920,6 +5159,58 @@ mod tests {
     }
 
     #[test]
+    fn transcript_scrollbar_appears_only_when_the_stream_is_scrolled() {
+        let mut state = UiState::from_history(&[], "provider-secret", "model", None, false);
+        state.welcome_visible = false;
+        state.transcript = (0..40)
+            .map(|index| TranscriptItem::Info(format!("message {index}")))
+            .collect();
+        state.auto_scroll = false;
+        state.scroll = 3;
+
+        let area = Rect::new(0, 0, 80, 14);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw scrolled transcript");
+
+        let chat_area = ui_layout(&state, tui_viewport(area)).0;
+        let scrollbar_x = chat_area.x + chat_area.width - 1;
+        let buffer = terminal.backend().buffer();
+        assert!(
+            (chat_area.y..chat_area.y + chat_area.height).any(|y| {
+                buffer[(scrollbar_x, y)].symbol() == TRANSCRIPT_SCROLLBAR_THUMB
+                    && buffer[(scrollbar_x, y)].fg == CONSOLE_STATUS_COLOR
+            }),
+            "a scrolled transcript should show a scrollbar thumb"
+        );
+        assert!(
+            (chat_area.y..chat_area.y + chat_area.height)
+                .any(|y| { buffer[(scrollbar_x, y)].symbol() == TRANSCRIPT_SCROLLBAR_TRACK }),
+            "a scrolled transcript should show a scrollbar track"
+        );
+
+        state.auto_scroll = true;
+        state.scroll = 0;
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw following transcript");
+        let buffer = terminal.backend().buffer();
+        assert!((chat_area.y..chat_area.y + chat_area.height)
+            .all(|y| buffer[(scrollbar_x, y)].symbol() != TRANSCRIPT_SCROLLBAR_THUMB));
+    }
+
+    #[test]
+    fn tool_result_sweep_is_now_twice_as_fast() {
+        assert_eq!(TOOL_RESULT_SWEEP_DURATION, Duration::from_millis(600));
+    }
+
+    #[test]
     fn wrap_text_breaks_long_lines_and_preserves_empty_lines() {
         let rows = wrap_text("12345\n\nabc", 3);
         assert_eq!(rows, vec!["123", "45", "", "abc"]);
@@ -5167,9 +5458,9 @@ mod tests {
                 assert!(frames.windows(2).all(|pair| {
                     let (before_red, before_green, before_blue) = tool_result_color_rgb(pair[0]);
                     let (after_red, after_green, after_blue) = tool_result_color_rgb(pair[1]);
-                    before_red.abs_diff(after_red) <= 45
-                        && before_green.abs_diff(after_green) <= 45
-                        && before_blue.abs_diff(after_blue) <= 45
+                    before_red.abs_diff(after_red) <= 90
+                        && before_green.abs_diff(after_green) <= 90
+                        && before_blue.abs_diff(after_blue) <= 90
                 }));
                 assert_eq!(frames.last(), Some(&target));
             }
@@ -5471,16 +5762,17 @@ mod tests {
             .expect("draw ready status");
         let viewport = tui_viewport(area);
         let status_area = ui_layout(&state, viewport).5;
-        let idle = "model · default | Context: 81/100 (81%) █████████░";
+        let expected_context = "Context: 81/100 (81%) █████████░";
         let buffer = terminal.backend().buffer();
-        let idle_columns = status_area.x..status_area.x + idle.chars().count() as u16;
-        let idle_row = idle_columns
-            .clone()
+        let idle_row = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert_eq!(idle_row, idle);
-        for x in idle_columns {
-            assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(144, 144, 148));
+        assert!(idle_row.starts_with("model · default"));
+        assert!(idle_row.ends_with(expected_context));
+        for x in status_area.x..status_area.x + status_area.width {
+            if buffer[(x, status_area.y)].symbol() != " " {
+                assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(144, 144, 148));
+            }
         }
 
         state.set_status("working");
@@ -5491,23 +5783,18 @@ mod tests {
             .draw(|frame| draw(frame, &state))
             .expect("draw working status");
         let status_area = ui_layout(&state, viewport).5;
-        let expected = "model · default | Context: 81/100 (81%) █████████░";
         let buffer = terminal.backend().buffer();
-        let status_columns = status_area.x..status_area.x + expected.chars().count() as u16;
-        let rendered = status_columns
-            .clone()
+        let rendered = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert_eq!(rendered, expected);
+        assert!(rendered.starts_with("model · default "));
+        assert!(rendered.contains(BUSY_INDICATOR_BLOCK));
+        assert!(rendered.ends_with(expected_context));
         assert!(
-            status_columns
-                .clone()
+            (status_area.x..status_area.x + status_area.width)
                 .any(|x| buffer[(x, status_area.y)].bg != CONSOLE_BACKGROUND),
             "the busy status line renders over bright glass"
         );
-        for x in status_columns {
-            assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(144, 144, 148));
-        }
     }
 
     #[test]
