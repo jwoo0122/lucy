@@ -204,76 +204,9 @@ where
 
     let (session, provider, resumed, attached_agents) = if let Some(id) = options.session.as_deref()
     {
-        let mut session = match Session::resume(home, id) {
-            Ok(session) => session,
-            Err(error) => {
-                write_diagnostic(&mut diagnostics, &error.to_string());
-                return 1;
-            }
-        };
-        let config = match Config::load_or_create(home) {
-            Ok(config) => config,
-            Err(error) => {
-                write_diagnostic(&mut diagnostics, &error.to_string());
-                return 1;
-            }
-        };
-        let auth = match config.resolved_auth() {
-            Ok(auth) => auth,
-            Err(error) => {
-                write_diagnostic(&mut diagnostics, &error.to_string());
-                return 1;
-            }
-        };
-        if let Some(secret) = configured_codex_secret(home, auth.provider) {
-            session = match Session::resume_with_secret(home, id, Some(&secret)) {
-                Ok(session) => session,
-                Err(error) => {
-                    write_diagnostic_safe(&mut diagnostics, &error.to_string(), Some(&secret));
-                    return 1;
-                }
-            };
-        }
-        let mut selected = match config.resolved_llm() {
-            Ok(settings) => settings,
-            Err(error) => {
-                write_diagnostic_safe(
-                    &mut diagnostics,
-                    &error.to_string(),
-                    configured_api_key(&config).as_deref(),
-                );
-                return 1;
-            }
-        };
-        apply_auth_to_settings(&mut selected, auth.provider);
-        session.llm.model = selected.model;
-        session.llm.effort = selected.effort;
-        session.llm.api_key_env = selected.api_key_env;
-        let provider = match provider_for_settings(home, &session.llm) {
-            Ok(provider) => provider,
-            Err(error) => {
-                write_diagnostic(&mut diagnostics, &error.to_string());
-                return 1;
-            }
-        };
-        if let Err(error) =
-            session.append_provider_settings(session.llm.model.clone(), session.llm.effort.clone())
-        {
-            write_diagnostic_safe(
-                &mut diagnostics,
-                &error.to_string(),
-                Some(&provider.api_key()),
-            );
+        let Some((session, provider)) = resume_session(home, id, mode, &mut diagnostics) else {
             return 1;
-        }
-        if mode == FrontendMode::Tui && conflicts_with_tui_literal(&provider.api_key()) {
-            write_diagnostic_safe(
-                &mut diagnostics,
-                "API key conflicts with terminal UI literals",
-                Some(&provider.api_key()),
-            );
-            return 1;
-        }
+        };
         (session, provider, true, Vec::new())
     } else {
         let config = match Config::load_or_create(home) {
@@ -392,13 +325,34 @@ where
         background_commands: crate::command::BackgroundCommands::default(),
     };
     if mode == FrontendMode::Tui {
-        return match crate::tui::run(harness, resumed, output) {
-            Ok(()) => 0,
-            Err(error) => {
-                write_diagnostic(&mut diagnostics, &error);
-                1
+        let mut harness = harness;
+        let mut output = output;
+        let mut resumed = resumed;
+        loop {
+            match crate::tui::run(harness, resumed, &mut output) {
+                Ok(crate::tui::TuiOutcome::Exit) => return 0,
+                Ok(crate::tui::TuiOutcome::Attach(id)) => {
+                    let Some((session, provider)) =
+                        resume_session(home, &id, mode, &mut diagnostics)
+                    else {
+                        return 1;
+                    };
+                    harness = Harness {
+                        provider: provider.with_session_id(&session.id),
+                        home: home.to_path_buf(),
+                        session,
+                        context_window: None,
+                        attached_agents: Vec::new(),
+                        background_commands: crate::command::BackgroundCommands::default(),
+                    };
+                    resumed = true;
+                }
+                Err(error) => {
+                    write_diagnostic(&mut diagnostics, &error);
+                    return 1;
+                }
             }
-        };
+        }
     }
 
     let mut protocol = ProtocolWriter::new(output);
@@ -1504,6 +1458,81 @@ fn provider_for_settings(
         AuthProvider::CodexSubscription => Provider::new_codex(home, settings),
         AuthProvider::Openrouter => Provider::new(settings),
     }
+}
+
+fn resume_session<W: Write>(
+    home: &Path,
+    id: &str,
+    mode: FrontendMode,
+    diagnostics: &mut W,
+) -> Option<(Session, Provider)> {
+    let mut session = match Session::resume(home, id) {
+        Ok(session) => session,
+        Err(error) => {
+            write_diagnostic(diagnostics, &error.to_string());
+            return None;
+        }
+    };
+    let config = match Config::load_or_create(home) {
+        Ok(config) => config,
+        Err(error) => {
+            write_diagnostic(diagnostics, &error.to_string());
+            return None;
+        }
+    };
+    let auth = match config.resolved_auth() {
+        Ok(auth) => auth,
+        Err(error) => {
+            write_diagnostic(diagnostics, &error.to_string());
+            return None;
+        }
+    };
+    if let Some(secret) = configured_codex_secret(home, auth.provider) {
+        session = match Session::resume_with_secret(home, id, Some(&secret)) {
+            Ok(session) => session,
+            Err(error) => {
+                write_diagnostic_safe(diagnostics, &error.to_string(), Some(&secret));
+                return None;
+            }
+        };
+    }
+    let mut selected = match config.resolved_llm() {
+        Ok(settings) => settings,
+        Err(error) => {
+            write_diagnostic_safe(
+                diagnostics,
+                &error.to_string(),
+                configured_api_key(&config).as_deref(),
+            );
+            return None;
+        }
+    };
+    apply_auth_to_settings(&mut selected, auth.provider);
+    session.llm.model = selected.model;
+    session.llm.effort = selected.effort;
+    session.llm.api_key_env = selected.api_key_env;
+    let provider = match provider_for_settings(home, &session.llm) {
+        Ok(provider) => provider,
+        Err(error) => {
+            write_diagnostic(diagnostics, &error.to_string());
+            return None;
+        }
+    };
+    if let Err(error) =
+        session.append_provider_settings(session.llm.model.clone(), session.llm.effort.clone())
+    {
+        write_diagnostic_safe(diagnostics, &error.to_string(), Some(&provider.api_key()));
+        return None;
+    }
+    if mode == FrontendMode::Tui && conflicts_with_tui_literal(&provider.api_key()) {
+        write_diagnostic_safe(
+            diagnostics,
+            "API key conflicts with terminal UI literals",
+            Some(&provider.api_key()),
+        );
+        return None;
+    }
+    Some((session, provider))
 }
 
 fn configured_codex_secret(home: &Path, provider: AuthProvider) -> Option<String> {
