@@ -6,6 +6,23 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.3](https://github.com/jwoo0122/lucy/compare/v1.8.2...v1.8.3) - 2026-07-25
+
+### Fixed
+
+- *(tui)* restore context usage graph
+- *(tui)* narrow content area by ten columns
+- *(tui)* remove context usage bar
+- *(tui)* show transcript scrollbar and speed up tool fades
+- *(tui)* align context status and place busy indicator
+- *(tui)* slow model graph animation
+- *(tui)* fade model graph trail with equal blocks
+- *(tui)* animate model status only while busy
+
+### Other
+
+- Merge origin/main into fix/tui-style
+
 ## [1.8.2](https://github.com/jwoo0122/lucy/compare/v1.8.1...v1.8.2) - 2026-07-25
 
 ### Fixed
