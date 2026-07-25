@@ -3979,10 +3979,18 @@ fn model_status_line(state: &UiState, effort: &str) -> Line<'static> {
 fn model_status_line_at(state: &UiState, effort: &str, elapsed: Duration) -> Line<'static> {
     let model = redact_secret(&state.model, Some(&state.secret));
     let effort = redact_secret(effort, Some(&state.secret));
-    let accent = Style::default().fg(console_accent_at(elapsed));
-    let graph = model_graph_frame_at(elapsed);
+    let model_style = if state.busy {
+        Style::default().fg(console_accent_at(elapsed))
+    } else {
+        context_status_style(state)
+    };
+    let graph = if state.busy {
+        format!(" {}", model_graph_frame_at(elapsed))
+    } else {
+        String::new()
+    };
     Line::from(vec![
-        Span::styled(format!("{model} {graph}"), accent),
+        Span::styled(format!("{model}{graph}"), model_style),
         Span::styled(
             format!(" · {effort} | {}", context_status_text(state)),
             context_status_style(state),
@@ -4036,8 +4044,12 @@ fn thinking_style() -> Style {
 const PULSE_LEVELS: [char; 7] = ['▁', '▂', '▃', '▅', '▆', '▇', '█'];
 const PULSE_BAR_PERIODS: [u128; 5] = [12, 16, 20, 24, 15];
 const PULSE_BAR_PHASES: [u128; 5] = [0, 5, 13, 9, 3];
-const MODEL_GRAPH_PERIODS: [u128; 3] = [12, 16, 20];
-const MODEL_GRAPH_PHASES: [u128; 3] = [0, 5, 13];
+const MODEL_GRAPH_TRACK_LENGTH: usize = 5;
+const MODEL_GRAPH_TAIL_LENGTH: usize = 2;
+const MODEL_GRAPH_WIDTH: usize = MODEL_GRAPH_TRACK_LENGTH + MODEL_GRAPH_TAIL_LENGTH;
+const MODEL_GRAPH_HEAD: char = '■';
+const MODEL_GRAPH_TAIL: char = '▪';
+const MODEL_GRAPH_PERIOD_TICKS: u128 = (MODEL_GRAPH_TRACK_LENGTH as u128 - 1) * 2;
 const PULSE_TICK: Duration = Duration::from_millis(50);
 const TOOL_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const TOOL_SPINNER_FRAME_DURATION: Duration = Duration::from_millis(100);
@@ -4080,10 +4092,25 @@ fn pulse_frame(levels: [usize; PULSE_BAR_PERIODS.len()]) -> String {
 
 fn model_graph_frame_at(elapsed: Duration) -> String {
     let tick = elapsed.as_millis() / PULSE_TICK.as_millis();
-    let levels: [char; MODEL_GRAPH_PERIODS.len()] = std::array::from_fn(|index| {
-        PULSE_LEVELS[pulse_level_at(tick, MODEL_GRAPH_PERIODS[index], MODEL_GRAPH_PHASES[index])]
-    });
-    levels.into_iter().collect()
+    let phase = tick % MODEL_GRAPH_PERIOD_TICKS;
+    let (head, moving_right) = if phase < MODEL_GRAPH_TRACK_LENGTH as u128 {
+        (phase as usize, phase < MODEL_GRAPH_TRACK_LENGTH as u128 - 1)
+    } else {
+        ((MODEL_GRAPH_PERIOD_TICKS - phase) as usize, false)
+    };
+    let mut frame = vec![' '; MODEL_GRAPH_WIDTH];
+    frame[head] = MODEL_GRAPH_HEAD;
+    for distance in 1..=MODEL_GRAPH_TAIL_LENGTH {
+        let tail = if moving_right {
+            head.checked_sub(distance)
+        } else {
+            head.checked_add(distance)
+        };
+        if let Some(tail) = tail.filter(|&index| index < MODEL_GRAPH_WIDTH) {
+            frame[tail] = MODEL_GRAPH_TAIL;
+        }
+    }
+    frame.into_iter().collect()
 }
 
 fn pulse_levels_at(elapsed: Duration) -> [usize; PULSE_BAR_PERIODS.len()] {
@@ -4414,10 +4441,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let status_area = ui_layout(&state, tui_viewport(Rect::new(0, 0, 80, 10))).5;
-        let expected = format!(
-            "model {} · default | Context: 81/100 (81%) █████████░",
-            model_graph_frame_at(Duration::ZERO)
-        );
+        let expected = "model · default | Context: 81/100 (81%) █████████░";
         let rendered = (status_area.x..status_area.x + expected.chars().count() as u16)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
@@ -4431,13 +4455,9 @@ mod tests {
             " ",
             "context is not pushed to the right edge"
         );
-        let model_width = "model ".chars().count() as u16
-            + model_graph_frame_at(Duration::ZERO).chars().count() as u16;
+        let model_width = "model".chars().count() as u16;
         for x in status_area.x..status_area.x + model_width {
-            assert_eq!(
-                buffer[(x, status_area.y)].fg,
-                console_accent_at(Duration::ZERO)
-            );
+            assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
         }
         for x in status_area.x + model_width..status_area.x + expected.chars().count() as u16 {
             assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
@@ -4445,8 +4465,9 @@ mod tests {
     }
 
     #[test]
-    fn model_name_and_graph_share_the_animated_accent_gradient() {
-        let state = UiState::from_history(&[], "secret", "model", None, false);
+    fn busy_model_name_and_graph_share_the_animated_accent_gradient() {
+        let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.busy = true;
         let start = model_status_line_at(&state, "default", Duration::ZERO);
         let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2);
         let start_accent = console_accent_at(Duration::ZERO);
@@ -4459,8 +4480,40 @@ mod tests {
         assert!(start.spans[0].content.starts_with("model "));
         assert_eq!(
             start.spans[0].content.chars().count(),
-            "model ".chars().count() + MODEL_GRAPH_PERIODS.len()
+            "model ".chars().count() + MODEL_GRAPH_WIDTH
         );
+    }
+
+    #[test]
+    fn idle_model_status_has_no_animation_or_graph() {
+        let state = UiState::from_history(&[], "secret", "model", None, false);
+        let start = model_status_line_at(&state, "default", Duration::ZERO);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2);
+
+        assert_eq!(start.spans[0].content, "model");
+        assert_eq!(middle.spans[0].content, "model");
+        assert_eq!(start.spans[0].style.fg, Some(CONSOLE_STATUS_COLOR));
+        assert_eq!(middle.spans[0].style.fg, Some(CONSOLE_STATUS_COLOR));
+    }
+
+    #[test]
+    fn model_graph_is_a_five_cell_bounce_with_a_two_cell_tail() {
+        let frames = (0..=MODEL_GRAPH_PERIOD_TICKS)
+            .map(|tick| model_graph_frame_at(PULSE_TICK * tick as u32))
+            .collect::<Vec<_>>();
+
+        assert_eq!(frames[0], "■      ");
+        assert_eq!(frames[1], "▪■     ");
+        assert_eq!(frames[2], "▪▪■    ");
+        assert_eq!(frames[4], "    ■▪▪");
+        assert_eq!(frames[5], "   ■▪▪ ");
+        assert_eq!(frames[7], " ■▪▪   ");
+        assert_eq!(frames[8], frames[0]);
+        assert!(frames
+            .iter()
+            .all(|frame| frame.chars().count() == MODEL_GRAPH_WIDTH));
+        assert_eq!(MODEL_GRAPH_TRACK_LENGTH, 5);
+        assert_eq!(MODEL_GRAPH_TAIL_LENGTH, 2);
     }
 
     #[test]
@@ -4576,6 +4629,7 @@ mod tests {
     #[test]
     fn borderless_console_contains_queue_running_subagent_prompt_and_statusline() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
+        state.set_busy(true);
         state.queue_user("first task");
         state.queue_user("second task");
         state.subagents.push(SubagentTask {
