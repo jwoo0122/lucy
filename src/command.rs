@@ -414,9 +414,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn temporary_directory() -> std::path::PathBuf {
         loop {
@@ -439,6 +441,7 @@ mod tests {
 
     #[test]
     fn captures_nonzero_exit_and_both_streams() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute_command(
             "printf out; printf err >&2; exit 7",
@@ -457,6 +460,7 @@ mod tests {
 
     #[test]
     fn caps_streams_independently_and_marks_truncation() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute_command(
             "printf 123456789; printf abcdefghij >&2",
@@ -476,6 +480,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bounds_lossy_invalid_utf8_output_and_marks_truncation() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute_command(
             r"printf '\377\376\375\374'; printf '\377\376\375\374' >&2",
@@ -494,6 +499,7 @@ mod tests {
 
     #[test]
     fn timeout_kills_the_command_group() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute_command(
             "sleep 30",
@@ -510,6 +516,7 @@ mod tests {
 
     #[test]
     fn cancellation_kills_a_running_command_group() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let token = CancellationToken::new();
         let worker_token = token.clone();
@@ -538,6 +545,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timeout_capture_returns_when_a_descendant_escapes_the_process_group() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let python_available = Command::new("python3")
             .arg("--version")
             .stdout(Stdio::null())
@@ -571,6 +579,7 @@ mod tests {
 
     #[test]
     fn output_redacts_the_provider_key() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute_command(
             "printf secret-key",
@@ -587,6 +596,7 @@ mod tests {
 
     #[test]
     fn redaction_stays_within_the_capture_byte_bound() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute_command(
             "printf x",
@@ -603,6 +613,7 @@ mod tests {
 
     #[test]
     fn collision_markers_do_not_reintroduce_the_provider_key() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         for secret in ["REDACTED", "[REDACTED]"] {
             let command = format!("printf '{secret}'");
@@ -622,6 +633,7 @@ mod tests {
 
     #[test]
     fn rejects_extra_command_arguments() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
         let cwd = temporary_directory();
         let result = execute(
             r#"{"command":"pwd","extra":true}"#,
