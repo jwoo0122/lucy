@@ -1129,7 +1129,7 @@ impl UiState {
         }
         self.sessions = Some(match result {
             Ok(mut sessions) => {
-                sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
                 SessionsState::Sessions {
                     sessions,
                     query: String::new(),
