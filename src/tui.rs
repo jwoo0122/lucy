@@ -3966,26 +3966,13 @@ fn info_style() -> Style {
 fn context_status_text(state: &UiState) -> String {
     let used = format_context_tokens(state.context_tokens);
     let Some(window) = state.context_window else {
-        return format!("Context: {used}/? (?%) ??????????");
+        return format!("Context: {used}/? (?%)");
     };
     let percentage = context_percentage(state.context_tokens, window);
     format!(
-        "Context: {used}/{} ({percentage}%) {}",
-        format_context_tokens(window),
-        context_progress_bar(state.context_tokens, window)
+        "Context: {used}/{} ({percentage}%)",
+        format_context_tokens(window)
     )
-}
-
-fn context_progress_bar(used: usize, window: usize) -> String {
-    const WIDTH: usize = 10;
-    let filled = if window == 0 {
-        0
-    } else {
-        (used as u128 * WIDTH as u128)
-            .div_ceil(window as u128)
-            .min(WIDTH as u128) as usize
-    };
-    format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
 }
 
 fn context_status_style(_state: &UiState) -> Style {
@@ -4402,20 +4389,14 @@ mod tests {
         let mut state = UiState::from_history(&[], "secret", "model", None, false)
             .with_context(Some(100_000), 80_000);
 
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 80.0K/100.0K (80%) ████████░░"
-        );
+        assert_eq!(context_status_text(&state), "Context: 80.0K/100.0K (80%)");
         assert_eq!(
             context_status_style(&state).fg,
             Some(Color::Rgb(144, 144, 148))
         );
 
         state.context_tokens = 80_001;
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 80.0K/100.0K (81%) █████████░"
-        );
+        assert_eq!(context_status_text(&state), "Context: 80.0K/100.0K (81%)");
         assert_eq!(
             context_status_style(&state).fg,
             Some(Color::Rgb(144, 144, 148)),
@@ -4424,33 +4405,24 @@ mod tests {
     }
 
     #[test]
-    fn context_status_keeps_percentage_and_bar_consistent_at_capacity() {
+    fn context_status_keeps_percentage_consistent_at_capacity() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false)
             .with_context(Some(100_000), 99_001);
 
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 99.0K/100.0K (100%) ██████████"
-        );
+        assert_eq!(context_status_text(&state), "Context: 99.0K/100.0K (100%)");
 
         state.context_tokens = 100_000;
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 100.0K/100.0K (100%) ██████████"
-        );
+        assert_eq!(context_status_text(&state), "Context: 100.0K/100.0K (100%)");
 
         state.context_tokens = 100_001;
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 100.0K/100.0K (101%) ██████████"
-        );
+        assert_eq!(context_status_text(&state), "Context: 100.0K/100.0K (101%)");
     }
 
     #[test]
     fn context_status_handles_unknown_window_without_highlighting() {
         let state = UiState::from_history(&[], "secret", "model", None, false);
 
-        assert_eq!(context_status_text(&state), "Context: 1/? (?%) ??????????");
+        assert_eq!(context_status_text(&state), "Context: 1/? (?%)");
         assert_eq!(
             context_status_style(&state).fg,
             Some(Color::Rgb(144, 144, 148))
@@ -4539,14 +4511,14 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let status_area = ui_layout(&state, tui_viewport(Rect::new(0, 0, 80, 10))).5;
-        let expected_context = " | Context: 81/100 (81%) █████████░";
+        let expected_context = " | Context: 81/100 (81%)";
         let rendered = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
         assert!(rendered.ends_with(expected_context));
         assert_eq!(
             buffer[(status_area.x + status_area.width - 1, status_area.y)].symbol(),
-            "░",
+            ")",
             "context is not pushed to the right edge"
         );
         assert!(rendered.starts_with("model · default"));
