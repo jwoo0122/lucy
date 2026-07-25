@@ -3980,7 +3980,7 @@ fn model_status_line_at(state: &UiState, effort: &str, elapsed: Duration) -> Lin
     let model = redact_secret(&state.model, Some(&state.secret));
     let effort = redact_secret(effort, Some(&state.secret));
     let accent = Style::default().fg(console_accent_at(elapsed));
-    let graph = pulse_frame(pulse_levels_at(elapsed));
+    let graph = model_graph_frame_at(elapsed);
     Line::from(vec![
         Span::styled(format!("{model} {graph}"), accent),
         Span::styled(
@@ -4036,6 +4036,8 @@ fn thinking_style() -> Style {
 const PULSE_LEVELS: [char; 7] = ['▁', '▂', '▃', '▅', '▆', '▇', '█'];
 const PULSE_BAR_PERIODS: [u128; 5] = [12, 16, 20, 24, 15];
 const PULSE_BAR_PHASES: [u128; 5] = [0, 5, 13, 9, 3];
+const MODEL_GRAPH_PERIODS: [u128; 3] = [12, 16, 20];
+const MODEL_GRAPH_PHASES: [u128; 3] = [0, 5, 13];
 const PULSE_TICK: Duration = Duration::from_millis(50);
 const TOOL_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const TOOL_SPINNER_FRAME_DURATION: Duration = Duration::from_millis(100);
@@ -4074,6 +4076,14 @@ fn pulse_frame(levels: [usize; PULSE_BAR_PERIODS.len()]) -> String {
         .into_iter()
         .map(|level| PULSE_LEVELS[level])
         .collect()
+}
+
+fn model_graph_frame_at(elapsed: Duration) -> String {
+    let tick = elapsed.as_millis() / PULSE_TICK.as_millis();
+    let levels: [char; MODEL_GRAPH_PERIODS.len()] = std::array::from_fn(|index| {
+        PULSE_LEVELS[pulse_level_at(tick, MODEL_GRAPH_PERIODS[index], MODEL_GRAPH_PHASES[index])]
+    });
+    levels.into_iter().collect()
 }
 
 fn pulse_levels_at(elapsed: Duration) -> [usize; PULSE_BAR_PERIODS.len()] {
@@ -4406,7 +4416,7 @@ mod tests {
         let status_area = ui_layout(&state, tui_viewport(Rect::new(0, 0, 80, 10))).5;
         let expected = format!(
             "model {} · default | Context: 81/100 (81%) █████████░",
-            pulse_frame(pulse_levels_at(Duration::ZERO))
+            model_graph_frame_at(Duration::ZERO)
         );
         let rendered = (status_area.x..status_area.x + expected.chars().count() as u16)
             .map(|x| buffer[(x, status_area.y)].symbol())
@@ -4422,7 +4432,7 @@ mod tests {
             "context is not pushed to the right edge"
         );
         let model_width = "model ".chars().count() as u16
-            + pulse_frame(pulse_levels_at(Duration::ZERO)).chars().count() as u16;
+            + model_graph_frame_at(Duration::ZERO).chars().count() as u16;
         for x in status_area.x..status_area.x + model_width {
             assert_eq!(
                 buffer[(x, status_area.y)].fg,
@@ -4449,7 +4459,7 @@ mod tests {
         assert!(start.spans[0].content.starts_with("model "));
         assert_eq!(
             start.spans[0].content.chars().count(),
-            "model ".chars().count() + PULSE_BAR_PERIODS.len()
+            "model ".chars().count() + MODEL_GRAPH_PERIODS.len()
         );
     }
 
