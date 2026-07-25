@@ -31,12 +31,6 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MODEL_METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
-const SPAWN_SUBAGENT_DESCRIPTION: &str = "Start an isolated background task and immediately return its task ID. The worker always inherits the current session model and reasoning effort; callers cannot override either setting. Continue your own work without waiting; when the worker finishes, Lucy resumes the attached logical turn with a typed background result instead of creating user input or a separate user turn. Do not poll with check_subagent unless you need an intermediate status. The worker has cmd but cannot delegate further.";
-const CHECK_SUBAGENT_DESCRIPTION: &str = "Inspect an in-process background subagent only when you need an intermediate status or an on-demand result. Do not poll repeatedly: when the worker finishes, Lucy resumes the attached logical turn with its typed result, so continue your own work instead.";
-const WAIT_SUBAGENT_DESCRIPTION: &str = "Wait for a background subagent to reach a terminal state. A timeout only ends the wait; it does not cancel the subagent.";
-const SEND_SUBAGENT_DESCRIPTION: &str = "Queue an additional message for a running background subagent. It is delivered at the worker's next safe provider boundary.";
-const CANCEL_SUBAGENT_DESCRIPTION: &str =
-    "Cancel a running background subagent at the nearest safe provider or command boundary.";
 
 #[derive(Debug)]
 pub struct ProviderError {
@@ -228,7 +222,6 @@ fn chat_request(
     messages: &[ChatMessage],
     effort: &Option<String>,
     include_tools: bool,
-    include_subagents: bool,
 ) -> Value {
     let mut request = json!({
         "model": model,
@@ -239,7 +232,7 @@ fn chat_request(
         "stream": true,
     });
     if include_tools {
-        let mut tools = vec![json!({
+        let tools = vec![json!({
             "type": "function",
             "function": {
                 "name": "cmd",
@@ -247,13 +240,6 @@ fn chat_request(
                 "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": false}
             }
         })];
-        if include_subagents {
-            tools.push(json!({"type":"function","function":{"name":"spawn_subagent","description":SPAWN_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task":{"type":"string"}},"required":["task"],"additionalProperties":false}}}));
-            tools.push(json!({"type":"function","function":{"name":"check_subagent","description":CHECK_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
-            tools.push(json!({"type":"function","function":{"name":"wait_subagent","description":WAIT_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["task_id"],"additionalProperties":false}}}));
-            tools.push(json!({"type":"function","function":{"name":"send_subagent","description":SEND_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","message"],"additionalProperties":false}}}));
-            tools.push(json!({"type":"function","function":{"name":"cancel_subagent","description":CANCEL_SUBAGENT_DESCRIPTION,"parameters":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}}));
-        }
         request["tools"] = Value::Array(tools);
     } else {
         request["max_tokens"] = json!(COMPACTION_MAX_SUMMARY_TOKENS);
@@ -463,7 +449,7 @@ impl Provider {
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> Result<ProviderTurn, ProviderError> {
         let cancellation = CancellationToken::new();
-        self.stream_chat_cancellable_with_options(messages, on_text, &cancellation, true, true)
+        self.stream_chat_cancellable_with_options(messages, on_text, &cancellation, true)
     }
 
     /// Generate an internal compaction summary without exposing `cmd` to the
@@ -474,13 +460,8 @@ impl Provider {
         cancellation: &CancellationToken,
     ) -> Result<String, ProviderError> {
         let mut ignored = |_text: &str| Ok(());
-        let turn = self.stream_chat_cancellable_with_options(
-            messages,
-            &mut ignored,
-            cancellation,
-            false,
-            false,
-        )?;
+        let turn =
+            self.stream_chat_cancellable_with_options(messages, &mut ignored, cancellation, false)?;
         if !turn.tool_calls.is_empty() {
             return Err(ProviderError::new(
                 "compaction summary requested an unsupported tool",
@@ -501,7 +482,7 @@ impl Provider {
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
         cancellation: &CancellationToken,
     ) -> Result<ProviderTurn, ProviderError> {
-        self.stream_chat_cancellable_with_options(messages, on_text, cancellation, true, true)
+        self.stream_chat_cancellable_with_options(messages, on_text, cancellation, true)
     }
 
     pub(crate) fn stream_chat_cancellable_with_options(
@@ -510,7 +491,6 @@ impl Provider {
         on_text: &mut dyn FnMut(&str) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
-        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         let mut on_event = |event| match event {
             ProviderStreamEvent::ReasoningStarted => Ok(()),
@@ -521,7 +501,6 @@ impl Provider {
             &mut on_event,
             cancellation,
             include_tools,
-            include_subagents,
         )
     }
 
@@ -531,17 +510,10 @@ impl Provider {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
-        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         if let Some(codex) = &self.codex {
             let mut on_event = |event| on_event(event);
-            return codex.stream_chat(
-                messages,
-                &mut on_event,
-                cancellation,
-                include_tools,
-                include_subagents,
-            );
+            return codex.stream_chat(messages, &mut on_event, cancellation, include_tools);
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -552,7 +524,6 @@ impl Provider {
             on_event,
             cancellation,
             include_tools,
-            include_subagents,
         ))
     }
 
@@ -562,17 +533,10 @@ impl Provider {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
-        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         for attempt in 0..=PROVIDER_RETRY_COUNT {
             match self
-                .stream_chat_async_once(
-                    messages,
-                    on_event,
-                    cancellation,
-                    include_tools,
-                    include_subagents,
-                )
+                .stream_chat_async_once(messages, on_event, cancellation, include_tools)
                 .await
             {
                 Err(error) if error.is_retryable() && attempt < PROVIDER_RETRY_COUNT => {
@@ -593,7 +557,6 @@ impl Provider {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
-        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         if cancellation.is_cancelled() {
             return Err(ProviderError::cancelled(ProviderTurn {
@@ -602,13 +565,7 @@ impl Provider {
                 reasoning_details: Vec::new(),
             }));
         }
-        let request = chat_request(
-            &self.model,
-            messages,
-            &self.effort,
-            include_tools,
-            include_subagents,
-        );
+        let request = chat_request(&self.model, messages, &self.effort, include_tools);
         let request = self
             .async_client
             .post(&self.endpoint)
@@ -1229,50 +1186,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn subagent_tool_descriptions_prefer_automatic_completion_over_polling() {
-        let request = chat_request(
-            "model",
-            &[ChatMessage::user("hello".to_owned())],
-            &None,
-            true,
-            true,
-        );
-        let tools = request["tools"].as_array().expect("model tools");
-        let description = |name: &str| {
-            tools
-                .iter()
-                .find(|tool| tool["function"]["name"] == name)
-                .and_then(|tool| tool["function"]["description"].as_str())
-                .expect("tool description")
-        };
-
-        let spawn = description("spawn_subagent");
-        assert!(spawn.contains("Continue your own work without waiting"));
-        assert!(spawn.contains("resumes the attached logical turn"));
-        assert!(spawn.contains("instead of creating user input or a separate user turn"));
-        assert!(spawn.contains("Do not poll with check_subagent"));
-        assert!(spawn.contains("always inherits the current session model and reasoning effort"));
-        assert!(spawn.contains("cannot override either setting"));
-        let spawn_properties = tools
-            .iter()
-            .find(|tool| tool["function"]["name"] == "spawn_subagent")
-            .and_then(|tool| tool["function"]["parameters"]["properties"].as_object())
-            .expect("spawn_subagent properties");
-        assert_eq!(spawn_properties.keys().collect::<Vec<_>>(), vec!["task"]);
-
-        let check = description("check_subagent");
-        assert!(check.contains("Do not poll repeatedly"));
-        assert!(check.contains("resumes the attached logical turn"));
-        assert!(check.contains("continue your own work instead"));
-
-        assert!(description("wait_subagent").contains("timeout only ends the wait"));
-        assert!(description("send_subagent").contains("next safe provider boundary"));
-        assert!(
-            description("cancel_subagent").contains("nearest safe provider or command boundary")
-        );
-    }
-
-    #[test]
     fn retry_policy_only_marks_transient_http_statuses() {
         for status in [408, 429, 500, 502, 503, 504] {
             assert!(transient_http_status(status));
@@ -1283,19 +1196,30 @@ mod tests {
     }
 
     #[test]
+    fn normal_requests_expose_only_cmd() {
+        let request = chat_request(
+            "model",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            true,
+        );
+        let tools = request["tools"].as_array().expect("model tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "cmd");
+    }
+
+    #[test]
     fn compaction_request_does_not_include_tools() {
         let normal = chat_request(
             "model",
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
-            true,
         );
         let compact = chat_request(
             "model",
             &[ChatMessage::user("hello".to_owned())],
             &None,
-            false,
             false,
         );
 
@@ -2110,7 +2034,6 @@ mod tests {
                 },
                 &cancellation,
                 true,
-                false,
             )
             .expect("long worker stream");
 
@@ -2171,7 +2094,6 @@ mod tests {
                 },
                 &cancellation,
                 true,
-                false,
             )
             .expect("retry succeeds");
 
@@ -2233,7 +2155,6 @@ mod tests {
                 },
                 &cancellation,
                 true,
-                false,
             )
             .expect_err("partial stream must fail");
 

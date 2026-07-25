@@ -9,7 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -82,11 +83,11 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
     home: &Path,
     cwd: &Path,
     configured_prompt: &str,
-    api_key_env: Option<&str>,
+    _api_key_env: Option<&str>,
 ) -> Result<BootContext, ContextError> {
     let cwd = fs::canonicalize(cwd)
         .map_err(|_error| ContextError::new("unable to resolve working directory"))?;
-    let root = git_root(&cwd, api_key_env);
+    let root = git_root(&cwd);
     let project_directories = ancestor_directories(&root, &cwd);
 
     let mut instruction_files = Vec::new();
@@ -130,34 +131,19 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
     })
 }
 
-fn git_root(cwd: &Path, api_key_env: Option<&str>) -> PathBuf {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--show-toplevel"]);
-    if let Some(api_key_env) = api_key_env
-        .map(str::trim)
-        .filter(|api_key_env| !api_key_env.is_empty())
-    {
-        command.env_remove(api_key_env);
-    }
-    let output = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !text.is_empty() {
-                if let Ok(path) = fs::canonicalize(text) {
-                    return path;
-                }
-            }
-            cwd.to_owned()
+fn git_root(cwd: &Path) -> PathBuf {
+    let mut current = cwd;
+    loop {
+        if current.join(".git").exists() {
+            return current.to_owned();
         }
-        _ => cwd.to_owned(),
+        let Some(parent) = current.parent() else {
+            return cwd.to_owned();
+        };
+        if parent == current {
+            return cwd.to_owned();
+        }
+        current = parent;
     }
 }
 

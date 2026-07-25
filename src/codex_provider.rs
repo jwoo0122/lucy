@@ -203,16 +203,9 @@ impl CodexProvider {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
         cancellation: &CancellationToken,
         include_tools: bool,
-        include_subagents: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         let (access, account_id) = self.access_token()?;
-        let request = codex_request(
-            &self.model,
-            messages,
-            &self.effort,
-            include_tools,
-            include_subagents,
-        );
+        let request = codex_request(&self.model, messages, &self.effort, include_tools);
         let mut response =
             self.send_request_cancellable(&request, &access, &account_id, cancellation)?;
         let mut active_access = access;
@@ -311,7 +304,6 @@ fn codex_request(
     messages: &[ChatMessage],
     effort: &Option<String>,
     include_tools: bool,
-    include_subagents: bool,
 ) -> Value {
     let instructions = messages
         .iter()
@@ -336,20 +328,11 @@ fn codex_request(
         request["reasoning"] = json!({"effort": effort, "summary": "auto"});
     }
     if include_tools {
-        let mut tools = vec![tool_schema(
+        let tools = vec![tool_schema(
             "cmd",
             "Execute a finite shell command in the session starting directory.",
             json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}),
         )];
-        if include_subagents {
-            tools.extend([
-                tool_schema("spawn_subagent", "Start an isolated background task.", json!({"type":"object","properties":{"task":{"type":"string"}},"required":["task"],"additionalProperties":false})),
-                tool_schema("check_subagent", "Inspect an in-process background subagent.", json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false})),
-                tool_schema("wait_subagent", "Wait for a background subagent.", json!({"type":"object","properties":{"task_id":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["task_id"],"additionalProperties":false})),
-                tool_schema("send_subagent", "Queue a message for a running background subagent.", json!({"type":"object","properties":{"task_id":{"type":"string"},"message":{"type":"string"}},"required":["task_id","message"],"additionalProperties":false})),
-                tool_schema("cancel_subagent", "Cancel a running background subagent.", json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false})),
-            ]);
-        }
         request["tools"] = Value::Array(tools);
     }
     request
@@ -639,7 +622,6 @@ mod tests {
             ],
             &Some("high".to_owned()),
             true,
-            false,
         );
         assert_eq!(request["model"], "gpt-5.3-codex");
         assert_eq!(request["store"], false);

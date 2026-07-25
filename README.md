@@ -14,7 +14,7 @@
 
 ## Project purpose
 
-Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects an OpenRouter/OpenAI-compatible provider or a Codex subscription provider and exposes model-facing `cmd` and `spawn_subagent` tools, with both an interactive TUI and a JSONL interface for automation powered by the same turn engine.
+Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects an OpenAI-compatible Chat Completions provider or a Codex subscription provider and exposes a model-facing `cmd` tool, with both an interactive TUI and a JSONL session interface for automation powered by the same turn engine.
 
 ## Installation
 
@@ -48,7 +48,7 @@ model = "your-model"
 export OPENROUTER_API_KEY="..."
 ```
 
-To use a ChatGPT plan through the Codex provider, log in separately. Tokens are stored in Lucy's private credential store, not in `config.toml` or sessions:
+To use a ChatGPT plan through Codex, log in separately. Tokens are stored in Lucy's private credential store, not in `config.toml` or sessions:
 
 ```sh
 lucy codex login
@@ -89,11 +89,11 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 
 - **TUI and JSONL:** Supports terminal chat and line-delimited JSON automation.
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
-- **Tool activity UI:** Renders `cmd` as a compact one-line card and lists active background subagents between the message input and bottom status line with task id and a short task preview. Parent lifecycle-tool cards are suppressed: check/send briefly flash the targeted row, wait shows `Waiting for` with a spinner, and cancel shows `Cancelling` until the worker ends; failed or unknown targets remain transcript errors. Down from the last input row focuses the list; a focused worker exposes its live assistant/tool stream above the input. Terminal workers leave the list immediately; pending and delivered result transitions remain in the transcript. The main-agent ready/working indicator appears in the bottom status line, and the prompt border uses a left-to-right teal-to-green gradient.
+- **Tool activity UI:** Renders `cmd` as a compact one-line card. The main-agent ready/working indicator appears in the bottom status line, and the prompt border uses a left-to-right teal-to-green gradient.
 - **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification for completion, cancellation, or error when the terminal supports it; JSONL output is unchanged.
 - **Safe local command execution:** Runs trusted finite `cmd` shell commands from the session's starting directory with time and output limits.
-- **Background sub-agents:** `spawn_subagent` immediately returns a queued task ID while up to four isolated workers run in parallel. The main agent should continue its own work without waiting; the logical main turn suspends when needed and resumes with a typed background result instead of fabricating a user message. Use `check_subagent` only for an intermediate or on-demand check, not repeated polling. Workers inherit the current session model and reasoning effort in addition to boot context and cwd; callers cannot override those settings. Workers may use `cmd` but cannot recursively delegate. The TUI shows running workers between the prompt and status line; Down focuses the list from the last input row, and a focused worker exposes its live stream above the prompt. The TUI accepts additional user messages while a turn is active and serializes them for processing. `wait_subagent`, `send_subagent`, and `cancel_subagent` provide lifecycle control. Each worker persists a secret-redacted child transcript linked to the parent session; completion results are injected before the next provider request at a safe tool boundary.
+- **Agent process boundary:** Other agents can invoke `lucy --jsonl` through `cmd`, capture the returned `session_id`, and continue the conversation with `lucy --jsonl --session <id>`. Lucy does not coordinate relationships between independent sessions.
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
 - **Context and skills:** Collects global `$XDG_CONFIG_HOME/lucy/AGENTS.md` (or `~/.config/lucy/AGENTS.md`) plus project `AGENTS.md`/`CLAUDE.md` instructions and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
 - **Automatic context compaction:** At 95% estimated context usage, safely summarizes older complete turns with the configured model, retains recent context, and resumes the active turn without rewriting session history.
-- **Credential protection:** Keeps OpenRouter API keys out of configuration, sessions, the public protocol, diagnostics, and child environments; Codex subscription tokens are stored privately, refreshed as needed, and never exposed to model tools or persisted sessions.
+- **Credential protection:** OpenRouter API keys are read only from environment variables and are not written to configuration, sessions, the public protocol, or diagnostics. Codex subscription tokens are stored in Lucy’s private credential store and are never exposed to model tools or persisted sessions.
