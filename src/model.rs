@@ -23,6 +23,48 @@ pub struct ChatToolCall {
     pub arguments: String,
 }
 
+/// Reasoning detail formats whose `reasoning.text` entries are rejected by the
+/// upstream provider when they carry no signature.
+///
+/// Anthropic and Gemini verify the signature of every thinking block that is
+/// sent back. A streamed turn arrives as many `reasoning.text` fragments that
+/// share one `index`, and only the final fragment carries the signature, so
+/// replaying the fragments verbatim makes the provider reject the request with
+/// HTTP 400. Signed entries, unsigned entries in other formats, and every
+/// non-text entry stay untouched.
+///
+/// In practice the signed fragment of an Anthropic turn carries no `text`, so
+/// this deliberately stops replaying that turn's thinking text and keeps only
+/// the signed marker. Lucy does not reassemble the fragments: the concatenation
+/// rule is undocumented, whereas dropping unsigned fragments is what the
+/// upstream OpenRouter SDK does.
+const SIGNATURE_REQUIRING_REASONING_FORMATS: [&str; 2] =
+    ["anthropic-claude-v1", "google-gemini-v1"];
+
+fn is_sendable_reasoning_detail(detail: &Value) -> bool {
+    if detail.get("type").and_then(Value::as_str) != Some("reasoning.text") {
+        return true;
+    }
+    let Some(format) = detail.get("format").and_then(Value::as_str) else {
+        return true;
+    };
+    if !SIGNATURE_REQUIRING_REASONING_FORMATS.contains(&format) {
+        return true;
+    }
+    detail
+        .get("signature")
+        .and_then(Value::as_str)
+        .is_some_and(|signature| !signature.trim().is_empty())
+}
+
+fn sendable_reasoning_details(details: &[Value]) -> Vec<Value> {
+    details
+        .iter()
+        .filter(|detail| is_sendable_reasoning_detail(detail))
+        .cloned()
+        .collect()
+}
+
 /// Estimate the number of context tokens represented by provider messages.
 ///
 /// Lucy supports arbitrary OpenAI-compatible providers and does not bundle a
@@ -96,7 +138,10 @@ impl ChatMessage {
         });
         if self.role == "assistant" {
             if let Some(reasoning_details) = &self.reasoning_details {
-                message["reasoning_details"] = Value::Array(reasoning_details.clone());
+                let sendable = sendable_reasoning_details(reasoning_details);
+                if !sendable.is_empty() {
+                    message["reasoning_details"] = Value::Array(sendable);
+                }
             }
         }
         if let Some(name) = &self.name {
@@ -188,5 +233,86 @@ mod tests {
         let mut user = ChatMessage::user("question".to_owned());
         user.reasoning_details = Some(vec![json!({"text": "must not be sent"})]);
         assert!(user.to_openai_value().get("reasoning_details").is_none());
+    }
+
+    #[test]
+    fn unsigned_thinking_fragments_are_not_replayed_to_the_provider() {
+        let signed = json!({
+            "type": "reasoning.text",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+            "signature": "CAIS0AIK"
+        });
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(vec![
+            json!({
+                "type": "reasoning.text",
+                "format": "anthropic-claude-v1",
+                "index": 0,
+                "text": "I"
+            }),
+            json!({
+                "type": "reasoning.text",
+                "format": "google-gemini-v1",
+                "index": 0,
+                "text": " need to inspect the repository."
+            }),
+            json!({
+                "type": "reasoning.text",
+                "format": "anthropic-claude-v1",
+                "index": 0,
+                "signature": ""
+            }),
+            json!({
+                "type": "reasoning.text",
+                "format": "anthropic-claude-v1",
+                "index": 0,
+                "signature": "   "
+            }),
+            json!({
+                "type": "reasoning.text",
+                "format": "some-other-provider-v1",
+                "text": "unsigned but not signature checked"
+            }),
+            json!({
+                "type": "reasoning.encrypted",
+                "id": "call-1",
+                "data": "opaque"
+            }),
+            signed.clone(),
+        ]);
+
+        assert_eq!(
+            assistant.to_openai_value()["reasoning_details"],
+            json!([
+                {
+                    "type": "reasoning.text",
+                    "format": "some-other-provider-v1",
+                    "text": "unsigned but not signature checked"
+                },
+                {
+                    "type": "reasoning.encrypted",
+                    "id": "call-1",
+                    "data": "opaque"
+                },
+                signed,
+            ])
+        );
+    }
+
+    #[test]
+    fn assistant_messages_omit_reasoning_details_when_every_entry_is_unsigned() {
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(vec![json!({
+            "type": "reasoning.text",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+            "text": "only an unsigned fragment"
+        })]);
+
+        assert!(assistant
+            .to_openai_value()
+            .get("reasoning_details")
+            .is_none());
     }
 }
