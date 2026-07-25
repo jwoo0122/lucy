@@ -2765,7 +2765,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
 
     let effort = state.effort.as_deref().unwrap_or("default");
     frame.render_widget(
-        Paragraph::new(model_status_line(state, effort)),
+        Paragraph::new(model_status_line(state, effort, status_area.width)),
         status_area,
     );
 
@@ -3968,50 +3968,61 @@ fn format_context_tokens(tokens: usize) -> String {
     }
 }
 
-fn model_status_line(state: &UiState, effort: &str) -> Line<'static> {
+fn model_status_line(state: &UiState, effort: &str, width: u16) -> Line<'static> {
     model_status_line_at(
         state,
         effort,
         state.console_animation_elapsed_at(Instant::now()),
+        width,
     )
 }
 
-fn model_status_line_at(state: &UiState, effort: &str, elapsed: Duration) -> Line<'static> {
+fn model_status_line_at(
+    state: &UiState,
+    effort: &str,
+    elapsed: Duration,
+    width: u16,
+) -> Line<'static> {
     let model = redact_secret(&state.model, Some(&state.secret));
     let effort = redact_secret(effort, Some(&state.secret));
+    let context = format!(" | {}", context_status_text(state));
+    let context_width = UnicodeWidthStr::width(context.as_str());
     let model_style = if state.busy {
         Style::default().fg(console_accent_at(elapsed))
     } else {
         context_status_style(state)
     };
-    let mut spans = vec![Span::styled(
-        if state.busy {
-            format!("{model} ")
-        } else {
-            model
-        },
-        model_style,
-    )];
+    let status_style = context_status_style(state);
+    let mut spans = vec![
+        Span::styled(model, model_style),
+        Span::styled(format!(" · {effort}"), status_style),
+    ];
     if state.busy {
         let accent = console_accent_at(elapsed);
-        let (head, _) = model_graph_position_at(elapsed);
-        for (index, character) in model_graph_frame_at(elapsed).chars().enumerate() {
-            let distance = if character == MODEL_GRAPH_BLOCK && index != head {
+        let (head, _) = busy_indicator_position_at(elapsed);
+        spans.push(Span::raw(" "));
+        for (index, character) in busy_indicator_frame_at(elapsed).chars().enumerate() {
+            let distance = if character == BUSY_INDICATOR_BLOCK && index != head {
                 Some(index.abs_diff(head))
             } else {
                 None
             };
-            let color = model_graph_color(accent, distance);
+            let color = busy_indicator_color(accent, distance);
             spans.push(Span::styled(
                 character.to_string(),
                 Style::default().fg(color),
             ));
         }
     }
-    spans.push(Span::styled(
-        format!(" · {effort} | {}", context_status_text(state)),
-        context_status_style(state),
-    ));
+    let left_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum::<usize>();
+    let gap = usize::from(width).saturating_sub(left_width + context_width);
+    if gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+    }
+    spans.push(Span::styled(context, status_style));
     Line::from(spans)
 }
 
@@ -4061,14 +4072,14 @@ fn thinking_style() -> Style {
 const PULSE_LEVELS: [char; 7] = ['▁', '▂', '▃', '▅', '▆', '▇', '█'];
 const PULSE_BAR_PERIODS: [u128; 5] = [12, 16, 20, 24, 15];
 const PULSE_BAR_PHASES: [u128; 5] = [0, 5, 13, 9, 3];
-const MODEL_GRAPH_TRACK_LENGTH: usize = 5;
-const MODEL_GRAPH_TAIL_LENGTH: usize = 2;
-const MODEL_GRAPH_WIDTH: usize = MODEL_GRAPH_TRACK_LENGTH + MODEL_GRAPH_TAIL_LENGTH;
-const MODEL_GRAPH_BLOCK: char = '■';
-const MODEL_GRAPH_TAIL_OPACITY: [f32; MODEL_GRAPH_TAIL_LENGTH] = [0.55, 0.25];
-const MODEL_GRAPH_PERIOD_TICKS: u128 = (MODEL_GRAPH_TRACK_LENGTH as u128 - 1) * 2;
-// 62.5ms per cell makes the graph move at 80% of its former speed.
-const MODEL_GRAPH_TICK: Duration = Duration::from_micros(62_500);
+const BUSY_INDICATOR_TRACK_LENGTH: usize = 5;
+const BUSY_INDICATOR_TAIL_LENGTH: usize = 2;
+const BUSY_INDICATOR_WIDTH: usize = BUSY_INDICATOR_TRACK_LENGTH + BUSY_INDICATOR_TAIL_LENGTH;
+const BUSY_INDICATOR_BLOCK: char = '■';
+const BUSY_INDICATOR_TAIL_OPACITY: [f32; BUSY_INDICATOR_TAIL_LENGTH] = [0.55, 0.25];
+const BUSY_INDICATOR_PERIOD_TICKS: u128 = (BUSY_INDICATOR_TRACK_LENGTH as u128 - 1) * 2;
+// 62.5ms per cell makes the busy indicator move at 80% of its former speed.
+const BUSY_INDICATOR_TICK: Duration = Duration::from_micros(62_500);
 const PULSE_TICK: Duration = Duration::from_millis(50);
 const TOOL_SPINNER_FRAMES: [char; 4] = ['|', '/', '-', '\\'];
 const TOOL_SPINNER_FRAME_DURATION: Duration = Duration::from_millis(100);
@@ -4109,28 +4120,31 @@ fn pulse_frame(levels: [usize; PULSE_BAR_PERIODS.len()]) -> String {
         .collect()
 }
 
-fn model_graph_position_at(elapsed: Duration) -> (usize, bool) {
-    let tick = elapsed.as_micros() / MODEL_GRAPH_TICK.as_micros();
-    let phase = tick % MODEL_GRAPH_PERIOD_TICKS;
-    if phase < MODEL_GRAPH_TRACK_LENGTH as u128 {
-        (phase as usize, phase < MODEL_GRAPH_TRACK_LENGTH as u128 - 1)
+fn busy_indicator_position_at(elapsed: Duration) -> (usize, bool) {
+    let tick = elapsed.as_micros() / BUSY_INDICATOR_TICK.as_micros();
+    let phase = tick % BUSY_INDICATOR_PERIOD_TICKS;
+    if phase < BUSY_INDICATOR_TRACK_LENGTH as u128 {
+        (
+            phase as usize,
+            phase < BUSY_INDICATOR_TRACK_LENGTH as u128 - 1,
+        )
     } else {
-        ((MODEL_GRAPH_PERIOD_TICKS - phase) as usize, false)
+        ((BUSY_INDICATOR_PERIOD_TICKS - phase) as usize, false)
     }
 }
 
-fn model_graph_frame_at(elapsed: Duration) -> String {
-    let (head, moving_right) = model_graph_position_at(elapsed);
-    let mut frame = vec![' '; MODEL_GRAPH_WIDTH];
-    frame[head] = MODEL_GRAPH_BLOCK;
-    for distance in 1..=MODEL_GRAPH_TAIL_LENGTH {
+fn busy_indicator_frame_at(elapsed: Duration) -> String {
+    let (head, moving_right) = busy_indicator_position_at(elapsed);
+    let mut frame = vec![' '; BUSY_INDICATOR_WIDTH];
+    frame[head] = BUSY_INDICATOR_BLOCK;
+    for distance in 1..=BUSY_INDICATOR_TAIL_LENGTH {
         let tail = if moving_right {
             head.checked_sub(distance)
         } else {
             head.checked_add(distance)
         };
-        if let Some(tail) = tail.filter(|&index| index < MODEL_GRAPH_WIDTH) {
-            frame[tail] = MODEL_GRAPH_BLOCK;
+        if let Some(tail) = tail.filter(|&index| index < BUSY_INDICATOR_WIDTH) {
+            frame[tail] = BUSY_INDICATOR_BLOCK;
         }
     }
     frame.into_iter().collect()
@@ -4138,14 +4152,14 @@ fn model_graph_frame_at(elapsed: Duration) -> String {
 
 /// Terminals do not support alpha in a cell foreground, so fade the tail by
 /// blending the accent toward the console background color.
-fn model_graph_color(accent: Color, distance: Option<usize>) -> Color {
+fn busy_indicator_color(accent: Color, distance: Option<usize>) -> Color {
     let Some(distance) = distance else {
         return accent;
     };
     let Color::Rgb(red, green, blue) = accent else {
         return accent;
     };
-    let opacity = MODEL_GRAPH_TAIL_OPACITY
+    let opacity = BUSY_INDICATOR_TAIL_OPACITY
         .get(distance.saturating_sub(1))
         .copied()
         .unwrap_or(0.0);
@@ -4472,7 +4486,7 @@ mod tests {
     }
 
     #[test]
-    fn context_immediately_follows_the_left_status_flow_in_uniform_gray() {
+    fn context_status_is_right_aligned_in_uniform_gray() {
         let state =
             UiState::from_history(&[], "secret", "model", None, false).with_context(Some(100), 81);
         let mut terminal =
@@ -4484,44 +4498,40 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let status_area = ui_layout(&state, tui_viewport(Rect::new(0, 0, 80, 10))).5;
-        let expected = "model · default | Context: 81/100 (81%) █████████░";
-        let rendered = (status_area.x..status_area.x + expected.chars().count() as u16)
+        let expected_context = " | Context: 81/100 (81%) █████████░";
+        let rendered = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert_eq!(rendered, expected);
+        assert!(rendered.ends_with(expected_context));
         assert_eq!(
-            buffer[(
-                status_area.x + expected.chars().count() as u16,
-                status_area.y
-            )]
-                .symbol(),
-            " ",
+            buffer[(status_area.x + status_area.width - 1, status_area.y)].symbol(),
+            "░",
             "context is not pushed to the right edge"
         );
-        let model_width = "model".chars().count() as u16;
-        for x in status_area.x..status_area.x + model_width {
-            assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
-        }
-        for x in status_area.x + model_width..status_area.x + expected.chars().count() as u16 {
-            assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
+        assert!(rendered.starts_with("model · default"));
+        for x in status_area.x..status_area.x + status_area.width {
+            if buffer[(x, status_area.y)].symbol() != " " {
+                assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
+            }
         }
     }
 
     #[test]
-    fn busy_model_name_and_graph_share_the_animated_accent_gradient() {
+    fn busy_model_name_and_indicator_share_the_animated_accent_gradient() {
         let mut state = UiState::from_history(&[], "secret", "model", None, false);
         state.busy = true;
-        let start = model_status_line_at(&state, "default", Duration::ZERO);
-        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2);
+        let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
         let start_accent = console_accent_at(Duration::ZERO);
         let middle_accent = console_accent_at(console_accent_cycle() / 2);
 
         assert_eq!(start.spans[0].style.fg, Some(start_accent));
         assert_eq!(middle.spans[0].style.fg, Some(middle_accent));
-        assert_eq!(start.spans[0].content, "model ");
-        assert_eq!(start.spans[1].content, MODEL_GRAPH_BLOCK.to_string());
-        assert_eq!(start.spans[1].style.fg, Some(start_accent));
-        assert_eq!(start.spans.len(), MODEL_GRAPH_WIDTH + 2);
+        assert_eq!(start.spans[0].content, "model");
+        assert_eq!(start.spans[1].content, " · default");
+        assert_eq!(start.spans[2].content, " ");
+        assert_eq!(start.spans[3].content, BUSY_INDICATOR_BLOCK.to_string());
+        assert_eq!(start.spans[3].style.fg, Some(start_accent));
         assert_eq!(
             start.spans.last().unwrap().style.fg,
             Some(CONSOLE_STATUS_COLOR)
@@ -4529,10 +4539,10 @@ mod tests {
     }
 
     #[test]
-    fn idle_model_status_has_no_animation_or_graph() {
+    fn idle_model_status_has_no_busy_indicator() {
         let state = UiState::from_history(&[], "secret", "model", None, false);
-        let start = model_status_line_at(&state, "default", Duration::ZERO);
-        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2);
+        let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
 
         assert_eq!(start.spans[0].content, "model");
         assert_eq!(middle.spans[0].content, "model");
@@ -4541,9 +4551,9 @@ mod tests {
     }
 
     #[test]
-    fn model_graph_is_a_five_cell_bounce_with_a_two_cell_tail() {
-        let frames = (0..=MODEL_GRAPH_PERIOD_TICKS)
-            .map(|tick| model_graph_frame_at(MODEL_GRAPH_TICK * tick as u32))
+    fn busy_indicator_is_a_five_cell_bounce_with_a_two_cell_tail() {
+        let frames = (0..=BUSY_INDICATOR_PERIOD_TICKS)
+            .map(|tick| busy_indicator_frame_at(BUSY_INDICATOR_TICK * tick as u32))
             .collect::<Vec<_>>();
 
         assert_eq!(frames[0], "■      ");
@@ -4555,10 +4565,10 @@ mod tests {
         assert_eq!(frames[8], frames[0]);
         assert!(frames
             .iter()
-            .all(|frame| frame.chars().count() == MODEL_GRAPH_WIDTH));
-        assert_eq!(MODEL_GRAPH_TRACK_LENGTH, 5);
-        assert_eq!(MODEL_GRAPH_TAIL_LENGTH, 2);
-        assert_eq!(MODEL_GRAPH_TICK, Duration::from_micros(62_500));
+            .all(|frame| frame.chars().count() == BUSY_INDICATOR_WIDTH));
+        assert_eq!(BUSY_INDICATOR_TRACK_LENGTH, 5);
+        assert_eq!(BUSY_INDICATOR_TAIL_LENGTH, 2);
+        assert_eq!(BUSY_INDICATOR_TICK, Duration::from_micros(62_500));
     }
 
     fn color_distance_from_console(color: Color) -> u32 {
@@ -4571,12 +4581,12 @@ mod tests {
     }
 
     #[test]
-    fn model_graph_tail_uses_same_block_with_progressively_fainter_colors() {
+    fn busy_indicator_tail_uses_same_block_with_progressively_fainter_colors() {
         let accent = Color::Rgb(180, 120, 240);
-        let near = model_graph_color(accent, Some(1));
-        let far = model_graph_color(accent, Some(2));
+        let near = busy_indicator_color(accent, Some(1));
+        let far = busy_indicator_color(accent, Some(2));
 
-        assert_eq!(MODEL_GRAPH_BLOCK, '■');
+        assert_eq!(BUSY_INDICATOR_BLOCK, '■');
         assert_ne!(near, accent);
         assert_ne!(far, near);
         assert!(color_distance_from_console(near) > color_distance_from_console(far));
@@ -4828,8 +4838,9 @@ mod tests {
         let status_row = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert!(status_row.starts_with("model "));
-        assert!(status_row.contains(" · default | Context: "));
+        assert!(status_row.starts_with("model · default "));
+        assert!(status_row.contains("■"));
+        assert!(status_row.contains(" | Context: "));
         terminal.backend_mut().assert_cursor_position((
             prompt_area.x + UnicodeWidthStr::width(state.input.as_str()) as u16,
             prompt_area.y,
