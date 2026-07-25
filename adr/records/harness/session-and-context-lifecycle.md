@@ -15,6 +15,15 @@ depends_on:
 supersedes: []
 superseded_by: []
 last_reviewed: "2026-07-19"
+enforcement:
+  - id: session-resume-and-context
+    path: src/session.rs
+    must_contain:
+      - "fn creates_appends_resumes_and_lists_jsonl_session()"
+      - "fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()"
+      - "fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()"
+    must_not_contain: []
+enforcement_exception: null
 ---
 
 # Session and boot context lifecycle

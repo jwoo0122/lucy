@@ -14,6 +14,15 @@ depends_on:
 supersedes: []
 superseded_by: []
 last_reviewed: "2026-07-19"
+enforcement:
+  - id: config-bootstrap-and-migration
+    path: src/config.rs
+    must_contain:
+      - "fn bootstraps_config_without_overwriting_existing_bytes()"
+      - "fn migrates_a_legacy_config_once_without_overwriting_xdg_config()"
+      - "fn auth_provider_rejects_mixed_credentials()"
+    must_not_contain: []
+enforcement_exception: null
 ---
 
 # User-owned configuration and provider boundary

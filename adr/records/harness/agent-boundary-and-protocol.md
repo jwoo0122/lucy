@@ -14,6 +14,25 @@ depends_on: []
 supersedes: []
 superseded_by: []
 last_reviewed: "2026-07-19"
+enforcement:
+  - id: cmd-only-tool-schema
+    path: src/provider.rs
+    must_contain:
+      - "fn normal_requests_expose_only_cmd()"
+      - '"name": "cmd"'
+    must_not_contain: []
+  - id: normalized-jsonl-tool-loop
+    path: tests/cli.rs
+    must_contain:
+      - "fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure()"
+    must_not_contain: []
+  - id: codex-cmd-tool-schema
+    path: src/codex_provider.rs
+    must_contain:
+      - "fn codex_request_uses_responses_shape()"
+      - '"background":{"type":"boolean","default":false}'
+    must_not_contain: []
+enforcement_exception: null
 ---
 
 # Local interactive and JSONL harness boundary

@@ -386,6 +386,7 @@ where
         provider,
         context_window: None,
         attached_agents,
+        background_commands: crate::command::BackgroundCommands::default(),
     };
     if mode == FrontendMode::Tui {
         return match crate::tui::run(harness, resumed, output) {
@@ -418,7 +419,20 @@ where
     });
     let mut input_closed = false;
     loop {
+        if harness.has_completed_background_commands() {
+            if let Err(error) = harness.handle_background_completions(&mut protocol, None) {
+                let error = redact_secret(&error, Some(harness.provider.api_key().as_str()));
+                if protocol.error(&error).is_err() {
+                    return 1;
+                }
+            }
+            continue;
+        }
         if input_closed {
+            if harness.has_active_background_commands() {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
             break;
         }
         let line = match input_rx.recv_timeout(std::time::Duration::from_millis(25)) {
@@ -505,6 +519,7 @@ pub(crate) struct Harness {
     /// AGENTS.md sources selected for this newly created session's boot context.
     /// The TUI uses these only while its first-boot welcome is visible.
     pub(crate) attached_agents: Vec<String>,
+    background_commands: crate::command::BackgroundCommands,
 }
 
 fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
@@ -658,8 +673,62 @@ impl Harness {
                 .map_err(|error| format!("unable to emit skill attachment state: {error}"))?;
         }
 
+        self.continue_turn(sink, cancellation)
+    }
+
+    pub(crate) fn has_active_background_commands(&self) -> bool {
+        self.background_commands.has_active()
+    }
+
+    pub(crate) fn has_completed_background_commands(&self) -> bool {
+        self.background_commands.has_completed()
+    }
+
+    pub(crate) fn handle_background_completions<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Result<bool, String> {
+        if !self.append_background_completions()? {
+            return Ok(false);
+        }
+        self.continue_turn(sink, cancellation)?;
+        Ok(true)
+    }
+
+    fn append_background_completions(&mut self) -> Result<bool, String> {
+        let completions = self.background_commands.take_completions();
+        if completions.is_empty() {
+            return Ok(false);
+        }
+        for completion in completions {
+            let result = serde_json::json!({
+                "background_id": completion.id,
+                "status": "completed",
+                "result": completion.result,
+            });
+            let content = format!(
+                "Lucy background command completed. Treat this as the automatic result for the previously registered background command:
+{}",
+                serde_json::to_string(&result)
+                    .map_err(|error| format!("unable to encode background cmd result: {error}"))?
+            );
+            self.session
+                .append_message(ChatMessage::system(content))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(true)
+    }
+
+    fn continue_turn<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Result<(), String> {
+        let secret = self.provider.api_key();
         let mut compacted_for_turn = false;
         loop {
+            self.append_background_completions()?;
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
             }
@@ -805,6 +874,9 @@ impl Harness {
                 {
                     return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
                 }
+                if self.append_background_completions()? {
+                    continue;
+                }
                 if cancellation.is_some_and(|token| !token.try_complete()) {
                     return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
                 }
@@ -832,14 +904,14 @@ impl Harness {
                     ))
                     .map_err(|error| format!("unable to encode cmd result: {error}"))?
                 } else {
-                    serde_json::to_value(crate::command::execute_with_cancellation(
+                    crate::command::execute_managed(
                         &raw_call.arguments,
                         &self.session.cwd,
                         self.provider.api_key_env(),
                         Some(&secret),
                         cancellation,
-                    ))
-                    .map_err(|error| format!("unable to encode cmd result: {error}"))?
+                        &mut self.background_commands,
+                    )
                 };
                 let result = redact_json_value(result, &secret);
                 let tool_content = serde_json::to_string(&result)
@@ -1172,7 +1244,12 @@ fn safe_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
             .ok()
             .and_then(|value| value.as_object().cloned())
             .is_some_and(|object| {
-                object.len() == 1 && object.get("command").is_some_and(Value::is_string)
+                (object.len() == 1 || object.len() == 2)
+                    && object.get("command").is_some_and(Value::is_string)
+                    && object.get("background").is_none_or(Value::is_boolean)
+                    && object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "command" | "background"))
             }),
         _ => false,
     };
@@ -1196,8 +1273,13 @@ fn safe_partial_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
     let arguments = if serde_json::from_str::<Value>(&call.arguments)
         .ok()
         .and_then(|value| value.as_object().cloned())
-        .is_some_and(|object| object.len() == 1 && object.contains_key("command"))
-    {
+        .is_some_and(|object| {
+            (object.len() == 1 || object.len() == 2)
+                && object.contains_key("command")
+                && object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "command" | "background"))
+        }) {
         safe_tool_call(call, secret).arguments
     } else {
         // An incomplete argument fragment is an observation only. Do not
@@ -1644,6 +1726,7 @@ mod tests {
             provider,
             context_window: Some(1),
             attached_agents: Vec::new(),
+            background_commands: crate::command::BackgroundCommands::default(),
         };
         let cancellation = CancellationToken::new();
         let mut sink = Sink {
@@ -1836,6 +1919,10 @@ mod tests {
         for invalid in ["[]", "{\"command\":1}", "{\"other\":\"value\"}"] {
             assert_eq!(redact_tool_arguments(invalid, secret), "{}");
         }
+        assert_eq!(
+            redact_tool_arguments(r#"{"command":"printf ordinary","background":true}"#, secret,),
+            r#"{"background":true,"command":"printf ordinary"}"#
+        );
     }
 
     #[test]
