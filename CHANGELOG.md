@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.11.0](https://github.com/jwoo0122/lucy/compare/v1.10.1...v1.11.0) - 2026-07-25
+
+### Added
+
+- *(codex)* default to the model's max context window
+
 ## [1.10.1](https://github.com/jwoo0122/lucy/compare/v1.10.0...v1.10.1) - 2026-07-25
 
 ### Fixed
