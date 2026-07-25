@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.9.0](https://github.com/jwoo0122/lucy/compare/v1.8.4...v1.9.0) - 2026-07-25
+
+### Added
+
+- load Codex model metadata from server
+
 ## [1.8.4](https://github.com/jwoo0122/lucy/compare/v1.8.3...v1.8.4) - 2026-07-25
 
 ### Fixed
