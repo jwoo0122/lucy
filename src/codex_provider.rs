@@ -39,6 +39,7 @@ pub struct CodexProvider {
     effort: Option<String>,
     initial_access: String,
     model_cache: Mutex<Option<(Instant, String, Vec<CodexModelMetadata>)>>,
+    session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -88,7 +89,13 @@ impl CodexProvider {
             model: settings.model.clone(),
             effort,
             model_cache: Mutex::new(None),
+            session_id: None,
         })
+    }
+
+    pub fn with_session_id(mut self, session_id: &str) -> Self {
+        self.session_id = Some(session_id.to_owned());
+        self
     }
 
     pub fn api_key(&self) -> &str {
@@ -304,7 +311,13 @@ impl CodexProvider {
         include_tools: bool,
     ) -> Result<ProviderTurn, ProviderError> {
         let (access, account_id) = self.access_token()?;
-        let request = codex_request(&self.model, messages, &self.effort, include_tools);
+        let request = codex_request(
+            &self.model,
+            messages,
+            &self.effort,
+            include_tools,
+            self.session_id.as_deref(),
+        );
         let mut response =
             self.send_request_cancellable(&request, &access, &account_id, cancellation)?;
         let mut active_access = access;
@@ -453,6 +466,7 @@ fn codex_request(
     messages: &[ChatMessage],
     effort: &Option<String>,
     include_tools: bool,
+    session_id: Option<&str>,
 ) -> Value {
     let instructions = messages
         .iter()
@@ -475,6 +489,9 @@ fn codex_request(
     });
     if let Some(effort) = effort {
         request["reasoning"] = json!({"effort": effort, "summary": "auto"});
+    }
+    if let Some(session_id) = session_id {
+        request["prompt_cache_key"] = json!(session_id);
     }
     if include_tools {
         let tools = vec![tool_schema(
@@ -771,6 +788,7 @@ mod tests {
             ],
             &Some("high".to_owned()),
             true,
+            Some("lucy-session"),
         );
         assert_eq!(request["model"], "gpt-5.3-codex");
         assert_eq!(request["store"], false);
@@ -778,9 +796,20 @@ mod tests {
         assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["tools"][0]["name"], "cmd");
+        assert_eq!(request["prompt_cache_key"], "lucy-session");
         let background = &request["tools"][0]["parameters"]["properties"]["background"];
         assert_eq!(background["type"], "boolean");
         assert_eq!(background["default"], false);
+
+        let compact = codex_request(
+            "gpt-5.3-codex",
+            &[ChatMessage::user("hello".to_owned())],
+            &None,
+            false,
+            Some("lucy-session"),
+        );
+        assert!(compact.get("tools").is_none());
+        assert_eq!(compact["prompt_cache_key"], request["prompt_cache_key"]);
     }
 
     #[test]

@@ -13,7 +13,7 @@ depends_on:
   - harness.agent-boundary-and-protocol
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-19"
+last_reviewed: "2026-07-25"
 enforcement:
   - id: config-bootstrap-and-migration
     path: src/config.rs
@@ -21,6 +21,19 @@ enforcement:
       - "fn bootstraps_config_without_overwriting_existing_bytes()"
       - "fn migrates_a_legacy_config_once_without_overwriting_xdg_config()"
       - "fn auth_provider_rejects_mixed_credentials()"
+    must_not_contain: []
+  - id: openrouter-session-identity-and-attribution
+    path: src/provider.rs
+    must_contain:
+      - "fn openrouter_requests_include_session_and_app_metadata()"
+      - "fn compatible_requests_omit_provider_specific_session_metadata()"
+      - 'const APP_URL: &str = "https://lucyna.run";'
+    must_not_contain: []
+  - id: codex-session-identity
+    path: src/codex_provider.rs
+    must_contain:
+      - "fn codex_request_uses_responses_shape()"
+      - 'request["prompt_cache_key"] = json!(session_id);'
     must_not_contain: []
 enforcement_exception: null
 ---
@@ -45,6 +58,8 @@ The generated config SHOULD use OpenRouter's OpenAI-compatible endpoint as its e
 
 When `effort` is set to a non-empty value, Lucy MUST send it verbatim as the OpenAI Chat Completions `reasoning_effort` request field; when it is unset or omitted, Lucy MUST NOT send the field. Lucy MUST NOT validate `effort` against a fixed enum — compatibility is the user's responsibility, and a value the configured provider or model rejects is a runtime provider error, not a boot failure. An empty or whitespace-only `effort` MUST fail boot with a configuration error. The resolved `effort` is sent with each request when set.
 
+Every model request in one named Lucy session MUST use that session's existing public session ID as a stable, secret-safe provider routing/cache identity when the selected provider supports one. Resume, tool follow-up, compaction, and post-settings-change requests MUST retain the same identity. Requests to OpenRouter's own host MUST send it as the top-level `session_id` and identify the application with `X-OpenRouter-Title: Lucy` and `HTTP-Referer: https://lucyna.run`. Codex subscription Responses requests MUST send it as `prompt_cache_key` and identify the application with `originator: lucy`. Generic OpenAI-compatible endpoints MUST NOT receive these provider-specific fields or headers. Lucy does not derive parent/task identities or manage routing identities for external agents, including independently launched Lucy processes.
+
 `config.toml` is the source of truth for model and effort whenever a session starts or resumes. The interactive TUI MUST provide an idle-only `/settings` menu that reads the configured provider catalog, supports typed model filtering plus keyboard selection, and writes selected model/effort values back to config before applying them to the current session. Catalog capability metadata MAY provide a finite effort picker; when it does not, the UI MUST accept a user-entered effort value. A resumed session MUST reload the current config model and effort rather than reuse the header values. The session header and every interactive setting transition MUST retain a secret-safe timestamped provider-settings audit record so historical requests remain attributable without making the header authoritative.
 
 Lucy MUST resolve config and ambient context at new-session boot and persist the resolved system prompt in the session snapshot. Editing config does not change the resolved prompt, cwd, or skill snapshot of an existing session.
@@ -68,6 +83,8 @@ Users need to inspect and change the minimal model guidance without recompiling 
 - `/settings` is available only when the TUI has no active turn, and provider catalog failures must not expose credentials.
 - Config parse errors identify the setting/file without echoing secret values.
 - A session's resolved prompt remains stable across resume.
+- Provider routing/cache identity equals the existing Lucy session ID, remains stable across resume and compaction, and is not persisted in a new field.
+- OpenRouter and Codex receive only their documented identity metadata; generic compatible endpoints remain free of provider-specific request fields and headers.
 
 ## Alternatives and trade-offs
 
@@ -75,11 +92,11 @@ A compiled prompt would be simpler but violate user ownership. An installer-spec
 
 ## Consequences
 
-The first run mutates the user's XDG configuration directory (or `~/.config` by default). Upgrading an installation with only a legacy config moves that config to the XDG location; sessions remain in `~/.lucy/sessions`. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers are out of scope for v1.
+The first run mutates the user's XDG configuration directory (or `~/.config` by default). Upgrading an installation with only a legacy config moves that config to the XDG location; sessions remain in `~/.lucy/sessions`. Model and effort changes made through `/settings` affect the next request in the current idle session and become the defaults for new or resumed sessions; prompt changes still require a new session. Credential rotation does not migrate old-key session data; legacy data containing an old inactive key remains a user-managed residual. Provider-specific optional headers remain out of scope except for the fixed application-attribution and session-routing metadata above.
 
 ## Enforcement
 
-Tests MUST cover XDG and default-path first-run creation, legacy-config migration, no-overwrite behavior, config parsing, environment-key lookup, redaction, prompt snapshot stability, provider-catalog fallback behavior, settings persistence, resume-time model/effort reload, and provider-settings audit records.
+Tests MUST cover XDG and default-path first-run creation, legacy-config migration, no-overwrite behavior, config parsing, environment-key lookup, redaction, prompt snapshot stability, provider-catalog fallback behavior, settings persistence, resume-time model/effort reload, and provider-settings audit records. Provider request tests MUST verify stable session identity for ordinary, resumed, compaction, and settings-change paths; provider-specific application attribution; and omission from generic compatible requests and public/persisted formats.
 
 ## Revisit when
 

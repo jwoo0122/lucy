@@ -4058,7 +4058,10 @@ mod tests {
         assert!(rows[title_row + 3].contains(WELCOME_TAGLINE));
 
         let version_width = WELCOME_VERSION.chars().count() as u16;
-        let version_x = chat_area.x + (chat_area.width - version_width) / 2;
+        let version_x = chat_area.x
+            + rows[version_rows[0]]
+                .find(WELCOME_VERSION)
+                .expect("rendered welcome version") as u16;
         let version_y = chat_area.y + title_row as u16 + 1;
         assert!((version_x..version_x + version_width)
             .all(|x| buffer[(x, version_y)].fg == Color::DarkGray));

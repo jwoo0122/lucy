@@ -380,6 +380,7 @@ where
         (session, provider, false, attached_agents)
     };
 
+    let provider = provider.with_session_id(&session.id);
     let harness = Harness {
         home: home.to_path_buf(),
         session,
@@ -580,7 +581,9 @@ impl Harness {
         settings.base_url = self.session.llm.base_url.clone();
         settings.api_key_env = self.session.llm.api_key_env.clone();
         apply_auth_to_settings(&mut settings, auth_provider_for_settings(&self.session.llm));
-        let provider = provider_for_settings(home, &settings).map_err(|error| error.to_string())?;
+        let provider = provider_for_settings(home, &settings)
+            .map_err(|error| error.to_string())?
+            .with_session_id(&self.session.id);
         // Validate the candidate before changing the user-owned source of truth.
         Config::save_selection(home, &settings.model, settings.effort.as_deref())
             .map_err(|error| error.to_string())?;
@@ -1720,6 +1723,7 @@ mod tests {
             }
         }
 
+        let provider = provider.with_session_id(&session.id);
         let mut harness = Harness {
             home: std::env::temp_dir(),
             session,
@@ -1742,6 +1746,10 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].get("tools").is_none());
         assert!(requests[1].get("tools").is_some());
+        // This compatible test endpoint intentionally receives no OpenRouter-only field.
+        assert!(requests
+            .iter()
+            .all(|request| request.get("session_id").is_none()));
         assert!(sink.compaction_started);
         assert!(sink.compaction_finished);
         assert!(sink.events.iter().any(
