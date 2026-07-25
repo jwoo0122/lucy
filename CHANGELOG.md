@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.8.1](https://github.com/jwoo0122/lucy/compare/v1.8.0...v1.8.1) - 2026-07-25
+
+### Fixed
+
+- *(tui)* simplify console surface and animate model status ([#23](https://github.com/jwoo0122/lucy/pull/23))
+
 ## [1.8.0](https://github.com/jwoo0122/lucy/compare/v1.7.0...v1.8.0) - 2026-07-23
 
 ### Added
