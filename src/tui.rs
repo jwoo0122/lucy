@@ -58,6 +58,7 @@ const WELCOME_START_COLOR: (u8, u8, u8) = (180, 130, 245);
 const WELCOME_END_COLOR: (u8, u8, u8) = (0, 180, 180);
 const USER_BORDER_COLOR: Color = Color::Rgb(192, 154, 0);
 const USER_BORDER_GLYPH: &str = "▌";
+const PROMPT_BACKGROUND: Color = Color::Rgb(24, 24, 27);
 const BUSY_INDICATOR_FADE_BASE_RGB: (u8, u8, u8) = (42, 42, 46);
 const CONSOLE_STATUS_COLOR: Color = Color::Rgb(144, 144, 148);
 const CONSOLE_ACCENT_LAVENDER: (u8, u8, u8) = (145, 70, 220);
@@ -2026,6 +2027,11 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
             draw_transcript_scrollbar(frame, visible_chat_area, total_lines, max_scroll, scroll);
         }
     }
+
+    frame.render_widget(
+        Block::default().style(Style::default().bg(PROMPT_BACKGROUND)),
+        input_chunk,
+    );
 
     if let Some(layout) = welcome_image_layout {
         let image = welcome_image(layout.image_size);
@@ -4954,7 +4960,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_surface_has_no_background_effects_when_idle_or_busy() {
+    fn prompt_surface_has_a_subtle_dark_background_when_idle_or_busy() {
         for busy in [false, true] {
             let mut state = UiState::from_history(&[], "secret", "model", None, false);
             state.input = "prompt".to_owned();
@@ -4971,12 +4977,20 @@ mod tests {
 
             let (_, _, _, _, input_area, _) = ui_layout(&state, tui_viewport(area));
             let buffer = terminal.backend().buffer();
-            for y in input_area.y.saturating_sub(1)..area.height {
+            for x in 0..area.width {
+                assert_eq!(buffer[(x, input_area.y - 1)].bg, Color::Reset);
+            }
+            for y in input_area.y..input_area.y + input_area.height {
                 for x in 0..area.width {
+                    let expected = if input_area.contains((x, y).into()) {
+                        PROMPT_BACKGROUND
+                    } else {
+                        Color::Reset
+                    };
                     assert_eq!(
                         buffer[(x, y)].bg,
-                        Color::Reset,
-                        "busy={busy}: background effect remains at ({x}, {y})"
+                        expected,
+                        "busy={busy}: unexpected background at ({x}, {y})"
                     );
                 }
             }
@@ -5431,7 +5445,7 @@ mod skill_picker_tests {
             SKILL_PICKER_BACKGROUND
         );
         assert_eq!(buffer[(input_area.x, input_area.y)].symbol(), " ");
-        assert_eq!(buffer[(input_area.x, input_area.y)].bg, Color::Reset);
+        assert_eq!(buffer[(input_area.x, input_area.y)].bg, PROMPT_BACKGROUND);
     }
 
     #[test]
