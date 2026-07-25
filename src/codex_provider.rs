@@ -402,7 +402,7 @@ fn parse_model_catalog(bytes: &[u8]) -> Result<Vec<CodexModelMetadata>, Provider
                         })
                 })
                 .filter(|efforts| !efforts.is_empty());
-            let context_window = [entry.get("context_window"), entry.get("max_context_window")]
+            let context_window = [entry.get("max_context_window"), entry.get("context_window")]
                 .into_iter()
                 .flatten()
                 .find_map(Value::as_u64)
@@ -872,7 +872,7 @@ mod tests {
             catalog[0].model.efforts,
             Some(vec!["low".to_owned(), "high".to_owned()])
         );
-        assert_eq!(catalog[0].context_window, Some(273_000));
+        assert_eq!(catalog[0].context_window, Some(400_000));
         assert_eq!(catalog[1].context_window, Some(128_000));
     }
 
