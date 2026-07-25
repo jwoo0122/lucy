@@ -34,6 +34,7 @@ const MAX_MODEL_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const COMPACTION_MAX_SUMMARY_TOKENS: usize = 4_096;
 const OPENROUTER_HOST: &str = "openrouter.ai";
 const APP_TITLE: &str = "Lucy";
+const APP_URL: &str = "https://lucyna.run";
 
 #[derive(Debug)]
 pub struct ProviderError {
@@ -270,6 +271,7 @@ fn provider_headers(is_openrouter: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if is_openrouter {
         headers.insert("x-openrouter-title", HeaderValue::from_static(APP_TITLE));
+        headers.insert("http-referer", HeaderValue::from_static(APP_URL));
     }
     headers
 }
@@ -1256,6 +1258,7 @@ mod tests {
 
         let headers = provider_headers(true);
         assert_eq!(headers.get("x-openrouter-title").unwrap(), "Lucy");
+        assert_eq!(headers.get("http-referer").unwrap(), "https://lucyna.run");
 
         let compact = chat_request(
             "model",
@@ -1278,7 +1281,9 @@ mod tests {
         );
         assert!(request.get("session_id").is_none());
 
-        assert!(provider_headers(false).get("x-openrouter-title").is_none());
+        let headers = provider_headers(false);
+        assert!(headers.get("x-openrouter-title").is_none());
+        assert!(headers.get("http-referer").is_none());
     }
 
     #[test]
