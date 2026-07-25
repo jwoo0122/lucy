@@ -1662,7 +1662,13 @@ fn draw_transcript_scrollbar(
     let thumb_range = track_height.saturating_sub(thumb_height);
     let thumb_start = (usize::from(scroll.min(max_scroll)) * thumb_range / usize::from(max_scroll))
         .min(thumb_range);
-    let x = area.x + area.width - 1;
+    // Keep the transcript's final column visible. Cramped layouts without a
+    // right gutter omit the scrollbar rather than covering message content.
+    let x = area.x.saturating_add(area.width);
+    let frame_right = frame.area().x.saturating_add(frame.area().width);
+    if x >= frame_right {
+        return;
+    }
     let buffer = frame.buffer_mut();
 
     for offset in 0..track_height {
@@ -4238,13 +4244,14 @@ mod tests {
     fn transcript_scrollbar_appears_only_when_the_stream_is_scrolled() {
         let mut state = UiState::from_history(&[], "provider-secret", "model", None, false);
         state.welcome_visible = false;
+        let area = Rect::new(0, 0, 80, 14);
+        let chat_area = ui_layout(&state, tui_viewport(area)).0;
         state.transcript = (0..40)
-            .map(|index| TranscriptItem::Info(format!("message {index}")))
+            .map(|_| TranscriptItem::Info(format!("{}#", "x".repeat(chat_area.width as usize - 1))))
             .collect();
         state.auto_scroll = false;
         state.scroll = 3;
 
-        let area = Rect::new(0, 0, 80, 14);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                 .expect("test terminal");
@@ -4252,9 +4259,14 @@ mod tests {
             .draw(|frame| draw(frame, &state))
             .expect("draw scrolled transcript");
 
-        let chat_area = ui_layout(&state, tui_viewport(area)).0;
-        let scrollbar_x = chat_area.x + chat_area.width - 1;
+        let message_edge_x = chat_area.x + chat_area.width - 1;
+        let scrollbar_x = chat_area.x + chat_area.width;
         let buffer = terminal.backend().buffer();
+        assert!(
+            (chat_area.y..chat_area.y + chat_area.height)
+                .any(|y| buffer[(message_edge_x, y)].symbol() == "#"),
+            "the scrollbar must not overwrite transcript content at the right edge"
+        );
         assert!(
             (chat_area.y..chat_area.y + chat_area.height).any(|y| {
                 buffer[(scrollbar_x, y)].symbol() == TRANSCRIPT_SCROLLBAR_THUMB
