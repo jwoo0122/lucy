@@ -724,6 +724,18 @@ impl Session {
                 | SessionHistoryRecord::Compaction(_) => {}
             }
         }
+        // Remove tool calls that have no corresponding tool result. When a
+        // turn is interrupted (e.g. timeout, cancellation) after the assistant
+        // message was persisted but before the tool result, the API rejects
+        // the replayed request with "No tool output found for function call".
+        // Dropping the orphaned tool call lets the session resume cleanly.
+        for message in &mut messages {
+            if message.role == "assistant" && !message.tool_calls.is_empty() {
+                message
+                    .tool_calls
+                    .retain(|call| completed_tool_calls.contains(&call.id));
+            }
+        }
         messages
     }
 
@@ -1437,6 +1449,62 @@ mod tests {
             fs::read_to_string(path).expect("session JSONL after provider messages"),
             raw_before
         );
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn provider_messages_drops_tool_calls_without_results() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_ORPHAN_TOOL_KEY".to_owned(),
+            effort: None,
+        };
+        let mut session = Session::create(&home, &cwd, "prompt".to_owned(), llm).expect("create");
+        // Assistant declares a tool call that never gets a result.
+        let assistant = ChatMessage::assistant(
+            "let me check".to_owned(),
+            vec![ChatToolCall {
+                id: "call-orphan".to_owned(),
+                name: "cmd".to_owned(),
+                arguments: r#"{"command":"pwd"}"#.to_owned(),
+            }],
+        );
+        session.append_message(assistant).expect("append assistant");
+        // A second assistant message with a completed tool call.
+        let assistant2 = ChatMessage::assistant(
+            "done".to_owned(),
+            vec![ChatToolCall {
+                id: "call-done".to_owned(),
+                name: "cmd".to_owned(),
+                arguments: r#"{"command":"ls"}"#.to_owned(),
+            }],
+        );
+        session
+            .append_message(assistant2)
+            .expect("append assistant2");
+        session
+            .append_message(ChatMessage::tool(
+                "call-done".to_owned(),
+                "cmd".to_owned(),
+                r#"{"exit_code":0,"stdout":"ok"}"#.to_owned(),
+            ))
+            .expect("append tool result");
+
+        let messages = session.provider_messages();
+        // System + user(boot) + assistant1 + assistant2 + tool
+        let assistants: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(assistants.len(), 2);
+        // Orphaned tool call is removed from the first assistant.
+        assert!(
+            assistants[0].tool_calls.is_empty(),
+            "orphaned tool call should be removed"
+        );
+        // Completed tool call is preserved on the second assistant.
+        assert_eq!(assistants[1].tool_calls.len(), 1);
+        assert_eq!(assistants[1].tool_calls[0].id, "call-done");
         fs::remove_dir_all(home).expect("cleanup");
     }
 
