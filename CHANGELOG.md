@@ -6,6 +6,13 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.12.3](https://github.com/jwoo0122/lucy/compare/v1.12.2...v1.12.3) - 2026-07-26
+
+### Fixed
+
+- drop orphaned tool calls on session resume
+- strip expired encrypted reasoning on Codex session resume
+
 ## [1.12.2](https://github.com/jwoo0122/lucy/compare/v1.12.1...v1.12.2) - 2026-07-25
 
 ### Fixed
