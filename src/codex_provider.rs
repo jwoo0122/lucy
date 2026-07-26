@@ -508,6 +508,29 @@ fn tool_schema(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false})
 }
 
+/// Transform a stored reasoning detail for replay in a subsequent Codex request.
+///
+/// The Codex subscription API returns `reasoning` items with `encrypted_content`
+/// when `include: ["reasoning.encrypted_content"]` is set.  The encrypted blob is
+/// short-lived: once it expires the API rejects it with HTTP 400.  On session
+/// resume the stored items may be minutes or hours old, so replaying the raw
+/// encrypted content is unsafe.
+///
+/// Strip `encrypted_content` from each stored `reasoning` item, keeping the
+/// `summary` text and the item's `id` so the model retains reasoning context.
+/// Non-`reasoning` items pass through unchanged.
+fn reasoning_item_for_replay(detail: &Value) -> Option<Value> {
+    let detail_type = detail.get("type").and_then(Value::as_str)?;
+    if detail_type != "reasoning" {
+        return Some(detail.clone());
+    }
+    let mut replayed = detail.clone();
+    if let Some(obj) = replayed.as_object_mut() {
+        obj.remove("encrypted_content");
+    }
+    Some(replayed)
+}
+
 fn response_input(message: &ChatMessage) -> Vec<Value> {
     match message.role.as_str() {
         OBSERVATION_ROLE => vec![json!({
@@ -522,7 +545,7 @@ fn response_input(message: &ChatMessage) -> Vec<Value> {
         "assistant" => {
             let mut values = Vec::new();
             if let Some(details) = &message.reasoning_details {
-                values.extend(details.iter().cloned());
+                values.extend(details.iter().filter_map(reasoning_item_for_replay));
             }
             if let Some(content) = &message.content {
                 values.push(json!({
@@ -951,5 +974,56 @@ mod tests {
         assert_eq!(value[0]["type"], "function_call_output");
         assert_eq!(value[0]["call_id"], "call");
         assert!(value[0].get("name").is_none());
+    }
+
+    #[test]
+    fn response_input_strips_encrypted_reasoning_on_replay() {
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(vec![
+            json!({
+                "type": "reasoning",
+                "id": "rs_abc",
+                "encrypted_content": "gAAAAAexpired",
+                "summary": [{"type": "summary_text", "text": "Inspecting repository"}],
+            }),
+            json!({
+                "type": "reasoning.text",
+                "format": "some-other-provider-v1",
+                "text": "unsigned but replayable",
+            }),
+        ]);
+        let values = response_input(&assistant);
+        let reasoning = values
+            .iter()
+            .find(|v| v.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("reasoning item");
+        assert_eq!(reasoning["id"], "rs_abc");
+        assert_eq!(reasoning["summary"][0]["text"], "Inspecting repository");
+        assert!(
+            reasoning.get("encrypted_content").is_none(),
+            "encrypted_content must not be replayed"
+        );
+        let other = values
+            .iter()
+            .find(|v| v.get("type").and_then(Value::as_str) == Some("reasoning.text"))
+            .expect("passthrough item");
+        assert_eq!(other["text"], "unsigned but replayable");
+    }
+
+    #[test]
+    fn response_input_preserves_reasoning_without_encrypted_content() {
+        let mut assistant = ChatMessage::assistant("answer".to_owned(), Vec::new());
+        assistant.reasoning_details = Some(vec![json!({
+            "type": "reasoning",
+            "id": "rs_plain",
+            "summary": [{"type": "summary_text", "text": "No encryption here"}],
+        })]);
+        let values = response_input(&assistant);
+        let reasoning = values
+            .iter()
+            .find(|v| v.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("reasoning item");
+        assert_eq!(reasoning["id"], "rs_plain");
+        assert!(reasoning.get("encrypted_content").is_none());
     }
 }
