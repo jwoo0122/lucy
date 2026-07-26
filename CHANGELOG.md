@@ -6,6 +6,17 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.13.0](https://github.com/jwoo0122/lucy/compare/v1.12.3...v1.13.0) - 2026-07-26
+
+### Added
+
+- add built-in capability discovery guidance
+
+### Other
+
+- Merge pull request #41 from jwoo0122/feat/builtin-capability-discovery
+- add capability discovery evaluation
+
 ## [1.12.3](https://github.com/jwoo0122/lucy/compare/v1.12.2...v1.12.3) - 2026-07-26
 
 ### Fixed
