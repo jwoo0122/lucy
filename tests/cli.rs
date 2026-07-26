@@ -461,19 +461,19 @@ fn temporary_tree(name: &str) -> (PathBuf, PathBuf) {
     (home, project)
 }
 
-fn write_config(home: &Path, base_url: &str, prompt: &str, model: &str) {
-    write_config_with_api_key_env(home, base_url, prompt, model, "LUCY_API_KEY");
+fn write_config(home: &Path, base_url: &str, legacy_prompt: &str, model: &str) {
+    write_config_with_api_key_env(home, base_url, legacy_prompt, model, "LUCY_API_KEY");
 }
 
 fn write_config_with_api_key_env(
     home: &Path,
     base_url: &str,
-    prompt: &str,
+    legacy_prompt: &str,
     model: &str,
     api_key_env: &str,
 ) {
     fs::create_dir_all(home.join(".config/lucy")).expect("Lucy config directory");
-    let escaped_prompt = prompt.replace('"', "\\\"");
+    let escaped_prompt = legacy_prompt.replace('"', "\\\"");
     fs::write(
         home.join(".config/lucy/config.toml"),
         format!(
@@ -483,9 +483,15 @@ fn write_config_with_api_key_env(
     .expect("config");
 }
 
-fn write_config_with_effort(home: &Path, base_url: &str, prompt: &str, model: &str, effort: &str) {
+fn write_config_with_effort(
+    home: &Path,
+    base_url: &str,
+    legacy_prompt: &str,
+    model: &str,
+    effort: &str,
+) {
     fs::create_dir_all(home.join(".config/lucy")).expect("Lucy config directory");
-    let escaped_prompt = prompt.replace('"', "\\\"");
+    let escaped_prompt = legacy_prompt.replace('"', "\\\"");
     fs::write(
         home.join(".config/lucy/config.toml"),
         format!(
@@ -697,7 +703,8 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
         .path();
     let session_bytes = fs::read_to_string(session_file).expect("session contents");
     assert!(!session_bytes.contains("provider-secret"));
-    assert!(session_bytes.contains("base prompt"));
+    assert!(!session_bytes.contains("base prompt"));
+    assert!(session_bytes.contains("specialized CLI on PATH"));
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -890,6 +897,40 @@ fn git_context_discovery_uses_the_project_root_with_the_normal_terminal_environm
     let requests = server.join();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("root instructions"));
+
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn legacy_configured_prompt_is_absent_from_new_request_and_session() {
+    let server = MockServer::start(vec![normal_response("finished")]);
+    let (home, project) = temporary_tree("legacy-prompt-ignored");
+    let legacy_sentinel = "LEGACY_CONFIGURED_PROMPT_SENTINEL";
+    write_config(&home, &server.base_url, legacy_sentinel, "mock-model");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    let requests = server.join();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].contains(legacy_sentinel));
+    assert!(requests[0].contains("You can access computer resources"));
+    assert!(requests[0].contains("specialized CLI on PATH"));
+
+    let session_file = fs::read_dir(home.join(".lucy/sessions"))
+        .expect("sessions")
+        .next()
+        .expect("session entry")
+        .expect("session file")
+        .path();
+    let session = fs::read_to_string(session_file).expect("session contents");
+    assert!(!session.contains(legacy_sentinel));
+    assert!(session.contains("You can access computer resources"));
+    assert!(session.contains("specialized CLI on PATH"));
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -1825,7 +1866,8 @@ fn resume_rejects_malformed_current_config_without_leaking_secrets() {
 
     let requests = server.join();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].contains("original prompt"));
+    assert!(!requests[0].contains("original prompt"));
+    assert!(requests[0].contains("specialized CLI on PATH"));
     assert!(requests[0].contains("original instructions"));
     assert!(requests[0].contains("original-model"));
 
@@ -1981,6 +2023,44 @@ fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
 }
 
 #[test]
+fn resumed_session_uses_original_instruction_snapshot_after_source_edit() {
+    let server = MockServer::start(vec![normal_response("first"), normal_response("second")]);
+    let (home, project) = temporary_tree("instruction-snapshot-resume");
+    write_config(&home, &server.base_url, "ignored prompt", "mock-model");
+    fs::write(project.join("AGENTS.md"), "original ambient instruction")
+        .expect("original instruction");
+
+    let first = run_lucy(
+        &home,
+        &project,
+        &["--jsonl"],
+        "{\"type\":\"message\",\"text\":\"first request\"}\n",
+    );
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fs::write(project.join("AGENTS.md"), "changed ambient instruction")
+        .expect("changed instruction");
+
+    let resumed = run_lucy(
+        &home,
+        &project,
+        &["--jsonl", "--session", &session_id],
+        "{\"type\":\"message\",\"text\":\"second request\"}\n",
+    );
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("original ambient instruction"));
+    assert!(!requests[1].contains("changed ambient instruction"));
+
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
 fn separate_lucy_processes_resume_the_same_named_session() {
     let server = MockServer::start(vec![
         normal_response("first answer"),
@@ -2003,6 +2083,25 @@ fn separate_lucy_processes_resume_the_same_named_session() {
         .to_owned();
     assert_eq!(first_records[0]["resumed"], false);
 
+    let session_path = home
+        .join(".lucy/sessions")
+        .join(format!("{session_id}.jsonl"));
+    let session_bytes = fs::read_to_string(&session_path).expect("session bytes");
+    let (header, history) = session_bytes
+        .split_once('\n')
+        .expect("session header and history");
+    let mut header: Value = serde_json::from_str(header).expect("session header JSON");
+    let historical_prompt = "historical prompt from an earlier Lucy binary";
+    header["boot_system_prompt"] = json!(historical_prompt);
+    fs::write(
+        &session_path,
+        format!(
+            "{}\n{history}",
+            serde_json::to_string(&header).expect("session header serialization")
+        ),
+    )
+    .expect("replace historical boot prompt");
+
     let second = run_lucy(
         &home,
         &project,
@@ -2021,6 +2120,8 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("first request"));
     assert!(requests[1].contains("second request"));
+    assert!(requests[1].contains(historical_prompt));
+    assert!(!requests[1].contains("specialized CLI on PATH"));
     let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
     let tools = resumed_request["tools"].as_array().expect("model tools");
     assert_eq!(tools.len(), 1);

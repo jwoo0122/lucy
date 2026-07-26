@@ -275,22 +275,18 @@ where
                 return 1;
             }
         };
-        let context = match resolve_boot_context_with_api_key_env(
-            home,
-            &safe_cwd,
-            &config.system_prompt,
-            api_key_env.as_deref(),
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                write_diagnostic_safe(
-                    &mut diagnostics,
-                    &error.to_string(),
-                    configured_secret.as_deref(),
-                );
-                return 1;
-            }
-        };
+        let context =
+            match resolve_boot_context_with_api_key_env(home, &safe_cwd, api_key_env.as_deref()) {
+                Ok(context) => context,
+                Err(error) => {
+                    write_diagnostic_safe(
+                        &mut diagnostics,
+                        &error.to_string(),
+                        configured_secret.as_deref(),
+                    );
+                    return 1;
+                }
+            };
         let boot_system_prompt = redact_secret(&context.system_prompt, Some(&provider.api_key()));
         let attached_agents = attached_agents(context.instruction_files, &provider.api_key());
         let skills = redact_skills(context.skills, &provider.api_key());

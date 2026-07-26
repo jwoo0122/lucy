@@ -1409,6 +1409,30 @@ mod tests {
     }
 
     #[test]
+    fn resume_retains_historical_boot_system_prompt() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "LUCY_HISTORICAL_PROMPT_KEY".to_owned(),
+            effort: None,
+        };
+        let historical_prompt = "historical built-in boot prompt";
+        let session =
+            Session::create(&home, &cwd, historical_prompt.to_owned(), llm).expect("create");
+
+        let resumed = Session::resume(&home, &session.id).expect("resume");
+        assert_eq!(resumed.boot_system_prompt, historical_prompt);
+        assert_eq!(
+            resumed.provider_messages()[0],
+            ChatMessage::system(historical_prompt.to_owned())
+        );
+
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
     fn provider_messages_downgrade_legacy_background_system_records() {
         let home = temporary_home();
         let cwd = std::env::current_dir().expect("cwd");

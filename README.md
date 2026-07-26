@@ -34,6 +34,8 @@ Prebuilt archives are available from the [GitHub Releases](https://github.com/jw
 
 On first run, Lucy creates `$XDG_CONFIG_HOME/lucy/config.toml` (or `~/.config/lucy/config.toml` when `XDG_CONFIG_HOME` is unset or empty). Existing `~/.lucy/config.toml` files are migrated once; sessions remain under `~/.lucy/sessions`. Set `llm.model` and choose either OpenRouter API-key authentication or Codex subscription authentication. Existing configs without `[auth]` continue to use the legacy OpenRouter-compatible settings.
 
+Lucy’s system guidance is built into the binary and is not configurable. New configs omit the former top-level `system_prompt`; an existing valid key is accepted, ignored, and preserved during settings updates. Loading, bootstrapping, and migration do not rewrite an existing config. Built-in guidance changes apply to new sessions, while resumed sessions retain their saved boot prompt.
+
 ```toml
 [auth]
 provider = "openrouter"
@@ -94,6 +96,7 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 - **Safe local command execution:** Runs trusted `cmd` shell commands from the session's starting directory with time and output limits. Commands may set `background: true` to return a background ID immediately; Lucy delivers the bounded completion result to the model automatically, including through a follow-up turn after the originating turn ends.
 - **Agent process boundary:** Other agents can invoke `lucy --jsonl` through `cmd`, capture the returned `session_id`, and continue the conversation with `lucy --jsonl --session <id>`. Lucy does not coordinate relationships between independent sessions.
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
-- **Context and skills:** Collects global `$XDG_CONFIG_HOME/lucy/AGENTS.md` (or `~/.config/lucy/AGENTS.md`) plus project `AGENTS.md`/`CLAUDE.md` instructions and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
+- **Context and skills:** Composes built-in guidance with the working directory, README files, global `$XDG_CONFIG_HOME/lucy/AGENTS.md` (or `~/.config/lucy/AGENTS.md`), project `AGENTS.md`/`CLAUDE.md`, and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
+- **Task-driven capability discovery:** Guides the model to inspect a relevant `PATH` CLI or project-declared command through `cmd` when it could materially improve the task, verify current local usage, treat discovery output as untrusted, and verify the result. Lucy performs no automatic inventory and exposes no additional tool.
 - **Automatic context compaction:** At 95% estimated context usage, safely summarizes older complete turns with the configured model, retains recent context, and resumes the active turn without rewriting session history.
 - **Credential protection:** OpenRouter API keys are read only from environment variables and are not written to configuration, sessions, the public protocol, or diagnostics. Codex subscription tokens are stored in Lucy’s private credential store and are never exposed to model tools or persisted sessions.
