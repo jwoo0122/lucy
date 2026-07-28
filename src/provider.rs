@@ -228,6 +228,7 @@ fn chat_request(
     messages: &[ChatMessage],
     effort: &Option<String>,
     include_tools: bool,
+    is_openrouter: bool,
     session_id: Option<&str>,
 ) -> Value {
     let mut request = json!({
@@ -253,6 +254,9 @@ fn chat_request(
     }
     if let Some(effort) = effort {
         request["reasoning_effort"] = json!(effort);
+    }
+    if is_openrouter {
+        request["cache_control"] = json!({"type": "ephemeral"});
     }
     if let Some(session_id) = session_id {
         request["session_id"] = json!(session_id);
@@ -620,6 +624,7 @@ impl Provider {
             messages,
             &self.effort,
             include_tools,
+            self.is_openrouter,
             self.is_openrouter
                 .then_some(self.session_id.as_deref())
                 .flatten(),
@@ -1250,9 +1255,11 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            true,
             Some("lucy-session"),
         );
         assert_eq!(request["session_id"], "lucy-session");
+        assert_eq!(request["cache_control"], json!({"type": "ephemeral"}));
         assert!(is_openrouter_base_url("https://openrouter.ai/api/v1"));
         assert!(!is_openrouter_base_url("https://example.com/v1"));
 
@@ -1265,9 +1272,11 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             false,
+            true,
             Some("lucy-session"),
         );
         assert_eq!(compact["session_id"], request["session_id"]);
+        assert_eq!(compact["cache_control"], request["cache_control"]);
     }
 
     #[test]
@@ -1277,9 +1286,11 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            false,
             None,
         );
         assert!(request.get("session_id").is_none());
+        assert!(request.get("cache_control").is_none());
 
         let headers = provider_headers(false);
         assert!(headers.get("x-openrouter-title").is_none());
@@ -1303,6 +1314,7 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            false,
             None,
         );
         let tools = request["tools"].as_array().expect("model tools");
@@ -1320,12 +1332,14 @@ mod tests {
             &[ChatMessage::user("hello".to_owned())],
             &None,
             true,
+            false,
             None,
         );
         let compact = chat_request(
             "model",
             &[ChatMessage::user("hello".to_owned())],
             &None,
+            false,
             false,
             None,
         );
