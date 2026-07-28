@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.1](https://github.com/jwoo0122/lucy/compare/v1.14.0...v1.14.1) - 2026-07-28
+
+### Fixed
+
+- follow symlinked skills ([#49](https://github.com/jwoo0122/lucy/pull/49))
+
 ## [1.14.0](https://github.com/jwoo0122/lucy/compare/v1.13.3...v1.14.0) - 2026-07-28
 
 ### Added
