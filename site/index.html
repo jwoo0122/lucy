@@ -26,13 +26,14 @@
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
-  html { scroll-behavior: smooth; }
+  html { scroll-behavior: smooth; overflow-x: hidden; }
 
   body {
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);
     line-height: 1.55;
+    overflow-x: hidden;
   }
 
   a { color: inherit; }
@@ -163,6 +164,8 @@
     padding: 80px 0 96px;
   }
 
+  .content-section > * { min-width: 0; }
+
   .section-intro h2 { margin-bottom: 24px; }
 
   .section-intro p {
@@ -190,6 +193,8 @@
     padding: 38px 0;
     border-top: 1px solid var(--border);
   }
+
+  .principle > * { min-width: 0; }
 
   .principle-number {
     color: var(--cyan);
@@ -220,6 +225,8 @@
     padding: 28px 0;
     border-bottom: 1px solid var(--border);
   }
+
+  .step > * { min-width: 0; }
 
   .step-number {
     color: var(--magenta);
@@ -308,6 +315,8 @@
     padding: 32px 0;
     border-bottom: 1px solid var(--border);
   }
+
+  .doc-entry > * { min-width: 0; }
 
   .doc-entry h3 {
     font-size: 17px;
