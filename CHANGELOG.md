@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.0](https://github.com/jwoo0122/lucy/compare/v1.13.3...v1.14.0) - 2026-07-28
+
+### Added
+
+- *(provider)* enable OpenRouter prompt caching ([#48](https://github.com/jwoo0122/lucy/pull/48))
+
 ## [1.13.3](https://github.com/jwoo0122/lucy/compare/v1.13.2...v1.13.3) - 2026-07-28
 
 ### Fixed
