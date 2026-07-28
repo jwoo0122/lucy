@@ -398,15 +398,38 @@ fn exchange_code(
             ("code_verifier", verifier),
         ])
         .send()
-        .map_err(|_| AuthError::new("OAuth token exchange failed"))?;
+        .map_err(oauth_transport_error)?;
     parse_token_response(response)
+}
+
+fn oauth_transport_error(error: reqwest::Error) -> AuthError {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    };
+    let mut details = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(error) = source {
+        details.push_str(": ");
+        details.push_str(&error.to_string());
+        source = error.source();
+    }
+    AuthError::new(format!("OAuth token exchange {kind} error: {details}"))
 }
 
 fn parse_token_response(
     response: reqwest::blocking::Response,
 ) -> Result<CodexCredentials, AuthError> {
     if !response.status().is_success() {
-        return Err(AuthError::new("OAuth token exchange failed"));
+        return Err(AuthError::new(format!(
+            "OAuth token endpoint returned HTTP status {}",
+            response.status().as_u16()
+        )));
     }
     let mut bytes = Vec::new();
     response
@@ -689,6 +712,69 @@ mod tests {
         store.logout().expect("logout");
         assert_eq!(store.load().expect("missing"), None);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn token_exchange_transport_error_preserves_the_cause() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let endpoints = OAuthEndpoints {
+            token: format!("http://{address}"),
+            ..OAuthEndpoints::default()
+        };
+
+        let error = exchange_code(&endpoints, "http://localhost/callback", "verifier", "code")
+            .expect_err("connection failure");
+        let message = error.to_string();
+        assert!(message.starts_with("OAuth token exchange connection error:"));
+        assert!(message.contains("error sending request"));
+    }
+
+    #[test]
+    fn token_exchange_http_error_includes_status() {
+        let address = serve_token_response(403, r#"{"error":"access_denied"}"#);
+        let endpoints = OAuthEndpoints {
+            token: format!("http://{address}"),
+            ..OAuthEndpoints::default()
+        };
+
+        let error = exchange_code(&endpoints, "http://localhost/callback", "verifier", "code")
+            .expect_err("HTTP failure");
+        assert_eq!(
+            error.to_string(),
+            "OAuth token endpoint returned HTTP status 403"
+        );
+    }
+
+    #[test]
+    fn token_exchange_parse_error_is_distinct_from_transport_and_http_errors() {
+        let address = serve_token_response(200, "not JSON");
+        let endpoints = OAuthEndpoints {
+            token: format!("http://{address}"),
+            ..OAuthEndpoints::default()
+        };
+
+        let error = exchange_code(&endpoints, "http://localhost/callback", "verifier", "code")
+            .expect_err("parse failure");
+        assert_eq!(error.to_string(), "OAuth token response was invalid");
+    }
+
+    fn serve_token_response(status: u16, body: &'static str) -> std::net::SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("response");
+        });
+        address
     }
 
     #[test]
