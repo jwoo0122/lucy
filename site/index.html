@@ -42,19 +42,6 @@
     margin: 0 auto;
   }
 
-  .eyebrow {
-    color: var(--magenta);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    font-weight: 500;
-    letter-spacing: .14em;
-    text-transform: uppercase;
-  }
-
-  header {
-    border-bottom: 1px solid var(--border);
-  }
-
   nav {
     min-height: 72px;
     display: flex;
@@ -90,12 +77,11 @@
     grid-template-columns: minmax(0, 1.5fr) minmax(260px, .5fr);
     align-items: end;
     gap: 80px;
-    padding: 120px 0 96px;
+    padding: 72px 0 96px;
   }
 
   h1 {
     max-width: 850px;
-    margin-top: 28px;
     color: var(--text);
     font-size: clamp(52px, 8vw, 104px);
     font-weight: 600;
@@ -120,6 +106,8 @@
 
   .hero-copy strong { color: var(--text); font-weight: 500; }
 
+  .hero-copy .command { margin-top: 28px; }
+
   .hero-mark {
     width: 48px;
     height: 2px;
@@ -129,12 +117,21 @@
 
   section { border-top: 1px solid var(--border); }
 
-  .section-head {
+  .content-section {
     display: grid;
     grid-template-columns: 1fr 2fr;
     gap: 40px;
-    padding: 64px 0;
+    padding: 80px 0 96px;
   }
+
+  .section-intro h2 { margin-bottom: 24px; }
+
+  .section-intro p {
+    max-width: 430px;
+    color: var(--text-dim);
+  }
+
+  .section-intro strong { color: var(--text); font-weight: 500; }
 
   h2 {
     max-width: 700px;
@@ -148,7 +145,7 @@
 
   .principle {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-columns: 52px minmax(150px, .65fr) 1fr;
     gap: 40px;
     padding: 38px 0;
     border-top: 1px solid var(--border);
@@ -173,22 +170,6 @@
   }
 
   code { color: var(--green); font-family: var(--font-mono); }
-
-  .setup {
-    display: grid;
-    grid-template-columns: 1fr 2fr;
-    gap: 40px;
-    padding: 80px 0 96px;
-  }
-
-  .setup-copy h2 { margin: 18px 0 24px; }
-
-  .setup-copy p {
-    max-width: 430px;
-    color: var(--text-dim);
-  }
-
-  .setup-copy strong { color: var(--text); font-weight: 500; }
 
   .steps { border-top: 1px solid var(--border); }
 
@@ -278,16 +259,15 @@
       min-height: auto;
       grid-template-columns: 1fr;
       gap: 56px;
-      padding: 88px 0 72px;
+      padding: 56px 0 72px;
     }
 
-    .section-head, .setup {
+    .content-section {
       grid-template-columns: 1fr;
       gap: 28px;
     }
 
-    .section-head { padding: 52px 0; }
-    .setup { padding: 64px 0 72px; }
+    .content-section { padding: 64px 0 72px; }
 
     .principle {
       grid-template-columns: 36px 1fr;
@@ -321,19 +301,21 @@
   <main id="top">
     <div class="container hero">
       <div>
-        <p class="eyebrow">Ultra-thin local agent harness</p>
         <h1>Give the model a shell. Keep everything else out of its <em>way.</em></h1>
       </div>
       <div class="hero-copy">
         <div class="hero-mark"></div>
         <p>Lucy is the thin line between a powerful model and your machine: <strong>one tool, one local process, no agent framework to carry.</strong></p>
+        <div class="command">
+          <code>brew install jwoo0122/tap/lucy</code>
+          <button class="copy-btn" type="button" data-command="brew install jwoo0122/tap/lucy" aria-label="Copy install command">copy</button>
+        </div>
       </div>
     </div>
 
     <section aria-labelledby="why-heading">
-      <div class="container">
-        <div class="section-head">
-          <p class="eyebrow">Why thin wins</p>
+      <div class="container content-section">
+        <div class="section-intro">
           <h2 id="why-heading">Less harness.<br>More model.</h2>
         </div>
 
@@ -358,9 +340,8 @@
     </section>
 
     <section aria-labelledby="setup-heading">
-      <div class="container setup">
-        <div class="setup-copy">
-          <p class="eyebrow">Simple on purpose</p>
+      <div class="container content-section">
+        <div class="section-intro">
           <h2 id="setup-heading">Connect a model.<br>Start working.</h2>
           <p>Lucy keeps configuration to the connection: <strong>provider, model, credential.</strong> Its behavior ships with the binary.</p>
         </div>
