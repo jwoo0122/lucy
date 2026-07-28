@@ -704,7 +704,7 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
     let session_bytes = fs::read_to_string(session_file).expect("session contents");
     assert!(!session_bytes.contains("provider-secret"));
     assert!(!session_bytes.contains("base prompt"));
-    assert!(session_bytes.contains("specialized CLI on PATH"));
+    assert!(session_bytes.contains("You can access computer resources"));
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -919,7 +919,6 @@ fn legacy_configured_prompt_is_absent_from_new_request_and_session() {
     assert_eq!(requests.len(), 1);
     assert!(!requests[0].contains(legacy_sentinel));
     assert!(requests[0].contains("You can access computer resources"));
-    assert!(requests[0].contains("specialized CLI on PATH"));
 
     let session_file = fs::read_dir(home.join(".lucy/sessions"))
         .expect("sessions")
@@ -930,7 +929,6 @@ fn legacy_configured_prompt_is_absent_from_new_request_and_session() {
     let session = fs::read_to_string(session_file).expect("session contents");
     assert!(!session.contains(legacy_sentinel));
     assert!(session.contains("You can access computer resources"));
-    assert!(session.contains("specialized CLI on PATH"));
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -1867,7 +1865,6 @@ fn resume_rejects_malformed_current_config_without_leaking_secrets() {
     let requests = server.join();
     assert_eq!(requests.len(), 1);
     assert!(!requests[0].contains("original prompt"));
-    assert!(requests[0].contains("specialized CLI on PATH"));
     assert!(requests[0].contains("original instructions"));
     assert!(requests[0].contains("original-model"));
 
@@ -2121,7 +2118,7 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     assert!(requests[1].contains("first request"));
     assert!(requests[1].contains("second request"));
     assert!(requests[1].contains(historical_prompt));
-    assert!(!requests[1].contains("specialized CLI on PATH"));
+    assert!(!requests[1].contains("You can access computer resources"));
     let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
     let tools = resumed_request["tools"].as_array().expect("model tools");
     assert_eq!(tools.len(), 1);
