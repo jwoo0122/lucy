@@ -50,6 +50,8 @@ model = "your-model"
 export OPENROUTER_API_KEY="..."
 ```
 
+When `llm.base_url` uses the `openrouter.ai` host, Lucy adds OpenRouter's ephemeral prompt-cache directive to every Chat Completions request, including compaction summaries. Other OpenAI-compatible endpoints receive no cache directive. This enables provider-side prompt caching only; Lucy does not enable response caching.
+
 To use a ChatGPT plan through Codex, log in separately. Tokens are stored in Lucy's private credential store, not in `config.toml` or sessions:
 
 ```sh
