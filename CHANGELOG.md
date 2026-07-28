@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.2](https://github.com/jwoo0122/lucy/compare/v1.14.1...v1.14.2) - 2026-07-28
+
+### Fixed
+
+- *(site)* eliminate horizontal scroll on narrow/mobile viewports ([#52](https://github.com/jwoo0122/lucy/pull/52))
+
+### Other
+
+- refine Lucy homepage ([#50](https://github.com/jwoo0122/lucy/pull/50))
+
 ## [1.14.1](https://github.com/jwoo0122/lucy/compare/v1.14.0...v1.14.1) - 2026-07-28
 
 ### Fixed
