@@ -38,16 +38,28 @@
   a { color: inherit; }
   button { font: inherit; }
 
+  .ambient-shell {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .dot-field {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+
+  .ambient-shell > :not(.dot-field) {
+    position: relative;
+    z-index: 1;
+  }
+
   .container {
     width: min(1120px, calc(100% - 48px));
     margin: 0 auto;
-  }
-
-  nav {
-    min-height: 72px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
   }
 
   .brand {
@@ -63,15 +75,6 @@
 
   .brand img { width: 32px; height: 32px; }
 
-  .nav-link {
-    color: var(--text-dim);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    text-decoration: none;
-  }
-
-  .nav-link:hover, .nav-link:focus-visible { color: var(--cyan); }
-
   .hero {
     min-height: 670px;
     display: flex;
@@ -82,6 +85,13 @@
   }
 
   .hero-title { padding: 0 0 .08em; }
+
+  .hero-logo {
+    display: block;
+    width: 52px;
+    height: 52px;
+    margin-bottom: 32px;
+  }
 
   .hero-line {
     display: block;
@@ -117,19 +127,26 @@
 
   .hero-copy p {
     color: var(--text-dim);
-    font-size: 18px;
+    font-size: 19px;
   }
 
   .hero-copy strong { color: var(--text); font-weight: 500; }
 
+  .hero-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 12px;
+    margin-top: 28px;
+  }
+
   .hero-copy .command {
     width: 100%;
-    margin-top: 28px;
+    margin-top: 0;
   }
 
   .hero-copy .command code {
     flex: 1;
-    font-size: 12px;
+    font-size: 13px;
   }
 
   .hero-mark {
@@ -138,8 +155,6 @@
     margin-bottom: 24px;
     background: var(--green);
   }
-
-  section { border-top: 1px solid var(--border); }
 
   .content-section {
     display: grid;
@@ -153,6 +168,7 @@
   .section-intro p {
     max-width: 430px;
     color: var(--text-dim);
+    font-size: 17px;
   }
 
   .section-intro strong { color: var(--text); font-weight: 500; }
@@ -190,7 +206,7 @@
   .principle p {
     max-width: 520px;
     color: var(--text-dim);
-    font-size: 15px;
+    font-size: 16px;
   }
 
   code { color: var(--green); font-family: var(--font-mono); }
@@ -219,7 +235,7 @@
 
   .step p {
     color: var(--text-dim);
-    font-size: 14px;
+    font-size: 15px;
   }
 
   .command {
@@ -235,7 +251,7 @@
     min-width: 0;
     padding: 16px 18px;
     color: var(--text);
-    font-size: 13px;
+    font-size: 14px;
     overflow-x: auto;
     white-space: nowrap;
   }
@@ -254,11 +270,122 @@
     color: var(--text-dim);
     cursor: pointer;
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 12px;
   }
+
+
+  .github-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    min-height: 50px;
+    padding: 0 18px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    text-decoration: none;
+  }
+
+  .github-btn svg { width: 16px; height: 16px; fill: currentColor; }
+  .github-btn:hover, .github-btn:focus-visible { color: var(--cyan); }
 
   .copy-btn:hover, .copy-btn:focus-visible { color: var(--cyan); }
   .copy-btn.copied { color: var(--green); }
+
+
+  .doc-list {
+    min-width: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .doc-entry {
+    display: grid;
+    grid-template-columns: minmax(140px, .45fr) 1fr;
+    gap: 32px;
+    padding: 32px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .doc-entry h3 {
+    font-size: 17px;
+    font-weight: 500;
+  }
+
+  .doc-entry-copy {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .doc-entry-copy > p {
+    max-width: 600px;
+    margin-bottom: 18px;
+    color: var(--text-dim);
+    font-size: 15px;
+  }
+
+  .doc-entry-copy > p:last-child { margin-bottom: 0; }
+
+  .code-block {
+    width: 100%;
+    min-width: 0;
+    margin-top: 18px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .code-label {
+    display: block;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
+  pre {
+    width: 100%;
+    max-width: 100%;
+    padding: 18px;
+    overflow-x: auto;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.7;
+    tab-size: 2;
+  }
+
+  pre code { color: inherit; }
+
+  .code-key { color: var(--cyan); }
+  .code-value { color: var(--green); }
+  .code-comment { color: var(--text-dim); }
+
+  .doc-note {
+    display: grid;
+    grid-template-columns: 52px 1fr;
+    gap: 20px;
+    padding: 24px 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .doc-note-mark {
+    color: var(--magenta);
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .doc-note p {
+    max-width: 600px;
+    color: var(--text-dim);
+    font-size: 15px;
+  }
+
+  .doc-note strong { color: var(--text); font-weight: 500; }
 
   .js [data-reveal] {
     opacity: 0;
@@ -287,6 +414,26 @@
     transform: translateY(0) scaleX(1);
   }
 
+  .final-cta {
+    min-height: 560px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 112px 0;
+    text-align: center;
+  }
+
+  .final-cta h2 {
+    max-width: 800px;
+    font-size: clamp(40px, 5.5vw, 68px);
+    font-weight: 600;
+    letter-spacing: -.055em;
+    line-height: 1;
+  }
+
+  .final-cta h2 span { display: block; }
+  .final-cta h2 em { color: var(--cyan); font-style: normal; }
+
   footer { border-top: 1px solid var(--border); }
 
   footer .container {
@@ -300,7 +447,7 @@
   footer p {
     color: var(--text-dim);
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 12px;
   }
 
   @media (max-width: 760px) {
@@ -313,6 +460,11 @@
     }
 
     .hero-copy { margin-left: 0; }
+
+    .final-cta {
+      min-height: 460px;
+      padding: 88px 0;
+    }
 
     .content-section {
       grid-template-columns: 1fr;
@@ -327,13 +479,17 @@
     }
 
     .principle p { grid-column: 2; }
+
+    .doc-entry { grid-template-columns: 1fr; gap: 14px; }
   }
 
   @media (max-width: 420px) {
-    nav { min-height: 64px; }
     h1 { font-size: clamp(39px, 12vw, 48px); }
-    .hero-copy p { font-size: 16px; }
-    .command code { font-size: 11px; }
+    .hero-copy p { font-size: 17px; }
+    .command code { font-size: 12px; }
+    .hero-actions { grid-template-columns: minmax(0, 1fr) 48px; }
+    .github-btn { padding: 0; }
+    .github-btn span { display: none; }
     footer .container { align-items: flex-start; flex-direction: column; justify-content: center; }
   }
 
@@ -349,16 +505,12 @@
 </style>
 </head>
 <body>
-  <header>
-    <nav class="container" aria-label="Primary navigation" data-reveal="fade" data-reveal-load>
-      <a class="brand" href="#top"><img src="logo.png" alt=""><span>Lucy</span></a>
-      <a class="nav-link" href="https://github.com/jwoo0122/lucy">GitHub ↗</a>
-    </nav>
-  </header>
-
   <main id="top">
-    <div class="container hero">
+    <div class="ambient-shell" data-dot-edge="top">
+      <canvas class="dot-field" aria-hidden="true"></canvas>
+      <div class="container hero">
       <div class="hero-title">
+        <img class="hero-logo" src="logo.png" alt="Lucy" data-reveal="fade" data-reveal-load>
         <h1 aria-label="Only a shell between the AI and the work.">
           <span class="hero-line" aria-hidden="true"><span data-reveal="horizon" data-reveal-load style="--reveal-delay: 80ms">Only a <em>shell</em></span></span>
           <span class="hero-line" aria-hidden="true"><span data-reveal="horizon" data-reveal-load style="--reveal-delay: 170ms">between the AI</span></span>
@@ -368,10 +520,17 @@
       <div class="hero-copy">
         <div class="hero-mark" data-reveal="line" data-reveal-load style="--reveal-delay: 520ms"></div>
         <p data-reveal data-reveal-load style="--reveal-delay: 420ms">Lucy is the thin line between powerful AI and your machine: <strong>one tool, one local process, no agent framework to carry.</strong></p>
-        <div class="command" data-reveal data-reveal-load style="--reveal-delay: 560ms">
-          <code>brew install jwoo0122/tap/lucy</code>
-          <button class="copy-btn" type="button" data-command="brew install jwoo0122/tap/lucy" aria-label="Copy install command">copy</button>
+        <div class="hero-actions" data-reveal data-reveal-load style="--reveal-delay: 560ms">
+          <div class="command">
+            <code>brew install jwoo0122/tap/lucy</code>
+            <button class="copy-btn" type="button" data-command="brew install jwoo0122/tap/lucy" aria-label="Copy install command">copy</button>
+          </div>
+          <a class="github-btn" href="https://github.com/jwoo0122/lucy" aria-label="Open Lucy on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.77 2.72 1.26 3.38.96.1-.75.4-1.27.74-1.56-2.57-.3-5.27-1.29-5.27-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.16 1.18A10.9 10.9 0 0 1 12 6.1c.98 0 1.95.13 2.87.39 2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.25c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg>
+            <span>GitHub</span>
+          </a>
         </div>
+      </div>
       </div>
     </div>
 
@@ -441,6 +600,119 @@
         </div>
       </div>
     </section>
+
+    <section id="configuration" aria-labelledby="configuration-heading">
+      <div class="container content-section">
+        <div class="section-intro" data-reveal>
+          <h2 id="configuration-heading">One file.<br>One connection.</h2>
+          <p>First run creates <code>~/.config/lucy/config.toml</code>, or uses <code>$XDG_CONFIG_HOME</code>. Set the provider and model; keep credentials outside the file.</p>
+        </div>
+
+        <div class="doc-list">
+          <article class="doc-entry" data-reveal>
+            <h3>OpenRouter</h3>
+            <div class="doc-entry-copy">
+              <p>Use an OpenAI-compatible endpoint and name the environment variable that holds its API key.</p>
+              <div class="code-block">
+                <span class="code-label">config.toml</span>
+                <pre><code><span class="code-key">[auth]</span>
+provider = <span class="code-value">"openrouter"</span>
+api_key_env = <span class="code-value">"OPENROUTER_API_KEY"</span>
+
+<span class="code-key">[llm]</span>
+base_url = <span class="code-value">"https://openrouter.ai/api/v1"</span>
+model = <span class="code-value">"your-model"</span>
+<span class="code-comment"># effort = "medium"</span></code></pre>
+              </div>
+              <div class="command">
+                <code>export OPENROUTER_API_KEY="..."</code>
+                <button class="copy-btn" type="button" data-command="export OPENROUTER_API_KEY=&quot;...&quot;" aria-label="Copy API key export command">copy</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-entry" data-reveal style="--reveal-delay: 80ms">
+            <h3>Codex subscription</h3>
+            <div class="doc-entry-copy">
+              <p>Use a ChatGPT plan through the explicit Codex adapter. Login tokens stay in Lucy’s private credential store, not in config or sessions.</p>
+              <div class="command">
+                <code>lucy codex login</code>
+                <button class="copy-btn" type="button" data-command="lucy codex login" aria-label="Copy Codex login command">copy</button>
+              </div>
+              <div class="code-block">
+                <span class="code-label">config.toml</span>
+                <pre><code><span class="code-key">[auth]</span>
+provider = <span class="code-value">"codex_subscription"</span>
+
+<span class="code-key">[llm]</span>
+model = <span class="code-value">"gpt-5.3-codex"</span></code></pre>
+              </div>
+            </div>
+          </article>
+
+          <div class="doc-note" data-reveal>
+            <span class="doc-note-mark">→</span>
+            <p><strong>Prefer the terminal?</strong> Open <code>/settings</code> while Lucy is idle to select a model and reasoning effort without editing TOML.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="usage" aria-labelledby="usage-heading">
+      <div class="container content-section">
+        <div class="section-intro" data-reveal>
+          <h2 id="usage-heading">A terminal<br>or a protocol.</h2>
+          <p>The same turn engine serves people and programs. Lucy chooses the interface from the terminal boundary, or you can select one explicitly.</p>
+        </div>
+
+        <div class="doc-list">
+          <article class="doc-entry" data-reveal>
+            <h3>Interactive</h3>
+            <div class="doc-entry-copy">
+              <p>Run Lucy in a terminal for the TUI. Enter sends, Shift/Alt+Enter adds a line, and Esc cancels the active turn.</p>
+              <div class="command">
+                <code>lucy</code>
+                <button class="copy-btn" type="button" data-command="lucy" aria-label="Copy Lucy command">copy</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-entry" data-reveal style="--reveal-delay: 80ms">
+            <h3>JSONL</h3>
+            <div class="doc-entry-copy">
+              <p>Pipe a message for normalized line-delimited events. Standard output stays machine-readable; diagnostics go to standard error.</p>
+              <div class="code-block">
+                <span class="code-label">shell</span>
+                <pre><code>printf <span class="code-value">'%s\n'</span> <span class="code-value">'{"type":"message","text":"Inspect the project."}'</span> \
+  | lucy --jsonl</code></pre>
+              </div>
+            </div>
+          </article>
+
+          <article class="doc-entry" data-reveal style="--reveal-delay: 160ms">
+            <h3>Resume</h3>
+            <div class="doc-entry-copy">
+              <p>Sessions are append-only JSONL records. Keep the returned session ID to continue the same context from another process.</p>
+              <div class="code-block">
+                <span class="code-label">shell</span>
+                <pre><code>lucy --list-sessions
+lucy --session <span class="code-value">&lt;session-id&gt;</span></code></pre>
+              </div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="ambient-shell" data-dot-edge="bottom" aria-labelledby="final-heading">
+      <canvas class="dot-field" aria-hidden="true"></canvas>
+      <div class="container final-cta">
+        <h2 id="final-heading" data-reveal aria-label="Leave the machinery. Take the edge.">
+          <span>Leave the machinery.</span>
+          <span>Take the <em>edge.</em></span>
+        </h2>
+      </div>
+    </section>
   </main>
 
   <footer>
@@ -451,6 +723,129 @@
   </footer>
 
 <script>
+  var dotCanvases = document.querySelectorAll('.dot-field');
+  var dotScale = 1;
+  var dotSpacing = 10.5;
+  var dotStart = 5.25;
+  var dotRadius = .464;
+  var dotFields = [];
+
+  function dotSeed(column, row) {
+    var value = Math.sin(column * 127.1 + row * 311.7) * 43758.5453;
+    return value - Math.floor(value);
+  }
+
+  function sizeDotFields() {
+    var ratio = Math.min(window.devicePixelRatio || 1, 1.5);
+    dotScale = Math.max(.72, Math.min(1.28, window.innerWidth / 1440));
+    dotSpacing = 10.5 * dotScale;
+    dotStart = dotSpacing / 2;
+    dotRadius = .464 * dotScale;
+    dotFields = Array.from(dotCanvases, function(canvas, fieldIndex) {
+      var shell = canvas.parentElement;
+      var fieldSeed = dotSeed(fieldIndex + 17, fieldIndex * 7 + 3);
+      var width = shell.clientWidth;
+      var topField = shell.dataset.dotEdge === 'top';
+      var topOffset = 0;
+      var edgeExtension = topField ? 220 : 0;
+      var height = shell.clientHeight + topOffset + edgeExtension;
+      canvas.width = Math.round(width * ratio);
+      canvas.height = Math.round(height * ratio);
+      canvas.style.width = width + 'px';
+      canvas.style.height = height + 'px';
+      canvas.style.top = -topOffset + 'px';
+      var context = canvas.getContext('2d');
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return {
+        context: context,
+        width: width,
+        height: height,
+        edge: shell.dataset.dotEdge,
+        topOffset: topOffset,
+        offsetX: fieldSeed * 860 + fieldIndex * 137,
+        offsetY: (1 - fieldSeed) * 690 + fieldIndex * 83,
+        phase: fieldSeed * Math.PI * 2,
+        frequency: .82 + fieldSeed * .36,
+        bend: .72 + dotSeed(fieldIndex + 41, 9) * .56,
+        speed: .78 + dotSeed(fieldIndex + 5, 29) * .44
+      };
+    });
+    drawDotFields(24000, false);
+  }
+
+  function drawDotFields(time, still) {
+    dotFields.forEach(function(field) {
+      var context = field.context;
+      context.clearRect(0, 0, field.width, field.height);
+      var columns = Math.ceil(field.width / dotSpacing);
+      var rows = Math.ceil(field.height / dotSpacing);
+
+      for (var row = 0; row <= rows; row += 1) {
+        for (var column = 0; column <= columns; column += 1) {
+          var x = dotStart + column * dotSpacing;
+          var y = dotStart + row * dotSpacing;
+          var fieldX = x + field.offsetX;
+          var fieldY = y + field.offsetY;
+          var fieldTime = time * field.speed;
+          var seed = dotSeed(column + Math.floor(field.offsetX), row + Math.floor(field.offsetY));
+          var position = field.edge === 'top'
+            ? Math.max(0, y - field.topOffset) / Math.max(field.height - field.topOffset, 1)
+            : y / Math.max(field.height, 1);
+          var edgeStrength = field.edge === 'top'
+            ? Math.pow(1 - position, 1.45)
+            : Math.pow(position, 1.45);
+          var alpha = .018 * edgeStrength;
+          var radius = dotRadius;
+
+          if (!still && seed > .38) {
+            var spatialNoise = Math.sin(fieldX * .00243 + fieldY * .00329 + field.phase)
+              + Math.sin(fieldX * .00443 - fieldY * .00157 + 1.7 - field.phase * .4)
+              + Math.sin((fieldX + fieldY) * .00129 + 4.2 + field.phase * .7);
+            var frequencyWarp = (1 + spatialNoise * .16) * field.frequency;
+            var phaseWarp = Math.sin(fieldX * .00171 - fieldY * .00386 + 2.1 + field.phase) * 1.9
+              + Math.sin(fieldX * .00086 + fieldY * .002 - field.phase * .6) * 1.2;
+            var bend = Math.sin(fieldY * .00786 + fieldTime * .00032 + phaseWarp * .18) * 74 * field.bend
+              + Math.sin(fieldY * .003 - fieldTime * .00018 + field.phase) * 46;
+            var primary = Math.sin(
+              (fieldX + bend) * .01171 * frequencyWarp
+              + fieldY * .0081
+              + phaseWarp
+              - fieldTime * .00084
+            );
+            var secondary = Math.sin(
+              fieldY * (.0074 + spatialNoise * .001)
+              - fieldX * .0062
+              + phaseWarp * .55
+              + fieldTime * .0005
+              + field.phase
+            );
+            var drift = Math.sin((fieldX * .72 + fieldY) * .00371 + phaseWarp * .35 + fieldTime * .00022);
+            var amplitude = .84 + Math.sin(fieldX * .00157 + fieldY * .00271 + 3.4 + field.phase) * .16;
+            var height = (primary * .62 * amplitude + secondary * .25 + drift * .13 + 1) * .5;
+            var pulse = Math.pow(Math.max(0, Math.min(1, height)), .85);
+            var response = .55 + ((seed - .38) / .62) * .45;
+            alpha += pulse * response * 1.1424 * edgeStrength;
+            alpha = Math.min(alpha, 1);
+            radius += pulse * response * .92 * dotScale;
+          }
+
+          var colorMix = x / Math.max(field.width, 1);
+          var red = Math.round(112 + (205 - 112) * colorMix);
+          var green = Math.round(214 + (166 - 214) * colorMix);
+          var blue = Math.round(255 + (255 - 255) * colorMix);
+
+          context.beginPath();
+          context.arc(x, y, radius, 0, Math.PI * 2);
+          context.fillStyle = 'rgba(' + red + ', ' + green + ', ' + blue + ', ' + alpha + ')';
+          context.fill();
+        }
+      }
+    });
+  }
+
+  sizeDotFields();
+  window.addEventListener('resize', sizeDotFields);
+
   var revealItems = document.querySelectorAll('[data-reveal]');
   var loadRevealItems = document.querySelectorAll('[data-reveal-load]');
   var scrollRevealItems = document.querySelectorAll('[data-reveal]:not([data-reveal-load])');
