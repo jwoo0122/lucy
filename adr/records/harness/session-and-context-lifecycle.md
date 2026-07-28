@@ -14,7 +14,7 @@ depends_on:
   - harness.configuration-and-provider
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-26"
+last_reviewed: "2026-07-29"
 enforcement:
   - id: session-resume-and-context
     path: src/session.rs
@@ -23,6 +23,11 @@ enforcement:
       - "fn resume_retains_historical_boot_system_prompt()"
       - "fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()"
       - "fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()"
+    must_not_contain: []
+  - id: symlinked-skill-discovery
+    path: src/context.rs
+    must_contain:
+      - "fn context_follows_symlinked_skill_directories_and_files()"
     must_not_contain: []
 enforcement_exception: null
 ---
@@ -47,11 +52,11 @@ Session identity is caller-owned. Lucy MUST keep sessions independently replayab
 
 Instruction discovery MUST include `$XDG_CONFIG_HOME/lucy/AGENTS.md` or `$XDG_CONFIG_HOME/lucy/CLAUDE.md` as the global source (falling back to `~/.config/lucy` when `XDG_CONFIG_HOME` is unset or empty) and `AGENTS.md`/`CLAUDE.md` along the path from Git root to cwd. For one directory, `AGENTS.md` takes precedence over `CLAUDE.md`. Files are merged from broadest to most specific. A final `AGENTS.md` or `CLAUDE.md` symlink MUST be followed when it resolves to a regular file, including a target outside the instruction directory; symlinked intermediate instruction directories MUST still be ignored.
 
-Skills MUST be discovered only from the standard `.agents/skills/<name>/SKILL.md` directories globally and along the project path. Symlinked skill directories and `SKILL.md` files MUST be ignored rather than followed. The boot prompt MUST include skill name, description, and path, but not full skill contents. The model loads a relevant skill through `cmd` when needed.
+Skills MUST be discovered from the standard `.agents/skills/<name>/SKILL.md` locations globally and along the project path. The `.agents/skills` root, directories below it, and `SKILL.md` files MAY be symlinks, including links to targets outside the source tree, and MUST be followed when they resolve to directories or regular files as appropriate. Discovery MUST terminate safely when links form a directory cycle and MUST NOT traverse the same resolved directory more than once per skill root. The boot prompt MUST include skill name, description, and the logical path through which it was discovered, but not full skill contents. Explicit invocation uses the immutable contents captured during discovery.
 
 ## Context and forces
 
-Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. Separate process invocations can resume the same session through the existing append-only file.
+Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. Following skill symlinks supports centrally managed skill collections while cycle detection keeps recursive discovery bounded. Separate process invocations can resume the same session through the existing append-only file.
 
 ## Invariants
 
@@ -63,12 +68,13 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 - A new session records the current built-in composed prompt as `boot_system_prompt`.
 - A resumed session sends its recorded historical `boot_system_prompt`, even when the current binary would compose a different prompt for a new session.
 - A skill catalog entry never claims to contain the full skill instructions.
-- Skill file contents loaded through `cmd` become ordinary tool results and are eligible for session persistence.
+- Symlinked skill roots, directories, and files are followed only when their targets have the expected directory or regular-file type; directory cycles and duplicate resolved directories are not traversed repeatedly.
+- Skill contents captured during discovery, including through a symlink, are persisted in the session snapshot and used by explicit invocation.
 - Lucy does not infer or persist relationships between sessions.
 
 ## Alternatives and trade-offs
 
-Recomposing the prompt on resume would apply the latest binary guidance immediately but break prompt stability and resume reproducibility. Embedding every skill file would simplify skill loading but waste context and diverge from progressive disclosure conventions. Lucy chooses snapshots plus command-based loading. Keeping session identity outside Lucy's relationship model lets callers orchestrate independent agents without adding a worker journal or scheduler.
+Recomposing the prompt on resume would apply the latest binary guidance immediately but break prompt stability and resume reproducibility. Embedding every skill body in the boot prompt would waste context and diverge from progressive disclosure conventions. Ignoring skill symlinks would reduce traversal complexity but prevent standard skill locations from referencing centrally managed files. Lucy chooses metadata-only boot context plus immutable skill-content snapshots, including symlink targets. Keeping session identity outside Lucy's relationship model lets callers orchestrate independent agents without adding a worker journal or scheduler.
 
 ## Consequences
 
@@ -76,7 +82,7 @@ Users must start a new session to pick up a newer built-in prompt or edited ambi
 
 ## Enforcement
 
-Tests MUST create, persist, close, and resume a session in a separate process; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, and skill catalog discovery; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
+Tests MUST create, persist, close, and resume a session in a separate process; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
 
 ## Revisit when
 

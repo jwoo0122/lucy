@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
@@ -212,26 +212,6 @@ fn open_instruction_file_at(parent: RawFd, name: &OsStr) -> io::Result<Option<fs
 }
 
 #[cfg(unix)]
-fn open_file_at(parent: RawFd, name: &OsStr) -> io::Result<Option<fs::File>> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_error| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(parent, name.as_ptr(), flags, 0) };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        if path_component_unavailable(&error) {
-            return Ok(None);
-        }
-        return Err(error);
-    }
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    if !file.metadata()?.is_file() {
-        return Ok(None);
-    }
-    Ok(Some(file))
-}
-
-#[cfg(unix)]
 impl ContextDirectory {
     fn open(path: &Path) -> io::Result<Option<Self>> {
         let start = if path.is_absolute() {
@@ -265,23 +245,8 @@ impl ContextDirectory {
         Ok(Some(directory))
     }
 
-    fn open_child_directory(&self, name: &OsStr) -> io::Result<Option<Self>> {
-        let Some(file) = open_directory_at(self.file.as_raw_fd(), name)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self { file }))
-    }
-
     fn open_instruction_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
         open_instruction_file_at(self.file.as_raw_fd(), name)
-    }
-
-    fn open_regular_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
-        open_file_at(self.file.as_raw_fd(), name)
-    }
-
-    fn entries(&self) -> io::Result<Vec<OsString>> {
-        read_directory_entries(&self.file)
     }
 }
 
@@ -298,155 +263,14 @@ impl ContextDirectory {
         }
     }
 
-    fn open_child_directory(&self, name: &OsStr) -> io::Result<Option<Self>> {
-        Self::open(&self.path.join(name))
-    }
-
     fn open_instruction_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
         open_instruction_file(&self.path.join(name))
     }
-
-    fn open_regular_file(&self, name: &OsStr) -> io::Result<Option<fs::File>> {
-        open_regular_file(&self.path.join(name))
-    }
-
-    fn entries(&self) -> io::Result<Vec<std::ffi::OsString>> {
-        fs::read_dir(&self.path)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect()
-    }
-}
-
-#[cfg(unix)]
-struct DirectoryStream(*mut libc::DIR);
-
-#[cfg(unix)]
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        unsafe {
-            libc::closedir(self.0);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn reset_directory_errno() {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    unsafe {
-        *libc::__error() = 0;
-    }
-}
-
-#[cfg(unix)]
-fn directory_errno() -> libc::c_int {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        unsafe { *libc::__errno_location() }
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    {
-        unsafe { *libc::__error() }
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "freebsd",
-        target_os = "dragonfly",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )))]
-    {
-        0
-    }
-}
-
-#[cfg(unix)]
-fn read_directory_entries(file: &fs::File) -> io::Result<Vec<OsString>> {
-    let duplicate = unsafe { libc::dup(file.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let directory = unsafe { libc::fdopendir(duplicate) };
-    if directory.is_null() {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(duplicate);
-        }
-        return Err(error);
-    }
-    let directory = DirectoryStream(directory);
-    let mut entries = Vec::new();
-    loop {
-        reset_directory_errno();
-        let entry = unsafe { libc::readdir(directory.0) };
-        if entry.is_null() {
-            let error_number = directory_errno();
-            if error_number != 0 {
-                return Err(io::Error::from_raw_os_error(error_number));
-            }
-            break;
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            entries.push(OsString::from_vec(name.to_vec()));
-        }
-    }
-    Ok(entries)
 }
 
 #[cfg(not(unix))]
 fn open_instruction_file(path: &Path) -> io::Result<Option<fs::File>> {
     let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if !file.metadata()?.is_file() {
-        return Ok(None);
-    }
-    Ok(Some(file))
-}
-
-#[cfg(not(unix))]
-fn open_regular_file(path: &Path) -> io::Result<Option<fs::File>> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Ok(None);
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    }
-
-    let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -522,63 +346,64 @@ fn discover_skills(
     skills_root: &Path,
     skills: &mut BTreeMap<String, SkillEntry>,
 ) -> Result<(), ContextError> {
-    let Some(skills_parent_path) = skills_root.parent() else {
+    let Some(skills_parent) = skills_root.parent() else {
         return Ok(());
     };
-    let Some(skills_parent) = ContextDirectory::open(skills_parent_path)
+    if ContextDirectory::open(skills_parent)
         .map_err(|_error| ContextError::new("unable to inspect skill context"))?
-    else {
+        .is_none()
+    {
         return Ok(());
-    };
-    let Some(skills_name) = skills_root.file_name() else {
-        return Ok(());
-    };
-    let Some(skills_directory) = skills_parent
-        .open_child_directory(skills_name)
-        .map_err(|_error| ContextError::new("unable to inspect skill context"))?
-    else {
-        return Ok(());
-    };
-    discover_skill_directory(skills_root, &skills_directory, skills)
+    }
+    let mut visited = BTreeSet::new();
+    discover_skill_directory(skills_root, skills, &mut visited)
 }
 
 fn discover_skill_directory(
     path: &Path,
-    directory: &ContextDirectory,
     skills: &mut BTreeMap<String, SkillEntry>,
+    visited: &mut BTreeSet<PathBuf>,
 ) -> Result<(), ContextError> {
-    if let Some(file) = directory
-        .open_regular_file(OsStr::new("SKILL.md"))
-        .map_err(|_error| ContextError::new("unable to inspect skill context"))?
-    {
-        if let Ok(contents) = read_open_file(file) {
-            if let Some((name, description, model_invocable)) = parse_skill_frontmatter(&contents) {
-                skills.insert(
-                    name.clone(),
-                    SkillEntry {
-                        name,
-                        description,
-                        path: path.join("SKILL.md"),
-                        contents,
-                        model_invocable,
-                    },
-                );
+    let resolved = match fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(error) if path_component_unavailable(&error) => return Ok(()),
+        Err(_error) => return Err(ContextError::new("unable to inspect skill context")),
+    };
+    let metadata = fs::metadata(&resolved)
+        .map_err(|_error| ContextError::new("unable to inspect skill context"))?;
+    if !metadata.is_dir() || !visited.insert(resolved.clone()) {
+        return Ok(());
+    }
+
+    let skill_path = path.join("SKILL.md");
+    if let Ok(skill_target) = fs::canonicalize(&skill_path) {
+        if fs::metadata(&skill_target).is_ok_and(|metadata| metadata.is_file()) {
+            if let Ok(contents) = fs::read_to_string(&skill_target) {
+                if let Some((name, description, model_invocable)) =
+                    parse_skill_frontmatter(&contents)
+                {
+                    skills.insert(
+                        name.clone(),
+                        SkillEntry {
+                            name,
+                            description,
+                            path: skill_path,
+                            contents,
+                            model_invocable,
+                        },
+                    );
+                }
             }
         }
     }
 
-    let mut names = directory
-        .entries()
+    let mut entries = fs::read_dir(&resolved)
+        .map_err(|_error| ContextError::new("unable to inspect skill context"))?
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|_error| ContextError::new("unable to inspect skill context"))?;
-    names.sort();
-    for name in names {
-        let Some(child) = directory
-            .open_child_directory(&name)
-            .map_err(|_error| ContextError::new("unable to inspect skill context"))?
-        else {
-            continue;
-        };
-        discover_skill_directory(&path.join(&name), &child, skills)?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        discover_skill_directory(&path.join(entry.file_name()), skills, visited)?;
     }
     Ok(())
 }
@@ -842,7 +667,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn context_follows_symlinked_instruction_files_but_ignores_symlinked_skills() {
+    fn context_follows_symlinked_skill_directories_and_files() {
         let (home, cwd) = temporary_tree();
         let project = home.join("project");
         fs::create_dir_all(config_dir(&home)).expect("global directory");
@@ -880,6 +705,11 @@ mod tests {
             "---\nname: linked-directory\ndescription: linked directory\n---\n",
         )
         .expect("linked directory skill");
+        symlink(
+            &linked_directory_target,
+            linked_directory_target.join("loop"),
+        )
+        .expect("skill directory cycle");
         symlink(
             &linked_directory_target,
             global_skills.join("linked-directory"),
@@ -933,8 +763,30 @@ mod tests {
             context.instruction_files[1].contents,
             "symlinked project instructions"
         );
-        assert_eq!(context.skills.len(), 1);
-        assert_eq!(context.skills[0].name, "valid");
+        assert_eq!(
+            context
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["linked-directory", "linked-file", "project-only", "valid"]
+        );
+        assert_eq!(
+            context
+                .skills
+                .iter()
+                .find(|skill| skill.name == "linked-directory")
+                .expect("linked directory")
+                .path,
+            global_skills.join("linked-directory/SKILL.md")
+        );
+        assert!(context
+            .skills
+            .iter()
+            .find(|skill| skill.name == "linked-file")
+            .expect("linked file")
+            .contents
+            .contains("description: linked file"));
         assert!(context
             .system_prompt
             .contains("symlinked global instructions"));
@@ -942,9 +794,9 @@ mod tests {
             .system_prompt
             .contains("symlinked project instructions"));
         assert!(!context.system_prompt.contains("real global instructions"));
-        assert!(!context.system_prompt.contains("linked-directory"));
-        assert!(!context.system_prompt.contains("linked-file"));
-        assert!(!context.system_prompt.contains("project-only"));
+        assert!(context.system_prompt.contains("linked-directory"));
+        assert!(context.system_prompt.contains("linked-file"));
+        assert!(context.system_prompt.contains("project-only"));
 
         fs::remove_dir_all(home).expect("remove tree");
     }

@@ -149,7 +149,7 @@ decisions:
       - harness.configuration-and-provider
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-26'
+    last_reviewed: '2026-07-29'
     enforcement:
       - id: session-resume-and-context
         path: src/session.rs
@@ -158,5 +158,10 @@ decisions:
           - fn resume_retains_historical_boot_system_prompt()
           - fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()
           - fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()
+        must_not_contain: []
+      - id: symlinked-skill-discovery
+        path: src/context.rs
+        must_contain:
+          - fn context_follows_symlinked_skill_directories_and_files()
         must_not_contain: []
     enforcement_exception: null
