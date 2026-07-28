@@ -24,12 +24,15 @@
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
+  html { overflow-x: hidden; }
+
   body {
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-sans);
     line-height: 1.6;
     overflow-x: hidden;
+    word-break: break-word;
   }
 
   /* subtle grid background */
@@ -123,6 +126,7 @@
     justify-content: space-between;
     flex-wrap: wrap;
     gap: 4px;
+    min-width: 0;
   }
 
   .cmd-line {
@@ -131,10 +135,15 @@
     flex-wrap: wrap;
     gap: 4px;
     flex: 1;
+    min-width: 0;
   }
 
   .cmd-prompt { color: var(--neon-green); }
-  .cmd-text { color: var(--text); }
+  .cmd-text {
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
   .cmd-cursor {
     display: inline-block;
     width: 9px;
@@ -195,7 +204,7 @@
 
   .feature-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
     gap: 20px;
   }
 
@@ -266,8 +275,9 @@
     .hero h1 { font-size: 44px; }
     .hero-logo { width: 56px; height: 56px; }
     .hero p { font-size: 17px; }
-    .cmd-body { flex-direction: column; align-items: flex-start; gap: 16px; }
+    .cmd-body { flex-direction: column; align-items: flex-start; gap: 16px; padding: 20px; font-size: 14px; }
     .copy-btn { align-self: flex-end; }
+    .feature-card { padding: 20px; }
     footer .container { flex-direction: column; text-align: center; }
   }
 </style>
