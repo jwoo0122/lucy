@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.13.3](https://github.com/jwoo0122/lucy/compare/v1.13.2...v1.13.3) - 2026-07-28
+
+### Fixed
+
+- *(auth)* trust native roots for Codex OAuth ([#47](https://github.com/jwoo0122/lucy/pull/47))
+
 ## [1.13.2](https://github.com/jwoo0122/lucy/compare/v1.13.1...v1.13.2) - 2026-07-28
 
 ### Fixed
