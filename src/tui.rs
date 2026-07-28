@@ -100,6 +100,84 @@ const SETTINGS_MIN_WIDTH: u16 = 36;
 const SETTINGS_MAX_WIDTH: u16 = 88;
 const SETTINGS_MIN_HEIGHT: u16 = 8;
 const SETTINGS_MAX_HEIGHT: u16 = 22;
+const TERMINAL_COLOR_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UiPalette {
+    prompt_background: Color,
+    text: Color,
+    assistant_text: Color,
+    muted_text: Color,
+    user_border: Color,
+    terminal_background: Option<(u8, u8, u8)>,
+}
+
+impl UiPalette {
+    fn fallback() -> Self {
+        Self {
+            prompt_background: PROMPT_BACKGROUND,
+            text: Color::White,
+            assistant_text: Color::Reset,
+            muted_text: Color::DarkGray,
+            user_border: USER_BORDER_COLOR,
+            terminal_background: None,
+        }
+    }
+
+    fn from_terminal_background(red: u8, green: u8, blue: u8) -> Self {
+        let neutral = (0.2126 * f32::from(red)
+            + 0.7152 * f32::from(green)
+            + 0.0722 * f32::from(blue))
+        .round() as u8;
+        let dark = neutral < 128;
+        let surface_lightness = if dark {
+            neutral.saturating_add(18)
+        } else {
+            neutral.saturating_sub(18)
+        };
+        let surface_channel = |channel: u8| {
+            (f32::from(surface_lightness) + (f32::from(channel) - f32::from(neutral)) * 1.15)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        let text = if dark {
+            Color::Rgb(235, 235, 235)
+        } else {
+            Color::Rgb(32, 32, 32)
+        };
+        Self {
+            prompt_background: Color::Rgb(
+                surface_channel(red),
+                surface_channel(green),
+                surface_channel(blue),
+            ),
+            text,
+            assistant_text: text,
+            muted_text: if dark {
+                Color::Rgb(144, 144, 144)
+            } else {
+                Color::Rgb(96, 96, 96)
+            },
+            user_border: if dark {
+                Color::Rgb(255, 210, 40)
+            } else {
+                Color::Rgb(140, 105, 0)
+            },
+            terminal_background: Some((red, green, blue)),
+        }
+    }
+}
+
+fn terminal_palette() -> UiPalette {
+    let mut options = terminal_colorsaurus::QueryOptions::default();
+    options.timeout = TERMINAL_COLOR_QUERY_TIMEOUT;
+    terminal_colorsaurus::background_color(options)
+        .map(|color| {
+            let (red, green, blue) = color.scale_to_8bit();
+            UiPalette::from_terminal_background(red, green, blue)
+        })
+        .unwrap_or_else(|_| UiPalette::fallback())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TuiOutcome {
@@ -137,6 +215,7 @@ pub(crate) fn run<W: Write>(
     .with_attached_agents(harness.attached_agents.clone())
     .with_skill_names(skill_names)
     .with_context(context_window, context_tokens);
+    state.palette = terminal_palette();
     state.background_active_count = harness.background_active_count();
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let (message_tx, message_rx) = mpsc::channel::<WorkerMessage>();
@@ -884,6 +963,7 @@ struct UiState {
     settings: Option<SettingsState>,
     sessions: Option<SessionsState>,
     background_active_count: Arc<AtomicUsize>,
+    palette: UiPalette,
 }
 
 impl UiState {
@@ -927,6 +1007,7 @@ impl UiState {
             settings: None,
             sessions: None,
             background_active_count: Arc::new(AtomicUsize::new(0)),
+            palette: UiPalette::fallback(),
         };
         for record in history {
             state.add_history_record(record);
@@ -2127,13 +2208,13 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
 
     let width = chat_chunk.width;
     let welcome_image_layout = if state.welcome_visible && greeting_image_enabled() {
-        let welcome_lines = welcome_lines(&state.attached_agents);
+        let welcome_lines = welcome_lines(&state.attached_agents, state.palette);
         welcome_image_layout(visible_chat_area, welcome_lines.len() as u16)
     } else {
         None
     };
     if state.welcome_visible {
-        let welcome_lines = welcome_lines(&state.attached_agents);
+        let welcome_lines = welcome_lines(&state.attached_agents, state.palette);
         if let Some(layout) = welcome_image_layout {
             let welcome = Paragraph::new(welcome_lines).alignment(Alignment::Center);
             frame.render_widget(welcome, layout.intro_area);
@@ -2180,7 +2261,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     }
 
     frame.render_widget(
-        Block::default().style(Style::default().bg(PROMPT_BACKGROUND)),
+        Block::default().style(Style::default().bg(state.palette.prompt_background)),
         input_chunk,
     );
     if let Some(indicator_area) = background_indicator_area(state, input_chunk) {
@@ -2211,7 +2292,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         draw_message_queue(frame, state, queue_area);
     }
 
-    let input_text_style = Style::default().fg(Color::White);
+    let input_text_style = Style::default().fg(state.palette.text);
     let prompt_area = prompt_area(input_chunk, state);
     let prompt = input_display_text(state);
     let input_rows = input_visible_rows(state, prompt_area.width).clamp(1, MAX_INPUT_ROWS);
@@ -2861,29 +2942,32 @@ fn interpolate_color(start: u8, end: u8, progress: f32) -> u8 {
     (start as f32 + (end as f32 - start as f32) * progress).round() as u8
 }
 
-fn welcome_lines(attached_agents: &[String]) -> Vec<Line<'static>> {
+fn terminal_background_label(palette: UiPalette) -> String {
+    palette.terminal_background.map_or_else(
+        || "Terminal background: unavailable (fallback)".to_owned(),
+        |(red, green, blue)| format!("Terminal background: #{red:02X}{green:02X}{blue:02X}"),
+    )
+}
+
+fn welcome_lines(attached_agents: &[String], palette: UiPalette) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(palette.muted_text);
     let mut lines = vec![
         welcome_line(),
-        Line::styled(WELCOME_VERSION, Style::default().fg(Color::DarkGray)),
+        Line::styled(WELCOME_VERSION, muted),
         Line::raw(""),
-        Line::styled(WELCOME_TAGLINE, Style::default().fg(Color::DarkGray)),
+        Line::styled(WELCOME_TAGLINE, muted),
+        Line::styled(terminal_background_label(palette), muted),
         Line::raw(""),
     ];
 
     if attached_agents.is_empty() {
-        lines.push(Line::styled(
-            "Attached AGENTS.md: none",
-            Style::default().fg(Color::DarkGray),
-        ));
+        lines.push(Line::styled("Attached AGENTS.md: none", muted));
     } else {
-        lines.push(Line::styled(
-            "Attached AGENTS.md:",
-            Style::default().fg(Color::DarkGray),
-        ));
+        lines.push(Line::styled("Attached AGENTS.md:", muted));
         lines.extend(
-            attached_agents.iter().map(|path| {
-                Line::styled(format!("• {path}"), Style::default().fg(Color::DarkGray))
-            }),
+            attached_agents
+                .iter()
+                .map(|path| Line::styled(format!("• {path}"), muted)),
         );
     }
 
@@ -2920,11 +3004,16 @@ fn render_transcript_items(
                 let trigger = skill_instruction_attached
                     .then(|| active_skill_trigger(&text, &state.skill_names))
                     .flatten();
-                push_user_message_block(&mut lines, &text, trigger, width);
+                push_user_message_block(&mut lines, &text, trigger, width, state.palette);
             }
             TranscriptItem::Assistant(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_wrapped(&mut lines, &text, width, Style::default());
+                push_wrapped(
+                    &mut lines,
+                    &text,
+                    width,
+                    Style::default().fg(state.palette.assistant_text),
+                );
             }
             TranscriptItem::ToolCall {
                 id,
@@ -2954,7 +3043,7 @@ fn render_transcript_items(
             }
             TranscriptItem::Info(text) => {
                 let text = redact_secret(text, Some(&state.secret));
-                push_wrapped(&mut lines, &text, width, info_style());
+                push_wrapped(&mut lines, &text, width, info_style(state.palette));
             }
             TranscriptItem::Reasoning { complete } => {
                 let text = if *complete {
@@ -2962,7 +3051,7 @@ fn render_transcript_items(
                 } else {
                     format!("Reasoning... {}", spinner_frame(state))
                 };
-                push_wrapped(&mut lines, &text, width, thinking_style());
+                push_wrapped(&mut lines, &text, width, thinking_style(state.palette));
             }
         }
         rendered_item = true;
@@ -3255,40 +3344,41 @@ fn truncate_output(output: &str) -> String {
     result
 }
 
-fn user_message_style() -> Style {
-    Style::default().fg(USER_BORDER_COLOR)
+fn user_message_style(palette: UiPalette) -> Style {
+    Style::default().fg(palette.user_border)
 }
 
-/// Render user messages with a one-cell yellow block rule, one inner left
+/// Render user messages with a one-cell neutral block rule, one inner left
 /// padding cell, and blank rows above and below; assistant and tool output remains borderless.
 fn push_user_message_block(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     active_skill_trigger: Option<&str>,
     width: usize,
+    palette: UiPalette,
 ) {
     if width < 3 {
         lines.extend(styled_text_lines(
             text,
             active_skill_trigger,
             width.max(1),
-            Style::default().fg(Color::White),
+            Style::default().fg(palette.text),
         ));
         return;
     }
 
-    let border_style = user_message_style();
+    let border_style = user_message_style(palette);
     let rows = styled_text_lines(
         text,
         active_skill_trigger,
         width - 2,
-        Style::default().fg(Color::White),
+        Style::default().fg(palette.text),
     );
     lines.push(Line::from(Span::styled(USER_BORDER_GLYPH, border_style)));
     for row in rows {
         let mut spans = Vec::with_capacity(row.spans.len() + 2);
         spans.push(Span::styled(USER_BORDER_GLYPH, border_style));
-        spans.push(Span::styled(" ", Style::default().fg(Color::White)));
+        spans.push(Span::styled(" ", Style::default().fg(palette.text)));
         spans.extend(row.spans);
         lines.push(Line::from(spans));
     }
@@ -3311,8 +3401,8 @@ fn error_style() -> Style {
     Style::default().fg(Color::Red)
 }
 
-fn info_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+fn info_style(palette: UiPalette) -> Style {
+    Style::default().fg(palette.muted_text)
 }
 
 fn context_status_text(state: &UiState) -> String {
@@ -3447,8 +3537,8 @@ fn desaturate_console_accent(red: u8, green: u8, blue: u8) -> Color {
     )
 }
 
-fn thinking_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+fn thinking_style(palette: UiPalette) -> Style {
+    Style::default().fg(palette.muted_text)
 }
 
 // Unicode block elements occupy the full cell width. Rendering them without
@@ -3662,6 +3752,108 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_backgrounds_produce_tinted_surfaces_and_contrasting_palettes() {
+        let dark = UiPalette::from_terminal_background(12, 24, 36);
+        assert_eq!(dark.prompt_background, Color::Rgb(29, 42, 56));
+        assert_eq!(dark.text, Color::Rgb(235, 235, 235));
+        assert_eq!(dark.assistant_text, dark.text);
+        assert_eq!(dark.muted_text, Color::Rgb(144, 144, 144));
+        assert_eq!(dark.user_border, Color::Rgb(255, 210, 40));
+
+        let light = UiPalette::from_terminal_background(240, 224, 208);
+        assert_eq!(light.prompt_background, Color::Rgb(224, 206, 187));
+        assert_eq!(light.text, Color::Rgb(32, 32, 32));
+        assert_eq!(light.assistant_text, light.text);
+        assert_eq!(light.muted_text, Color::Rgb(96, 96, 96));
+        assert_eq!(light.user_border, Color::Rgb(140, 105, 0));
+    }
+
+    #[test]
+    fn fallback_palette_preserves_the_existing_colors() {
+        assert_eq!(
+            UiPalette::fallback(),
+            UiPalette {
+                prompt_background: PROMPT_BACKGROUND,
+                text: Color::White,
+                assistant_text: Color::Reset,
+                muted_text: Color::DarkGray,
+                user_border: USER_BORDER_COLOR,
+                terminal_background: None,
+            }
+        );
+    }
+
+    #[test]
+    fn detected_palette_colors_prompt_and_regular_messages_but_not_tool_calls() {
+        let palette = UiPalette::from_terminal_background(240, 240, 240);
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.palette = palette;
+        state.input = "prompt".to_owned();
+        state.add_user("user", "secret");
+        state.add_assistant_message("assistant");
+        state
+            .transcript
+            .push(TranscriptItem::Info("info".to_owned()));
+        state
+            .transcript
+            .push(TranscriptItem::Reasoning { complete: true });
+        state.transcript.push(TranscriptItem::ToolCall {
+            id: "call-1".to_owned(),
+            name: "cmd".to_owned(),
+            arguments: r#"{"command":"pwd"}"#.to_owned(),
+        });
+
+        let lines = transcript_lines(&state, 80);
+        let user = lines
+            .iter()
+            .find(|line| line.to_string() == "▌ user")
+            .unwrap();
+        assert_eq!(user.spans[0].style.fg, Some(palette.user_border));
+        assert_eq!(user.spans[2].style.fg, Some(palette.text));
+        let assistant = lines
+            .iter()
+            .find(|line| line.to_string() == "assistant")
+            .unwrap();
+        assert_eq!(assistant.style.fg, Some(palette.text));
+        let info = lines
+            .iter()
+            .find(|line| line.to_string() == "info")
+            .unwrap();
+        assert_eq!(info.style.fg, Some(palette.muted_text));
+        let reasoning = lines
+            .iter()
+            .find(|line| line.to_string() == "Reasoning Complete")
+            .unwrap();
+        assert_eq!(reasoning.style.fg, Some(palette.muted_text));
+        let tool = lines
+            .iter()
+            .find(|line| line.to_string().contains("cmd  $ pwd"))
+            .unwrap();
+        assert_eq!(tool.spans[0].style.fg, Some(PENDING_TOOL_COLOR));
+
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("draw TUI");
+        let (_, _, _, _, input_area, _) = ui_layout(&state, tui_viewport(Rect::new(0, 0, 40, 10)));
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(input_area.x, input_area.y)].bg,
+            palette.prompt_background
+        );
+        assert_eq!(
+            buffer[(
+                prompt_area(input_area, &state).x,
+                prompt_area(input_area, &state).y
+            )]
+                .fg,
+            palette.text
+        );
+    }
 
     #[test]
     fn turn_notifications_use_osc_777_with_fixed_secret_safe_messages() {
@@ -4298,7 +4490,7 @@ mod tests {
             Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                 .expect("test terminal");
         let chat_area = ui_layout(&state, tui_viewport(area)).0;
-        let intro_lines = welcome_lines(&state.attached_agents);
+        let intro_lines = welcome_lines(&state.attached_agents, state.palette);
         let greeting_layout =
             welcome_image_layout(chat_area, intro_lines.len() as u16).expect("greeting fits");
 
@@ -4407,25 +4599,38 @@ mod tests {
                 "/workspace/AGENTS.md".to_owned(),
                 "/workspace/app/AGENTS.md".to_owned(),
             ]);
-        let lines = welcome_lines(&state.attached_agents);
+        let lines = welcome_lines(&state.attached_agents, state.palette);
 
         assert_eq!(lines[1].to_string(), WELCOME_VERSION);
         assert_eq!(lines[1].style.fg, Some(Color::DarkGray));
         assert!(lines[2].to_string().is_empty());
         assert_eq!(lines[3].to_string(), WELCOME_TAGLINE);
         assert_eq!(lines[3].style.fg, Some(Color::DarkGray));
-        assert!(lines[4].to_string().is_empty());
-        assert_eq!(lines[5].to_string(), "Attached AGENTS.md:");
-        assert_eq!(lines[6].to_string(), "• /workspace/AGENTS.md");
-        assert_eq!(lines[7].to_string(), "• /workspace/app/AGENTS.md");
-        assert!(lines[5..]
+        assert_eq!(
+            lines[4].to_string(),
+            "Terminal background: unavailable (fallback)"
+        );
+        assert_eq!(lines[4].style.fg, Some(Color::DarkGray));
+        assert!(lines[5].to_string().is_empty());
+        assert_eq!(lines[6].to_string(), "Attached AGENTS.md:");
+        assert_eq!(lines[7].to_string(), "• /workspace/AGENTS.md");
+        assert_eq!(lines[8].to_string(), "• /workspace/app/AGENTS.md");
+        assert!(lines[6..]
             .iter()
             .all(|line| line.style.fg == Some(Color::DarkGray)));
     }
 
     #[test]
+    fn welcome_reports_detected_terminal_background_as_rgb_hex() {
+        let palette = UiPalette::from_terminal_background(12, 34, 56);
+        let lines = welcome_lines(&[], palette);
+        assert_eq!(lines[4].to_string(), "Terminal background: #0C2238");
+        assert_eq!(lines[4].style.fg, Some(palette.muted_text));
+    }
+
+    #[test]
     fn welcome_reports_when_no_agents_file_is_attached() {
-        let lines = welcome_lines(&[]);
+        let lines = welcome_lines(&[], UiPalette::fallback());
         assert_eq!(
             lines.last().expect("empty context line").to_string(),
             "Attached AGENTS.md: none"
