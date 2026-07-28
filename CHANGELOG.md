@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.13.1](https://github.com/jwoo0122/lucy/compare/v1.13.0...v1.13.1) - 2026-07-28
+
+### Fixed
+
+- *(tui)* adapt colors to terminal background ([#44](https://github.com/jwoo0122/lucy/pull/44))
+
 ## [1.13.0](https://github.com/jwoo0122/lucy/compare/v1.12.3...v1.13.0) - 2026-07-26
 
 ### Added
