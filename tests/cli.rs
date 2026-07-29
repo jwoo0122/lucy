@@ -2306,3 +2306,39 @@ fn assert_background_completion_framing(content: &str, payload: &str) {
     assert!(opening_start < payload_start);
     assert!(payload_start < closing_start);
 }
+
+#[test]
+fn setup_without_terminals_fails_immediately_without_reading_input() {
+    let (home, project) = temporary_tree("setup-non-tty");
+    let output = run_lucy(&home, &project, &["setup"], "");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr"),
+        "!: lucy setup requires a terminal on stdin and stdout\n"
+    );
+    assert!(!home.join(".lucy/sessions").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn jsonl_with_incomplete_config_fails_without_prompts_or_terminal_sequences() {
+    let (home, project) = temporary_tree("incomplete-jsonl");
+    let output = run_lucy(
+        &home,
+        &project,
+        &["--jsonl"],
+        "{\"type\":\"message\",\"text\":\"hello\"}\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert_eq!(
+        stderr,
+        "!: configuration is incomplete; run `lucy setup` in a terminal\n"
+    );
+    assert!(!stderr.contains("Connection:"));
+    assert!(!stderr.contains('\u{1b}'));
+    assert!(!home.join(".lucy/sessions").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}

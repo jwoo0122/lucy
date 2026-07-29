@@ -982,6 +982,7 @@ dependencies = [
  "terminal-colorsaurus",
  "tokio",
  "toml",
+ "toml_edit",
  "unicode-width",
 ]
 

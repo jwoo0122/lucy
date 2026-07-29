@@ -531,8 +531,8 @@
         <p data-reveal data-reveal-load style="--reveal-delay: 420ms">Lucy is the thin line between powerful AI and your machine: <strong>one tool, one local process, no agent framework to carry.</strong></p>
         <div class="hero-actions" data-reveal data-reveal-load style="--reveal-delay: 560ms">
           <div class="command">
-            <code>brew install jwoo0122/tap/lucy</code>
-            <button class="copy-btn" type="button" data-command="brew install jwoo0122/tap/lucy" aria-label="Copy install command">copy</button>
+            <code>brew install jwoo0122/tap/lucy &amp;&amp; lucy setup &amp;&amp; lucy</code>
+            <button class="copy-btn" type="button" data-command="brew install jwoo0122/tap/lucy && lucy setup && lucy" aria-label="Copy install command">copy</button>
           </div>
           <a class="github-btn" href="https://github.com/jwoo0122/lucy" aria-label="Open Lucy on GitHub">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.4c.58.1.79-.25.79-.56v-2.23c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.77 2.72 1.26 3.38.96.1-.75.4-1.27.74-1.56-2.57-.3-5.27-1.29-5.27-5.69 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.16 1.18A10.9 10.9 0 0 1 12 6.1c.98 0 1.95.13 2.87.39 2.2-1.49 3.16-1.18 3.16-1.18.63 1.59.23 2.76.11 3.05.74.8 1.19 1.83 1.19 3.09 0 4.42-2.71 5.39-5.29 5.68.42.36.79 1.07.79 2.16v3.25c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg>
@@ -591,8 +591,12 @@
           <div class="step" data-reveal style="--reveal-delay: 80ms">
             <span class="step-number">02</span>
             <div>
-              <h3>Choose the connection</h3>
-              <p>First run creates one config file. Select an OpenAI-compatible provider with an environment key, or sign in with <code>lucy codex login</code>.</p>
+              <h3>Run interactive setup</h3>
+              <p>Choose an OpenAI-compatible provider with an environment key, or sign in with Codex. Lucy never stores the API-key value.</p>
+              <div class="command">
+                <code>lucy setup</code>
+                <button class="copy-btn" type="button" data-command="lucy setup" aria-label="Copy setup command">copy</button>
+              </div>
             </div>
           </div>
           <div class="step" data-reveal style="--reveal-delay: 160ms">
@@ -614,7 +618,7 @@
       <div class="container content-section">
         <div class="section-intro" data-reveal>
           <h2 id="configuration-heading">One file.<br>One connection.</h2>
-          <p>First run creates <code>~/.config/lucy/config.toml</code>, or uses <code>$XDG_CONFIG_HOME</code>. Set the provider and model; keep credentials outside the file.</p>
+          <p><code>lucy setup</code> creates <code>~/.config/lucy/config.toml</code>, or uses <code>$XDG_CONFIG_HOME</code>. Set the provider and model; keep credentials outside the file.</p>
         </div>
 
         <div class="doc-list">

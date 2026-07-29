@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,8 @@ pub const OPENROUTER_PROVIDER: &str = "openrouter";
 pub const CODEX_API_KEY_ENV_SENTINEL: &str = "LUCY_CODEX_SUBSCRIPTION_TOKEN";
 #[deprecated(note = "system prompts are Lucy-owned and this compatibility constant is ignored")]
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, use cmd to read a relevant skill's SKILL.md.";
+
+static CONFIG_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const GENERATED_CONFIG: &str = r#"[auth]
 provider = "openrouter"
@@ -102,6 +105,15 @@ pub struct LlmConfig {
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupSelection {
+    pub provider: AuthProvider,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub model: String,
     pub effort: Option<String>,
 }
 
@@ -234,6 +246,83 @@ impl Config {
             .map_err(|_| ConfigError::new("unable to write config.toml"))?;
         fs::write(&path, rendered).map_err(|_| ConfigError::new("unable to write config.toml"))?;
         ensure_private_file(&path).map_err(|_| ConfigError::new("unable to secure config.toml"))
+    }
+
+    /// Atomically update only setup-owned keys while preserving unrelated TOML and comments.
+    pub fn save_setup(home: &Path, selection: &SetupSelection) -> Result<(), ConfigError> {
+        use std::str::FromStr;
+        let path = config_path(home);
+        ensure_not_symlink(&path).map_err(|_| ConfigError::new("unable to secure config.toml"))?;
+        ensure_private_dir(&config_dir(home))
+            .map_err(|_| ConfigError::new("unable to secure config.toml"))?;
+        let source = fs::read_to_string(&path)
+            .map_err(|_| ConfigError::new("unable to read config.toml"))?;
+        let mut document = toml_edit::DocumentMut::from_str(&source)
+            .map_err(|_| ConfigError::new("unable to parse config.toml: invalid TOML"))?;
+        document["auth"]["provider"] = toml_edit::value(match selection.provider {
+            AuthProvider::Openrouter => OPENROUTER_PROVIDER,
+            AuthProvider::CodexSubscription => CODEX_SUBSCRIPTION_PROVIDER,
+        });
+        match selection.api_key_env.as_deref() {
+            Some(value) => document["auth"]["api_key_env"] = toml_edit::value(value),
+            None => {
+                document["auth"]
+                    .as_table_mut()
+                    .map(|table| table.remove("api_key_env"));
+            }
+        }
+        document["llm"]
+            .as_table_mut()
+            .map(|table| table.remove("api_key_env"));
+        match selection.base_url.as_deref() {
+            Some(value) => document["llm"]["base_url"] = toml_edit::value(value),
+            None => {
+                document["llm"]
+                    .as_table_mut()
+                    .map(|table| table.remove("base_url"));
+            }
+        }
+        document["llm"]["model"] = toml_edit::value(selection.model.as_str());
+        match selection.effort.as_deref() {
+            Some(value) => document["llm"]["effort"] = toml_edit::value(value),
+            None => {
+                document["llm"]
+                    .as_table_mut()
+                    .map(|table| table.remove("effort"));
+            }
+        }
+        let rendered = document.to_string();
+        let counter = CONFIG_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = config_dir(home).join(format!(
+            ".config.toml.{}.{}.tmp",
+            std::process::id(),
+            counter
+        ));
+        ensure_not_symlink(&temporary)
+            .map_err(|_| ConfigError::new("unable to secure config.toml"))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let result = (|| {
+            let mut file = options
+                .open(&temporary)
+                .map_err(|_| ConfigError::new("unable to write config.toml"))?;
+            file.write_all(rendered.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(|_| ConfigError::new("unable to write config.toml"))?;
+            ensure_private_file(&temporary)
+                .map_err(|_| ConfigError::new("unable to secure config.toml"))?;
+            ensure_not_symlink(&path)
+                .map_err(|_| ConfigError::new("unable to secure config.toml"))?;
+            fs::rename(&temporary, &path)
+                .map_err(|_| ConfigError::new("unable to replace config.toml"))?;
+            ensure_private_file(&path).map_err(|_| ConfigError::new("unable to secure config.toml"))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub fn resolved_auth(&self) -> Result<AuthSettings, ConfigError> {

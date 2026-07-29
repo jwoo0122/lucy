@@ -22,6 +22,8 @@ Prebuilt releases are available for Apple Silicon macOS, Intel macOS, and x86_64
 
 ```sh
 brew install jwoo0122/tap/lucy
+lucy setup
+lucy
 ```
 
 The `lucy-cli` crate is also published on crates.io for Rust users:
@@ -32,7 +34,11 @@ cargo install lucy-cli
 
 Prebuilt archives are available from the [GitHub Releases](https://github.com/jwoo0122/lucy/releases) page. After extracting the archive, place the `lucy` executable on your `PATH`.
 
-On first run, Lucy creates `$XDG_CONFIG_HOME/lucy/config.toml` (or `~/.config/lucy/config.toml` when `XDG_CONFIG_HOME` is unset or empty). Existing `~/.lucy/config.toml` files are migrated once; sessions remain under `~/.lucy/sessions`. Set `llm.model` and choose either OpenRouter API-key authentication or Codex subscription authentication. Existing configs without `[auth]` continue to use the legacy OpenRouter-compatible settings.
+Run `lucy setup` in a terminal to choose an OpenAI-compatible API-key connection or a Codex subscription. Plain `lucy` starts the same setup flow before the TUI when configuration is incomplete. Setup stores only the API-key environment-variable name, never the key value. JSONL and other non-interactive invocations fail fast and direct you to `lucy setup` instead of prompting.
+
+Lucy writes `$XDG_CONFIG_HOME/lucy/config.toml` (or `~/.config/lucy/config.toml` when `XDG_CONFIG_HOME` is unset or empty). Existing `~/.lucy/config.toml` files are migrated once; sessions remain under `~/.lucy/sessions`. Re-running setup updates Lucy-owned connection fields while preserving unrelated valid TOML content. Existing configs without `[auth]` continue to use legacy OpenRouter-compatible settings.
+
+### Manual configuration (advanced/reference)
 
 Lucy’s system guidance is built into the binary and is not configurable. New configs omit the former top-level `system_prompt`; an existing valid key is accepted, ignored, and preserved during settings updates. Loading, bootstrapping, and migration do not rewrite an existing config. Built-in guidance changes apply to new sessions, while resumed sessions retain their saved boot prompt.
 

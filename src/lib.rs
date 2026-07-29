@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod provider;
 pub(crate) mod redaction;
 pub mod session;
+pub mod setup;
 pub mod tui;
 
 pub use app::{run_cli, run_cli_at_home};

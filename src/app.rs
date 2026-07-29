@@ -33,6 +33,7 @@ struct CliOptions {
 enum CliCommand {
     CodexLogin,
     CodexLogout,
+    Setup,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,8 +133,8 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_cli_at_home_with_terminals<R, W, E>(
     args: &[String],
-    input: R,
-    output: W,
+    mut input: R,
+    mut output: W,
     mut diagnostics: E,
     home: &Path,
     cwd: &Path,
@@ -164,6 +165,16 @@ where
         return 0;
     }
     if let Some(command) = options.command {
+        if command == CliCommand::Setup {
+            if !(stdin_is_tty && stdout_is_tty) {
+                write_diagnostic(&mut diagnostics, "lucy setup requires a terminal on stdin and stdout");
+                return 2;
+            }
+            return match crate::setup::run(home, &mut input, &mut output) {
+                Ok(_) => 0,
+                Err(error) => { write_diagnostic(&mut diagnostics, &error); 1 }
+            };
+        }
         return run_codex_command(command, home, output, &mut diagnostics);
     }
     let mode = match resolve_mode(args, stdin_is_tty, stdout_is_tty) {
@@ -202,6 +213,24 @@ where
                 1
             }
         };
+    }
+
+    if !options.list_sessions && options.session.is_none() {
+        let config = match Config::load_or_create(home) {
+            Ok(config) => config,
+            Err(error) => { write_diagnostic(&mut diagnostics, &error.to_string()); return 1; }
+        };
+        if !crate::setup::configuration_is_complete(home, &config) {
+            if mode == FrontendMode::Jsonl {
+                write_diagnostic(&mut diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+                return 1;
+            }
+            match crate::setup::run(home, &mut input, &mut output) {
+                Ok(crate::setup::SetupOutcome::Saved) => {}
+                Ok(crate::setup::SetupOutcome::Cancelled) => return 0,
+                Err(error) => { write_diagnostic(&mut diagnostics, &error); return 1; }
+            }
+        }
     }
 
     let (session, provider, resumed, attached_agents, resolved_policy) = if let Some(id) =
@@ -1379,6 +1408,10 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         version: false,
         command: None,
     };
+    if args.len() == 1 && args[0] == "setup" {
+        options.command = Some(CliCommand::Setup);
+        return Ok(options);
+    }
     if args.len() == 2 && args[0] == "codex" {
         options.command = Some(match args[1].as_str() {
             "login" => CliCommand::CodexLogin,
@@ -1429,7 +1462,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
+                    "usage: lucy setup | lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
                         .to_owned(),
                 );
             }
@@ -1475,6 +1508,7 @@ fn run_codex_command<W: Write, E: Write>(
     diagnostics: &mut E,
 ) -> i32 {
     match command {
+        CliCommand::Setup => unreachable!("setup is dispatched before Codex commands"),
         CliCommand::CodexLogin => match crate::auth::login(home) {
             Ok(_) => {
                 let _ = writeln!(output, "Codex login successful");
@@ -1546,6 +1580,10 @@ fn resume_session<W: Write>(
             return None;
         }
     };
+    if !crate::setup::configuration_is_complete(home, &config) {
+        write_diagnostic(diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+        return None;
+    }
     let auth = match config.resolved_auth() {
         Ok(auth) => auth,
         Err(error) => {
