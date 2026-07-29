@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.3](https://github.com/jwoo0122/lucy/compare/v1.14.2...v1.14.3) - 2026-07-29
+
+### Fixed
+
+- *(security)* remove active provider credential from command child ([#59](https://github.com/jwoo0122/lucy/pull/59))
+
 ## [1.14.2](https://github.com/jwoo0122/lucy/compare/v1.14.1...v1.14.2) - 2026-07-28
 
 ### Fixed
