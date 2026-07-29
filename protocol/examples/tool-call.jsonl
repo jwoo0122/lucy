@@ -1,0 +1,6 @@
+{"type":"protocol","version":1,"capabilities":["sessions","cancellation","background_commands"]}
+{"type":"session","session_id":"abc123","resumed":false}
+{"type":"assistant_delta","text":"Let me check the files.","turn_id":"turn-1","request_id":"build-42"}
+{"type":"tool_call","id":"call-1","name":"cmd","arguments":"{\"command\":\"ls -la\"}","turn_id":"turn-1","request_id":"build-42"}
+{"type":"tool_result","id":"call-1","name":"cmd","result":{"exit_code":0,"stdout":"total 0","stderr":""},"turn_id":"turn-1","request_id":"build-42"}
+{"type":"turn_end","turn_id":"turn-1","request_id":"build-42"}

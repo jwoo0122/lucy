@@ -325,7 +325,7 @@ fn worker_loop(
                     {
                         let message =
                             redact_secret(&error, Some(harness.provider.api_key().as_str()));
-                        let _ = sink.emit_event(&ProtocolEvent::Error { message });
+                        let _ = sink.emit_event(&ProtocolEvent::Error { message, request_id: None });
                     }
                     let _ = messages.send(WorkerMessage::Finished);
                 }
@@ -340,9 +340,9 @@ fn worker_loop(
                     cancel: cancel.clone(),
                     user_text: Some(text.clone()),
                 });
-                if let Err(error) = harness.handle_message(&text, &mut sink, Some(&cancel)) {
+                if let Err(error) = harness.handle_message(&text, &mut sink, Some(&cancel), None) {
                     let message = redact_secret(&error, Some(harness.provider.api_key().as_str()));
-                    let _ = sink.emit_event(&ProtocolEvent::Error { message });
+                    let _ = sink.emit_event(&ProtocolEvent::Error { message, request_id: None });
                 }
                 let _ = messages.send(WorkerMessage::Finished);
             }
@@ -1588,36 +1588,39 @@ impl UiState {
     fn apply_event(&mut self, event: ProtocolEvent) {
         match event {
             ProtocolEvent::Session { .. } => {}
-            ProtocolEvent::AssistantDelta { text } => self.add_assistant(&text),
+            ProtocolEvent::AssistantDelta { text, .. } => self.add_assistant(&text),
             ProtocolEvent::ToolCall {
                 id,
                 name,
                 arguments,
+                ..
             } => self.add_live_tool_call(&crate::model::ChatToolCall {
                 id,
                 name,
                 arguments,
             }),
-            ProtocolEvent::ToolResult { id, name, result } => {
+            ProtocolEvent::ToolResult { id, name, result, .. } => {
                 self.add_live_tool_result(&id, &name, result)
             }
-            ProtocolEvent::TurnEnd => {
+            ProtocolEvent::TurnEnd { .. } => {
                 self.complete_reasoning();
                 self.set_status("finalizing");
                 self.transcript
                     .push(TranscriptItem::Info("✓ turn complete".to_owned()));
             }
-            ProtocolEvent::TurnInterrupted { reason, phase } => {
+            ProtocolEvent::TurnInterrupted { reason, phase, .. } => {
                 self.complete_reasoning();
                 self.set_status("cancelling");
                 self.transcript
                     .push(TranscriptItem::Info(format!("! {reason} ({phase})")));
             }
-            ProtocolEvent::Error { message } => {
+            ProtocolEvent::Error { message, request_id: None } => {
                 self.complete_reasoning();
                 self.set_status("error");
                 self.transcript.push(TranscriptItem::Error(message));
             }
+            ProtocolEvent::Protocol { .. } => {}
+            _ => {}
         }
     }
 }
@@ -4967,7 +4970,7 @@ mod tests {
         );
         state.busy = true;
         state.active_cancel = Some(CancellationToken::new());
-        state.apply_event(ProtocolEvent::TurnEnd);
+        state.apply_event(ProtocolEvent::TurnEnd { turn_id: None, request_id: None });
         assert!(state.busy);
         assert!(state.active_cancel.is_some());
         assert_eq!(state.status, "finalizing");

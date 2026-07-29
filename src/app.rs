@@ -40,6 +40,8 @@ struct InputRecord {
     #[serde(rename = "type")]
     record_type: String,
     text: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 const USER_CANCEL_REASON: &str = "user_cancelled";
@@ -370,6 +372,15 @@ where
 
     let mut protocol = ProtocolWriter::new(output);
     let mut harness = harness;
+    // Emit the protocol handshake as the first stdout record.
+    if let Err(error) = protocol.handshake() {
+        write_diagnostic_safe(
+            &mut diagnostics,
+            &format!("unable to write protocol handshake: {error}"),
+            Some(harness.provider.api_key().as_str()),
+        );
+        return 1;
+    }
     if let Err(error) = protocol.session(&harness.session.id, resumed) {
         write_diagnostic_safe(
             &mut diagnostics,
@@ -424,8 +435,8 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        let text = match parse_input_message(&line) {
-            Ok(text) => text,
+        let (text, request_id) = match parse_input_message(&line) {
+            Ok(result) => result,
             Err(error) => {
                 let error = redact_secret(&error, Some(harness.provider.api_key().as_str()));
                 if let Err(write_error) = protocol.error(&error) {
@@ -439,9 +450,11 @@ where
                 continue;
             }
         };
-        if let Err(error) = harness.handle_message(&text, &mut protocol, None) {
+        if let Err(error) =
+            harness.handle_message(&text, &mut protocol, None, request_id.as_deref())
+        {
             let error = redact_secret(&error, Some(harness.provider.api_key().as_str()));
-            if let Err(write_error) = protocol.error(&error) {
+            if let Err(write_error) = protocol.error_correlated(&error, request_id.as_deref()) {
                 write_diagnostic_safe(
                     &mut diagnostics,
                     &format!("unable to write protocol error: {write_error}"),
@@ -628,7 +641,9 @@ impl Harness {
         text: &str,
         sink: &mut S,
         cancellation: Option<&crate::cancellation::CancellationToken>,
+        request_id: Option<&str>,
     ) -> Result<(), String> {
+        let _ = request_id;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
         }
@@ -737,6 +752,8 @@ impl Harness {
                             redactor.push(&delta, |safe_delta| {
                                 sink.emit_event(&ProtocolEvent::AssistantDelta {
                                     text: safe_delta.to_owned(),
+                                    turn_id: None,
+                                    request_id: None
                                 })
                             })
                         }
@@ -756,6 +773,8 @@ impl Harness {
                         redactor.push(delta, |safe_delta| {
                             sink.emit_event(&ProtocolEvent::AssistantDelta {
                                 text: safe_delta.to_owned(),
+                                    turn_id: None,
+                                    request_id: None
                             })
                         })
                     }),
@@ -765,6 +784,8 @@ impl Harness {
                 .finish(|safe_delta| {
                     sink.emit_event(&ProtocolEvent::AssistantDelta {
                         text: safe_delta.to_owned(),
+                                    turn_id: None,
+                                    request_id: None
                     })
                 })
                 .map_err(|error| format!("unable to write assistant delta: {error}"))?;
@@ -856,7 +877,7 @@ impl Harness {
                 }
                 sink.context_usage(estimate_context_tokens(&self.session.provider_messages()))
                     .map_err(|error| format!("unable to emit context usage: {error}"))?;
-                sink.emit_event(&ProtocolEvent::TurnEnd)
+                sink.emit_event(&ProtocolEvent::TurnEnd { turn_id: None, request_id: None })
                     .map_err(|error| format!("unable to write turn end: {error}"))?;
                 return Ok(());
             }
@@ -866,6 +887,8 @@ impl Harness {
                     id: safe_call.id.clone(),
                     name: safe_call.name.clone(),
                     arguments: safe_call.arguments.clone(),
+                                    turn_id: None,
+                                    request_id: None
                 })
                 .map_err(|error| format!("unable to write tool call: {error}"))?;
             }
@@ -915,6 +938,8 @@ impl Harness {
                     id: safe_call.id.clone(),
                     name: safe_call.name.clone(),
                     result: result.clone(),
+                                    turn_id: None,
+                                    request_id: None
                 })
                 .map_err(|error| format!("unable to write tool result: {error}"))?;
                 if cancellation.is_some_and(|token| token.is_cancelled()) {
@@ -958,6 +983,8 @@ impl Harness {
                             id: pending_call.id.clone(),
                             name: pending_call.name.clone(),
                             result: pending_result.clone(),
+                                    turn_id: None,
+                                    request_id: None
                         })
                         .map_err(|error| format!("unable to write tool result: {error}"))?;
                     }
@@ -1000,6 +1027,8 @@ impl Harness {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
+                                    turn_id: None,
+                                    request_id: None
             }) {
                 event_error.get_or_insert(error);
             }
@@ -1009,6 +1038,8 @@ impl Harness {
                 id: observation.id.clone(),
                 name: observation.name.clone(),
                 result: observation.result.clone(),
+                                    turn_id: None,
+                                    request_id: None
             }) {
                 event_error.get_or_insert(error);
             }
@@ -1016,6 +1047,8 @@ impl Harness {
         if let Err(error) = sink.emit_event(&ProtocolEvent::TurnInterrupted {
             reason: USER_CANCEL_REASON.to_owned(),
             phase: phase.to_owned(),
+                                    turn_id: None,
+                                    request_id: None
         }) {
             event_error.get_or_insert(error);
         }
@@ -1407,15 +1440,16 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     Ok(options)
 }
 
-fn parse_input_message(line: &str) -> Result<String, String> {
+fn parse_input_message(line: &str) -> Result<(String, Option<String>), String> {
     let record: InputRecord = serde_json::from_str(line)
         .map_err(|_| "input must be a JSONL message record".to_owned())?;
     if record.record_type != "message" {
         return Err("input record type must be message".to_owned());
     }
-    record
+    let text = record
         .text
-        .ok_or_else(|| "message record requires a text string".to_owned())
+        .ok_or_else(|| "message record requires a text string".to_owned())?;
+    Ok((text, record.request_id))
 }
 
 fn home_directory() -> Result<PathBuf, String> {
@@ -1833,7 +1867,7 @@ mod tests {
             compaction_finished: false,
         };
         harness
-            .handle_message("continue", &mut sink, Some(&cancellation))
+            .handle_message("continue", &mut sink, Some(&cancellation), None)
             .expect("continued turn");
 
         let requests = server.join().expect("server");
@@ -1847,7 +1881,7 @@ mod tests {
         assert!(sink.compaction_started);
         assert!(sink.compaction_finished);
         assert!(sink.events.iter().any(
-            |event| matches!(event, ProtocolEvent::AssistantDelta { text } if text == "continued")
+            |event| matches!(event, ProtocolEvent::AssistantDelta { text, .. } if text == "continued")
         ));
         assert!(harness
             .session
@@ -1870,15 +1904,23 @@ mod tests {
 
     #[test]
     fn parses_only_message_records() {
-        assert_eq!(
-            parse_input_message(r#"{"type":"message","text":"hello"}"#).expect("message"),
-            "hello"
-        );
+        let (text, request_id) =
+            parse_input_message(r#"{"type":"message","text":"hello"}"#).expect("message");
+        assert_eq!(text, "hello");
+        assert!(request_id.is_none());
         assert!(parse_input_message(r#"{"type":"event","text":"hello"}"#).is_err());
-        assert_eq!(
-            parse_input_message(r#"{"type":"message","text":""}"#).expect("empty message"),
-            ""
-        );
+        let (text, _) =
+            parse_input_message(r#"{"type":"message","text":""}"#).expect("empty message");
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn parses_request_id_from_message() {
+        let (text, request_id) =
+            parse_input_message(r#"{"type":"message","text":"run tests","request_id":"build-42"}"#)
+                .expect("message with request_id");
+        assert_eq!(text, "run tests");
+        assert_eq!(request_id.as_deref(), Some("build-42"));
     }
 
     #[test]

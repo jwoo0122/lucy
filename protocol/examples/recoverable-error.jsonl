@@ -1,0 +1,3 @@
+{"type":"protocol","version":1,"capabilities":["sessions","cancellation","background_commands"]}
+{"type":"session","session_id":"abc123","resumed":false}
+{"type":"error","message":"input must be a JSONL message record","request_id":null}

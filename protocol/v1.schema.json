@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lucy.nousresearch.com/protocol/v1.schema.json",
+  "title": "Lucy JSONL Protocol v1",
+  "description": "Schema for Lucy's public JSONL protocol v1 output events.",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "protocol",
+        "session",
+        "assistant_delta",
+        "tool_call",
+        "tool_result",
+        "turn_end",
+        "turn_interrupted",
+        "error"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "protocol" },
+        "version": { "type": "integer", "const": 1 },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["type", "version", "capabilities"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "session" },
+        "session_id": { "type": "string" },
+        "resumed": { "type": "boolean" }
+      },
+      "required": ["type", "session_id", "resumed"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "assistant_delta" },
+        "text": { "type": "string" },
+        "turn_id": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] }
+      },
+      "required": ["type", "text"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "tool_call" },
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "arguments": { "type": "string" },
+        "turn_id": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] }
+      },
+      "required": ["type", "id", "name", "arguments"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "tool_result" },
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "result": {},
+        "turn_id": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] }
+      },
+      "required": ["type", "id", "name", "result"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "turn_end" },
+        "turn_id": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] }
+      },
+      "required": ["type"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "turn_interrupted" },
+        "reason": { "type": "string" },
+        "phase": { "type": "string" },
+        "turn_id": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] }
+      },
+      "required": ["type", "reason", "phase"]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": { "const": "error" },
+        "message": { "type": "string" },
+        "request_id": { "type": ["string", "null"] }
+      },
+      "required": ["type", "message"]
+    }
+  ]
+}
