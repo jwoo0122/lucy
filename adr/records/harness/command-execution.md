@@ -63,13 +63,14 @@ Each command MUST have a 10-minute timeout. A `cmd` call MAY set `background: tr
 
 ## Context and forces
 
-The model is explicitly trusted and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy treats the command environment as a trusted terminal environment and redacts the provider credential from captured/persisted tool output. The credential is therefore available to commands and may be observed by them; this does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the protocol or consuming the model context without limit.
+The model is explicitly trusted and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy treats the command environment as a trusted terminal environment and redacts the provider credential from captured/persisted tool output. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; however, shell startup files or commands may independently reintroduce credentials, so this does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the protocol or consuming the model context without limit.
 
 ## Invariants
 
 - The shell command string is passed without Lucy-side rewriting.
 - The shell executable is inherited from `SHELL` when set, with `/bin/sh` as the empty/unset fallback.
-- The configured provider API-key variable remains available in the child environment.
+- The configured provider API-key variable is removed from the command child environment before spawn; the rest of the inherited environment is preserved.
+- Shell startup files may independently reintroduce or retrieve credentials; Lucy does not parse or sanitize shell startup behavior.
 - Captured command output is redacted before protocol or session serialization.
 - The command cwd is stable across invocations; shell-local `cd` does not mutate the session cwd.
 - Timeout and output truncation produce a tool result that the model can handle.

@@ -320,7 +320,7 @@ pub fn execute_command(
 pub(crate) fn execute_command_with_cancellation(
     command: &str,
     cwd: &Path,
-    _api_key_env: &str,
+    api_key_env: &str,
     secret: Option<&str>,
     timeout: Duration,
     output_cap: usize,
@@ -344,6 +344,15 @@ pub(crate) fn execute_command_with_cancellation(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Remove the active provider credential from the command child's
+    // environment. The rest of the inherited environment is preserved so
+    // login-shell configuration, PATH, virtualenv state, and unrelated user
+    // variables remain available. Shell startup files may independently
+    // reintroduce a credential; this only prevents direct inheritance.
+    if !api_key_env.is_empty() {
+        process.env_remove(api_key_env);
+    }
 
     #[cfg(unix)]
     {
@@ -874,6 +883,90 @@ mod tests {
         assert_eq!(completions[0].result.exit_code, Some(0));
         assert_eq!(completions[0].result.stdout, "done");
         assert!(!background.has_active());
+        fs::remove_dir_all(cwd).expect("remove temp directory");
+    }
+
+    fn unique_env_name(prefix: &str) -> String {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}_{stamp}_{counter}")
+    }
+
+    #[test]
+    fn preserves_normal_inherited_environment_variable() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
+        let cwd = temporary_directory();
+        let var_name = unique_env_name("LUCY_TEST_INHERIT");
+        std::env::set_var(&var_name, "still-here");
+        let result = execute_command(
+            &format!("printf ${var_name}"),
+            &cwd,
+            &unique_env_name("LUCY_TEST_UNUSED"),
+            None,
+            Duration::from_secs(2),
+            COMMAND_OUTPUT_CAP,
+        );
+        assert_eq!(result.stdout, "still-here");
+        std::env::remove_var(&var_name);
+        fs::remove_dir_all(cwd).expect("remove temp directory");
+    }
+
+    #[test]
+    fn removes_active_provider_credential_from_foreground_command() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
+        let cwd = temporary_directory();
+        let var_name = unique_env_name("LUCY_TEST_SECRET");
+        std::env::set_var(&var_name, "super-secret-key");
+        let result = execute_command(
+            &format!("printf ${var_name}"),
+            &cwd,
+            &var_name,
+            Some("super-secret-key"),
+            Duration::from_secs(2),
+            COMMAND_OUTPUT_CAP,
+        );
+        assert!(
+            !result.stdout.contains("super-secret-key"),
+            "credential leaked into foreground command output"
+        );
+        std::env::remove_var(&var_name);
+        fs::remove_dir_all(cwd).expect("remove temp directory");
+    }
+
+    #[test]
+    fn removes_active_provider_credential_from_background_command() {
+        let _test_lock = COMMAND_TEST_LOCK.lock().expect("command test lock");
+        let cwd = temporary_directory();
+        let var_name = unique_env_name("LUCY_TEST_BG_SECRET");
+        std::env::set_var(&var_name, "bg-secret-key");
+        let mut background = BackgroundCommands::default();
+        let _ = execute_managed(
+            &format!(
+                r#"{{"command":"printf ${var_name}","background":true}}"#
+            ),
+            &cwd,
+            &var_name,
+            Some("bg-secret-key"),
+            None,
+            &mut background,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !background.has_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let completions = background.take_completions();
+        assert_eq!(completions.len(), 1);
+        assert!(
+            !completions[0]
+                .result
+                .stdout
+                .contains("bg-secret-key"),
+            "credential leaked into background command output"
+        );
+        std::env::remove_var(&var_name);
         fs::remove_dir_all(cwd).expect("remove temp directory");
     }
 }
