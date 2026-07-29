@@ -61,6 +61,8 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -77,6 +79,12 @@ pub enum AuthProvider {
     #[default]
     Openrouter,
     CodexSubscription,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExecutionConfig {
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +136,18 @@ impl Default for LlmConfig {
 
 fn default_base_url() -> String {
     DEFAULT_BASE_URL.to_owned()
+}
+
+/// Expand a leading `~/` or `~` path prefix to the given home directory.
+/// Other paths are returned unchanged.
+fn expand_tilde(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
 }
 
 impl Config {
@@ -285,6 +305,45 @@ impl Config {
             api_key_env,
             effort,
         })
+    }
+
+    /// Resolve and validate the optional command policy hook path. Returns
+    /// `None` when no policy is configured. A configured path is expanded,
+    /// validated against symlinks and unsafe permissions, and resolved to an
+    /// absolute path. A validation error means the policy is unsafe or
+    /// unusable and must be reported before any command runs.
+    pub fn resolved_policy(&self, home: &Path) -> Result<Option<PathBuf>, ConfigError> {
+        let Some(raw) = self.execution.policy.as_deref() else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let expanded = expand_tilde(raw, home);
+        let resolved = if expanded.is_absolute() {
+            expanded
+        } else {
+            config_dir(home).join(expanded)
+        };
+        ensure_not_symlink(&resolved)
+            .map_err(|_| ConfigError::new("policy path must not be a symlink"))?;
+        if !resolved.exists() {
+            return Err(ConfigError::new("policy path does not exist"));
+        }
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(&resolved)
+                .map_err(|_| ConfigError::new("unable to inspect policy"))?;
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            if mode & 0o022 != 0 {
+                return Err(ConfigError::new(
+                    "policy path must not be group or world writable",
+                ));
+            }
+        }
+        Ok(Some(resolved))
     }
 }
 
@@ -635,6 +694,7 @@ mod tests {
                 api_key_env: None,
                 effort: None,
             },
+            ..Default::default()
         };
         assert_eq!(
             config.resolved_llm().expect("settings").api_key_env,
@@ -656,6 +716,7 @@ mod tests {
                 api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
                 effort: None,
             },
+            ..Default::default()
         };
         let error = config.resolved_auth().expect_err("mixed auth");
         assert_eq!(
@@ -673,6 +734,7 @@ mod tests {
                 api_key_env: Some(CODEX_API_KEY_ENV_SENTINEL.to_owned()),
             },
             llm: LlmConfig::default(),
+            ..Default::default()
         };
         assert!(config.resolved_auth().is_err());
     }
@@ -691,6 +753,7 @@ mod tests {
                 api_key_env: None,
                 effort: None,
             },
+            ..Default::default()
         };
         assert_eq!(
             config.resolved_auth().expect("codex auth").provider,
@@ -709,6 +772,7 @@ mod tests {
                 api_key_env: Some("LUCY_KEY".to_owned()),
                 effort: effort.map(str::to_owned),
             },
+            ..Default::default()
         };
         assert_eq!(config(None).resolved_llm().expect("none").effort, None);
         assert_eq!(

@@ -69,7 +69,23 @@ impl BackgroundCommands {
         cwd: &Path,
         api_key_env: &str,
         secret: Option<&str>,
+        session_id: &str,
+        policy: Option<&Path>,
     ) -> Value {
+        // Evaluate the policy before spawning the background worker.
+        if let Some(policy_path) = policy {
+            let outcome = crate::policy::evaluate(
+                Some(policy_path),
+                session_id,
+                cwd,
+                &command,
+                true,
+                api_key_env,
+            );
+            if !outcome.is_allowed() {
+                return outcome.to_json(&redact_secret(&command, secret));
+            }
+        }
         let id = format!("background-{}", self.next_id);
         self.next_id += 1;
         let cancellation = CancellationToken::new();
@@ -203,7 +219,7 @@ struct CapturedOutput {
 }
 
 pub fn execute(arguments: &str, cwd: &Path, api_key_env: &str, secret: Option<&str>) -> CmdResult {
-    execute_with_cancellation(arguments, cwd, api_key_env, secret, None)
+    execute_with_cancellation(arguments, cwd, api_key_env, secret, None, None, "")
 }
 
 pub(crate) fn execute_with_cancellation(
@@ -212,6 +228,8 @@ pub(crate) fn execute_with_cancellation(
     api_key_env: &str,
     secret: Option<&str>,
     cancellation: Option<&CancellationToken>,
+    policy: Option<&Path>,
+    session_id: &str,
 ) -> CmdResult {
     let parsed = match parse_arguments(arguments) {
         Ok(parsed) if !parsed.background => parsed,
@@ -226,6 +244,40 @@ pub(crate) fn execute_with_cancellation(
             "command canceled before execution",
         );
     }
+    // Evaluate the policy before spawning the foreground command.
+    if let Some(policy_path) = policy {
+        let outcome = crate::policy::evaluate(
+            Some(policy_path),
+            session_id,
+            cwd,
+            &parsed.command,
+            false,
+            api_key_env,
+        );
+        if !outcome.is_allowed() {
+            let json = outcome.to_json(&redact_secret(&parsed.command, secret));
+            return CmdResult {
+                command: redact_secret(&parsed.command, secret),
+                exit_code: None,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: serde_json::to_string(&json)
+                    .unwrap_or_else(|_| "command denied by policy".to_owned()),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                canceled: false,
+                error: Some(match &outcome {
+                    crate::policy::PolicyOutcome::Denied { reason } => {
+                        format!("command denied by policy: {reason}")
+                    }
+                    crate::policy::PolicyOutcome::Error { reason } => {
+                        format!("policy error: {reason}")
+                    }
+                    _ => "command denied by policy".to_owned(),
+                }),
+            };
+        }
+    }
     execute_command_with_cancellation(
         &parsed.command,
         cwd,
@@ -237,6 +289,7 @@ pub(crate) fn execute_with_cancellation(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_managed(
     arguments: &str,
     cwd: &Path,
@@ -244,6 +297,8 @@ pub(crate) fn execute_managed(
     secret: Option<&str>,
     cancellation: Option<&CancellationToken>,
     background_commands: &mut BackgroundCommands,
+    session_id: &str,
+    policy: Option<&Path>,
 ) -> Value {
     let parsed = match parse_arguments(arguments) {
         Ok(parsed) => parsed,
@@ -257,16 +312,23 @@ pub(crate) fn execute_managed(
         .expect("CmdResult serializes");
     }
     if parsed.background {
-        return background_commands.start(parsed.command, cwd, api_key_env, secret);
+        return background_commands.start(
+            parsed.command,
+            cwd,
+            api_key_env,
+            secret,
+            session_id,
+            policy,
+        );
     }
-    serde_json::to_value(execute_command_with_cancellation(
-        &parsed.command,
+    serde_json::to_value(execute_with_cancellation(
+        arguments,
         cwd,
         api_key_env,
         secret,
-        COMMAND_TIMEOUT,
-        COMMAND_OUTPUT_CAP,
         cancellation,
+        policy,
+        session_id,
     ))
     .expect("CmdResult serializes")
 }
@@ -317,6 +379,7 @@ pub fn execute_command(
     execute_command_with_cancellation(command, cwd, api_key_env, secret, timeout, output_cap, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_command_with_cancellation(
     command: &str,
     cwd: &Path,
@@ -867,6 +930,8 @@ mod tests {
             None,
             None,
             &mut background,
+            "test-session",
+            None,
         );
         assert_eq!(result["status"], "running");
         assert_eq!(result["background_id"], "background-1");
@@ -944,14 +1009,14 @@ mod tests {
         std::env::set_var(&var_name, "bg-secret-key");
         let mut background = BackgroundCommands::default();
         let _ = execute_managed(
-            &format!(
-                r#"{{"command":"printf ${var_name}","background":true}}"#
-            ),
+            &format!(r#"{{"command":"printf ${var_name}","background":true}}"#),
             &cwd,
             &var_name,
             Some("bg-secret-key"),
             None,
             &mut background,
+            "test-session",
+            None,
         );
         let deadline = Instant::now() + Duration::from_secs(2);
         while !background.has_completed() && Instant::now() < deadline {
@@ -960,10 +1025,7 @@ mod tests {
         let completions = background.take_completions();
         assert_eq!(completions.len(), 1);
         assert!(
-            !completions[0]
-                .result
-                .stdout
-                .contains("bg-secret-key"),
+            !completions[0].result.stdout.contains("bg-secret-key"),
             "credential leaked into background command output"
         );
         std::env::remove_var(&var_name);

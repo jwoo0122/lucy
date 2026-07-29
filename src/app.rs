@@ -202,12 +202,17 @@ where
         };
     }
 
-    let (session, provider, resumed, attached_agents) = if let Some(id) = options.session.as_deref()
+    let (session, provider, resumed, attached_agents, resolved_policy) = if let Some(id) =
+        options.session.as_deref()
     {
         let Some((session, provider)) = resume_session(home, id, mode, &mut diagnostics) else {
             return 1;
         };
-        (session, provider, true, Vec::new())
+        let policy = Config::load_or_create(home)
+            .ok()
+            .and_then(|config| config.resolved_policy(home).ok())
+            .flatten();
+        (session, provider, true, Vec::new(), policy)
     } else {
         let config = match Config::load_or_create(home) {
             Ok(config) => config,
@@ -308,7 +313,13 @@ where
                 return 1;
             }
         };
-        (session, provider, false, attached_agents)
+        (
+            session,
+            provider,
+            false,
+            attached_agents,
+            config.resolved_policy(home).unwrap_or(None),
+        )
     };
 
     let provider = provider.with_session_id(&session.id);
@@ -319,6 +330,7 @@ where
         context_window: None,
         attached_agents,
         background_commands: crate::command::BackgroundCommands::default(),
+        policy: resolved_policy,
     };
     if mode == FrontendMode::Tui {
         let mut harness = harness;
@@ -333,6 +345,10 @@ where
                     else {
                         return 1;
                     };
+                    let resumed_policy = Config::load_or_create(home)
+                        .ok()
+                        .and_then(|config| config.resolved_policy(home).ok())
+                        .flatten();
                     harness = Harness {
                         provider: provider.with_session_id(&session.id),
                         home: home.to_path_buf(),
@@ -340,6 +356,7 @@ where
                         context_window: None,
                         attached_agents: Vec::new(),
                         background_commands: crate::command::BackgroundCommands::default(),
+                        policy: resumed_policy,
                     };
                     resumed = true;
                 }
@@ -473,6 +490,9 @@ pub(crate) struct Harness {
     /// The TUI uses these only while its first-boot welcome is visible.
     pub(crate) attached_agents: Vec<String>,
     background_commands: crate::command::BackgroundCommands,
+    /// Optional command deny policy hook path resolved from user-owned config.
+    /// `None` means no policy is configured and all commands are allowed.
+    pub(crate) policy: Option<PathBuf>,
 }
 
 fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
@@ -865,6 +885,8 @@ impl Harness {
                         Some(&secret),
                         cancellation,
                         &mut self.background_commands,
+                        &self.session.id,
+                        self.policy.as_deref(),
                     )
                 };
                 let result = redact_json_value(result, &secret);
@@ -1802,6 +1824,7 @@ mod tests {
             context_window: Some(1),
             attached_agents: Vec::new(),
             background_commands: crate::command::BackgroundCommands::default(),
+            policy: None,
         };
         let cancellation = CancellationToken::new();
         let mut sink = Sink {

@@ -6,6 +6,7 @@ pub mod command;
 pub mod config;
 pub mod context;
 pub mod model;
+pub mod policy;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod redaction;
