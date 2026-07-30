@@ -5,6 +5,7 @@ pub(crate) mod codex_provider;
 pub mod command;
 pub mod config;
 pub mod context;
+pub mod doctor;
 pub mod model;
 pub mod policy;
 pub mod protocol;

@@ -2342,3 +2342,36 @@ fn jsonl_with_incomplete_config_fails_without_prompts_or_terminal_sequences() {
     assert!(!home.join(".lucy/sessions").exists());
     fs::remove_dir_all(home).expect("cleanup");
 }
+
+#[test]
+fn doctor_json_reports_missing_configuration_without_terminal_sequences_or_session() {
+    let (home, project) = temporary_tree("doctor-missing-config");
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["ok"], false);
+    assert!(report["checks"].as_array().is_some_and(|checks| checks.iter().any(|check| check["id"] == "config.storage" && check["status"] == "fail")));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('\u{1b}'));
+    assert!(!home.join(".lucy/sessions").read_dir().is_ok_and(|mut entries| entries.any(|entry| entry.is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl")))));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn doctor_json_valid_config_is_secret_free_and_metadata_absence_is_warning() {
+    let (home, project) = temporary_tree("doctor-valid-config");
+    write_config(&home, "http://127.0.0.1:1/v1", "ignored", "mock-model");
+    #[cfg(unix)]
+    fs::set_permissions(home.join(".config/lucy"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).expect("private config directory");
+    #[cfg(unix)]
+    fs::set_permissions(home.join(".config/lucy/config.toml"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).expect("private config");
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    let text = String::from_utf8(output.stdout).expect("doctor JSON");
+    assert!(output.status.success(), "report: {text}");
+    assert!(output.stderr.is_empty());
+    assert!(!text.contains("provider-secret"));
+    let report: Value = serde_json::from_str(&text).expect("report");
+    assert!(report["checks"].as_array().is_some_and(|checks| checks.iter().any(|check| check["id"] == "provider.metadata" && check["status"] == "warning")));
+    fs::remove_dir_all(home).expect("cleanup");
+}

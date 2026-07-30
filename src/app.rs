@@ -29,11 +29,12 @@ struct CliOptions {
     command: Option<CliCommand>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     CodexLogin,
     CodexLogout,
     Setup,
+    Doctor { json: bool, live: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,15 +165,42 @@ where
         }
         return 0;
     }
+    if let Some(CliCommand::Doctor { json, live }) = options.command.as_ref() {
+        let report = crate::doctor::run(home, cwd, *live);
+        if *json {
+            if serde_json::to_writer(&mut output, &report).is_err() || writeln!(output).is_err() {
+                write_diagnostic(&mut diagnostics, "unable to write doctor report");
+                return 1;
+            }
+        } else {
+            for check in &report.checks {
+                let _ = writeln!(
+                    diagnostics,
+                    "{:?} {}: {}",
+                    check.status, check.id, check.message
+                );
+                if let Some(remediation) = check.remediation {
+                    let _ = writeln!(diagnostics, "  {remediation}");
+                }
+            }
+        }
+        return report.exit_code();
+    }
     if let Some(command) = options.command {
         if command == CliCommand::Setup {
             if !(stdin_is_tty && stdout_is_tty) {
-                write_diagnostic(&mut diagnostics, "lucy setup requires a terminal on stdin and stdout");
+                write_diagnostic(
+                    &mut diagnostics,
+                    "lucy setup requires a terminal on stdin and stdout",
+                );
                 return 2;
             }
             return match crate::setup::run(home, &mut input, &mut output) {
                 Ok(_) => 0,
-                Err(error) => { write_diagnostic(&mut diagnostics, &error); 1 }
+                Err(error) => {
+                    write_diagnostic(&mut diagnostics, &error);
+                    1
+                }
             };
         }
         return run_codex_command(command, home, output, &mut diagnostics);
@@ -218,17 +246,26 @@ where
     if !options.list_sessions && options.session.is_none() {
         let config = match Config::load_or_create(home) {
             Ok(config) => config,
-            Err(error) => { write_diagnostic(&mut diagnostics, &error.to_string()); return 1; }
+            Err(error) => {
+                write_diagnostic(&mut diagnostics, &error.to_string());
+                return 1;
+            }
         };
         if !crate::setup::configuration_is_complete(home, &config) {
             if mode == FrontendMode::Jsonl {
-                write_diagnostic(&mut diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+                write_diagnostic(
+                    &mut diagnostics,
+                    "configuration is incomplete; run `lucy setup` in a terminal",
+                );
                 return 1;
             }
             match crate::setup::run(home, &mut input, &mut output) {
                 Ok(crate::setup::SetupOutcome::Saved) => {}
                 Ok(crate::setup::SetupOutcome::Cancelled) => return 0,
-                Err(error) => { write_diagnostic(&mut diagnostics, &error); return 1; }
+                Err(error) => {
+                    write_diagnostic(&mut diagnostics, &error);
+                    return 1;
+                }
             }
         }
     }
@@ -782,7 +819,7 @@ impl Harness {
                                 sink.emit_event(&ProtocolEvent::AssistantDelta {
                                     text: safe_delta.to_owned(),
                                     turn_id: None,
-                                    request_id: None
+                                    request_id: None,
                                 })
                             })
                         }
@@ -802,8 +839,8 @@ impl Harness {
                         redactor.push(delta, |safe_delta| {
                             sink.emit_event(&ProtocolEvent::AssistantDelta {
                                 text: safe_delta.to_owned(),
-                                    turn_id: None,
-                                    request_id: None
+                                turn_id: None,
+                                request_id: None,
                             })
                         })
                     }),
@@ -813,8 +850,8 @@ impl Harness {
                 .finish(|safe_delta| {
                     sink.emit_event(&ProtocolEvent::AssistantDelta {
                         text: safe_delta.to_owned(),
-                                    turn_id: None,
-                                    request_id: None
+                        turn_id: None,
+                        request_id: None,
                     })
                 })
                 .map_err(|error| format!("unable to write assistant delta: {error}"))?;
@@ -906,8 +943,11 @@ impl Harness {
                 }
                 sink.context_usage(estimate_context_tokens(&self.session.provider_messages()))
                     .map_err(|error| format!("unable to emit context usage: {error}"))?;
-                sink.emit_event(&ProtocolEvent::TurnEnd { turn_id: None, request_id: None })
-                    .map_err(|error| format!("unable to write turn end: {error}"))?;
+                sink.emit_event(&ProtocolEvent::TurnEnd {
+                    turn_id: None,
+                    request_id: None,
+                })
+                .map_err(|error| format!("unable to write turn end: {error}"))?;
                 return Ok(());
             }
 
@@ -916,8 +956,8 @@ impl Harness {
                     id: safe_call.id.clone(),
                     name: safe_call.name.clone(),
                     arguments: safe_call.arguments.clone(),
-                                    turn_id: None,
-                                    request_id: None
+                    turn_id: None,
+                    request_id: None,
                 })
                 .map_err(|error| format!("unable to write tool call: {error}"))?;
             }
@@ -967,8 +1007,8 @@ impl Harness {
                     id: safe_call.id.clone(),
                     name: safe_call.name.clone(),
                     result: result.clone(),
-                                    turn_id: None,
-                                    request_id: None
+                    turn_id: None,
+                    request_id: None,
                 })
                 .map_err(|error| format!("unable to write tool result: {error}"))?;
                 if cancellation.is_some_and(|token| token.is_cancelled()) {
@@ -1012,8 +1052,8 @@ impl Harness {
                             id: pending_call.id.clone(),
                             name: pending_call.name.clone(),
                             result: pending_result.clone(),
-                                    turn_id: None,
-                                    request_id: None
+                            turn_id: None,
+                            request_id: None,
                         })
                         .map_err(|error| format!("unable to write tool result: {error}"))?;
                     }
@@ -1056,8 +1096,8 @@ impl Harness {
                 id: call.id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
-                                    turn_id: None,
-                                    request_id: None
+                turn_id: None,
+                request_id: None,
             }) {
                 event_error.get_or_insert(error);
             }
@@ -1067,8 +1107,8 @@ impl Harness {
                 id: observation.id.clone(),
                 name: observation.name.clone(),
                 result: observation.result.clone(),
-                                    turn_id: None,
-                                    request_id: None
+                turn_id: None,
+                request_id: None,
             }) {
                 event_error.get_or_insert(error);
             }
@@ -1076,8 +1116,8 @@ impl Harness {
         if let Err(error) = sink.emit_event(&ProtocolEvent::TurnInterrupted {
             reason: USER_CANCEL_REASON.to_owned(),
             phase: phase.to_owned(),
-                                    turn_id: None,
-                                    request_id: None
+            turn_id: None,
+            request_id: None,
         }) {
             event_error.get_or_insert(error);
         }
@@ -1408,6 +1448,19 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         version: false,
         command: None,
     };
+    if args.first().is_some_and(|arg| arg == "doctor") {
+        let mut json = false;
+        let mut live = false;
+        for argument in &args[1..] {
+            match argument.as_str() {
+                "--json" if !json => json = true,
+                "--live" if !live => live = true,
+                _ => return Err("usage: lucy doctor [--live] [--json]".to_owned()),
+            }
+        }
+        options.command = Some(CliCommand::Doctor { json, live });
+        return Ok(options);
+    }
     if args.len() == 1 && args[0] == "setup" {
         options.command = Some(CliCommand::Setup);
         return Ok(options);
@@ -1462,7 +1515,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: lucy setup | lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
+                    "usage: lucy setup | lucy doctor [--live] [--json] | lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
                         .to_owned(),
                 );
             }
@@ -1508,6 +1561,7 @@ fn run_codex_command<W: Write, E: Write>(
     diagnostics: &mut E,
 ) -> i32 {
     match command {
+        CliCommand::Doctor { .. } => unreachable!("doctor is dispatched before Codex commands"),
         CliCommand::Setup => unreachable!("setup is dispatched before Codex commands"),
         CliCommand::CodexLogin => match crate::auth::login(home) {
             Ok(_) => {
@@ -1581,7 +1635,10 @@ fn resume_session<W: Write>(
         }
     };
     if !crate::setup::configuration_is_complete(home, &config) {
-        write_diagnostic(diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+        write_diagnostic(
+            diagnostics,
+            "configuration is incomplete; run `lucy setup` in a terminal",
+        );
         return None;
     }
     let auth = match config.resolved_auth() {
