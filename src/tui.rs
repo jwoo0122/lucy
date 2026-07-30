@@ -325,7 +325,10 @@ fn worker_loop(
                     {
                         let message =
                             redact_secret(&error, Some(harness.provider.api_key().as_str()));
-                        let _ = sink.emit_event(&ProtocolEvent::Error { message, request_id: None });
+                        let _ = sink.emit_event(&ProtocolEvent::Error {
+                            message,
+                            request_id: None,
+                        });
                     }
                     let _ = messages.send(WorkerMessage::Finished);
                 }
@@ -342,7 +345,10 @@ fn worker_loop(
                 });
                 if let Err(error) = harness.handle_message(&text, &mut sink, Some(&cancel), None) {
                     let message = redact_secret(&error, Some(harness.provider.api_key().as_str()));
-                    let _ = sink.emit_event(&ProtocolEvent::Error { message, request_id: None });
+                    let _ = sink.emit_event(&ProtocolEvent::Error {
+                        message,
+                        request_id: None,
+                    });
                 }
                 let _ = messages.send(WorkerMessage::Finished);
             }
@@ -1617,9 +1623,9 @@ impl UiState {
                 name,
                 arguments,
             }),
-            ProtocolEvent::ToolResult { id, name, result, .. } => {
-                self.add_live_tool_result(&id, &name, result)
-            }
+            ProtocolEvent::ToolResult {
+                id, name, result, ..
+            } => self.add_live_tool_result(&id, &name, result),
             ProtocolEvent::TurnEnd { .. } => {
                 self.complete_reasoning();
                 self.set_status("finalizing");
@@ -1632,7 +1638,10 @@ impl UiState {
                 self.transcript
                     .push(TranscriptItem::Info(format!("! {reason} ({phase})")));
             }
-            ProtocolEvent::Error { message, request_id: None } => {
+            ProtocolEvent::Error {
+                message,
+                request_id: None,
+            } => {
                 self.complete_reasoning();
                 self.set_status("error");
                 self.transcript.push(TranscriptItem::Error(message));
@@ -4988,7 +4997,10 @@ mod tests {
         );
         state.busy = true;
         state.active_cancel = Some(CancellationToken::new());
-        state.apply_event(ProtocolEvent::TurnEnd { turn_id: None, request_id: None });
+        state.apply_event(ProtocolEvent::TurnEnd {
+            turn_id: None,
+            request_id: None,
+        });
         assert!(state.busy);
         assert!(state.active_cancel.is_some());
         assert_eq!(state.status, "finalizing");
