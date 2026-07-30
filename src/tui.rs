@@ -780,6 +780,24 @@ fn supports_keyboard_enhancement() -> bool {
     false
 }
 
+/// Read-only terminal capability snapshot used by `lucy doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalCapabilities {
+    pub background: Option<String>,
+    pub keyboard_enhancement: bool,
+}
+
+pub(crate) fn diagnostic_capabilities(query_background: bool) -> TerminalCapabilities {
+    let background = query_background
+        .then(|| terminal_palette().terminal_background)
+        .flatten()
+        .map(|(red, green, blue)| format!("#{red:02X}{green:02X}{blue:02X}"));
+    TerminalCapabilities {
+        background,
+        keyboard_enhancement: supports_keyboard_enhancement(),
+    }
+}
+
 /// Whether the process is running inside a tmux session.
 fn is_inside_tmux() -> bool {
     std::env::var("TERM_PROGRAM")

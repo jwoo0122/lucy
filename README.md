@@ -76,6 +76,21 @@ provider = "codex_subscription"
 model = "gpt-5.3-codex"
 ```
 
+## Troubleshooting
+
+Run static configuration, storage, authentication, provider-metadata, shell, terminal, and protocol checks without creating a conversation session:
+
+```sh
+lucy doctor
+lucy doctor --json
+```
+
+Use `lucy doctor --live` only when you explicitly want one bounded provider streaming request that may incur provider cost. It validates Lucy's `cmd` request schema but never executes a model-selected command. JSON reports are secret-redacted and suitable for issue filing:
+
+```json
+{"version":1,"ok":true,"checks":[{"id":"config.toml","status":"pass","message":"configuration TOML is valid"}]}
+```
+
 ## Usage
 
 Run Lucy in a terminal to start the TUI. Use the release binary path when building from source:

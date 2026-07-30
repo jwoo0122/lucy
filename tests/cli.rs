@@ -154,7 +154,7 @@ fn read_request(stream: TcpStream, deadline: Instant) -> (TcpStream, String) {
                 .then(|| value.trim().parse::<usize>().ok())
         })
         .flatten()
-        .expect("content length");
+        .unwrap_or(0);
     let mut body = vec![0_u8; content_length];
     set_read_deadline(reader.get_ref(), deadline, "request body");
     reader
@@ -593,7 +593,7 @@ fn parse_lines(output: &[u8]) -> Vec<Value> {
 }
 
 #[test]
-fn cmd_inherits_provider_key_but_redacts_captured_output() {
+fn cmd_removes_provider_key_and_preserves_ordinary_environment() {
     let server = MockServer::start(vec![
         provider_environment_tool_response(),
         normal_response("finished"),
@@ -617,7 +617,7 @@ fn cmd_inherits_provider_key_but_redacts_captured_output() {
         .iter()
         .find(|record| record["type"] == "tool_result")
         .expect("tool result event");
-    assert_eq!(tool_result["result"]["stdout"], "[REDACTED]");
+    assert_eq!(tool_result["result"]["stdout"], "");
     assert_eq!(tool_result["result"]["stderr"], "ordinary-value");
     assert!(!serde_json::to_string(tool_result)
         .expect("tool result JSON")
@@ -657,7 +657,8 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
     assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
 
     let records = parse_lines(&output.stdout);
-    assert_eq!(records[0]["type"], "session");
+    assert_eq!(records[0]["type"], "protocol");
+    assert_eq!(records[1]["type"], "session");
     assert!(records
         .iter()
         .any(|record| record["type"] == "assistant_delta"));
@@ -733,7 +734,7 @@ fn reasoning_details_survive_tool_follow_up_and_session_resume_without_public_ou
     let first_output = String::from_utf8_lossy(&first.stdout);
     assert!(!first_output.contains("reasoning_details"));
     assert!(!first_output.contains("private reasoning"));
-    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+    let session_id = parse_lines(&first.stdout)[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -1628,7 +1629,8 @@ fn forced_jsonl_keeps_the_machine_protocol() {
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     let records = parse_lines(&output.stdout);
-    assert_eq!(records[0]["type"], "session");
+    assert_eq!(records[0]["type"], "protocol");
+    assert_eq!(records[1]["type"], "session");
     assert!(records.iter().any(|record| record["type"] == "turn_end"));
     assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(home).expect("cleanup");
@@ -1790,7 +1792,7 @@ fn resume_reloads_model_and_effort_from_config() {
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
     let first_records = parse_lines(&first.stdout);
-    let session_id = first_records[0]["session_id"]
+    let session_id = first_records[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -1830,7 +1832,7 @@ fn resume_rejects_malformed_current_config_without_leaking_secrets() {
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
     let first_records = parse_lines(&first.stdout);
-    let session_id = first_records[0]["session_id"]
+    let session_id = first_records[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -1994,7 +1996,7 @@ fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
         "{\"type\":\"message\",\"text\":\"start session\"}\n",
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
-    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+    let session_id = parse_lines(&first.stdout)[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -2034,7 +2036,7 @@ fn resumed_session_uses_original_instruction_snapshot_after_source_edit() {
         "{\"type\":\"message\",\"text\":\"first request\"}\n",
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
-    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+    let session_id = parse_lines(&first.stdout)[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -2074,11 +2076,11 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
     let first_records = parse_lines(&first.stdout);
-    let session_id = first_records[0]["session_id"]
+    let session_id = first_records[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
-    assert_eq!(first_records[0]["resumed"], false);
+    assert_eq!(first_records[1]["resumed"], false);
 
     let session_path = home
         .join(".lucy/sessions")
@@ -2107,8 +2109,8 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     );
     assert!(second.status.success(), "stderr: {:?}", second.stderr);
     let second_records = parse_lines(&second.stdout);
-    assert_eq!(second_records[0]["session_id"], session_id);
-    assert_eq!(second_records[0]["resumed"], true);
+    assert_eq!(second_records[1]["session_id"], session_id);
+    assert_eq!(second_records[1]["resumed"], true);
     assert!(second_records
         .iter()
         .any(|record| record["type"] == "assistant_delta" && record["text"] == "second answer"));
@@ -2335,10 +2337,309 @@ fn jsonl_with_incomplete_config_fails_without_prompts_or_terminal_sequences() {
     let stderr = String::from_utf8(output.stderr).expect("stderr");
     assert_eq!(
         stderr,
-        "!: configuration is incomplete; run `lucy setup` in a terminal\n"
+        "!: configuration is incomplete; run `lucy setup` in a terminal, then `lucy doctor`\n"
     );
     assert!(!stderr.contains("Connection:"));
     assert!(!stderr.contains('\u{1b}'));
     assert!(!home.join(".lucy/sessions").exists());
     fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn doctor_json_missing_config_is_stable_and_leaves_no_session_state() {
+    let (home, project) = temporary_tree("doctor-missing");
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let text = String::from_utf8(output.stdout).expect("doctor JSON");
+    let report: Value = serde_json::from_str(&text).expect("report");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["ok"], false);
+    assert!(report["checks"].as_array().is_some_and(|checks| checks
+        .iter()
+        .any(|check| check["id"] == "config.file" && check["status"] == "fail")));
+    assert!(!text.contains('\u{1b}'));
+    assert!(!home.join(".lucy").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn doctor_json_loads_metadata_without_exposing_the_key_or_creating_a_session() {
+    let server = MockServer::start(vec![json!({"data":[{"id":"mock-model","context_length":12345,"supported_reasoning_efforts":["low","high"]}]}).to_string()]);
+    let (home, project) = temporary_tree("doctor-valid");
+    write_config(&home, &server.base_url, "ignored", "mock-model");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home.join(".config/lucy"), fs::Permissions::from_mode(0o700))
+            .expect("directory mode");
+        fs::set_permissions(
+            home.join(".config/lucy/config.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("file mode");
+    }
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    let text = String::from_utf8(output.stdout).expect("doctor JSON");
+    assert!(
+        output.status.success(),
+        "stderr: {} report: {text}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!text.contains("provider-secret"));
+    let report: Value = serde_json::from_str(&text).expect("report");
+    let metadata = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "provider.metadata")
+        .unwrap();
+    assert_eq!(metadata["status"], "pass");
+    assert_eq!(metadata["details"]["context_window"], 12345);
+    assert!(!home.join(".lucy/sessions").exists());
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn doctor_human_writes_only_stderr_and_invalid_forms_are_usage_errors() {
+    let (home, project) = temporary_tree("doctor-human");
+    let output = run_lucy(&home, &project, &["doctor"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("[FAIL] config.file"));
+    let invalid = run_lucy(&home, &project, &["doctor", "--json", "--json"], "");
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_rejects_symlinked_config_without_reading_or_mutating_it() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let (home, project) = temporary_tree("doctor-config-symlink");
+    let directory = home.join(".config/lucy");
+    fs::create_dir_all(&directory).expect("config directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).expect("directory mode");
+    let target = home.join("secret-config");
+    fs::write(&target, "provider-secret").expect("target");
+    symlink(&target, directory.join("config.toml")).expect("config symlink");
+    let before = fs::read(&target).expect("before");
+
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).expect("report");
+    assert!(!text.contains("provider-secret"));
+    let report: Value = serde_json::from_str(&text).expect("JSON");
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["id"] == "config.file" && check["status"] == "fail"));
+    assert_eq!(fs::read(&target).expect("after"), before);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn doctor_distinguishes_unsupported_http_and_parse_metadata_failures() {
+    fn report_for(response: &str, name: &str) -> Value {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("address");
+        let response = response.to_owned();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).expect("header") > 0 && line != "\r\n" {
+                line.clear();
+            }
+            stream.write_all(response.as_bytes()).expect("response");
+        });
+        let (home, project) = temporary_tree(name);
+        write_config(
+            &home,
+            &format!("http://{address}/v1"),
+            "ignored",
+            "mock-model",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(home.join(".config/lucy"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fs::set_permissions(
+                home.join(".config/lucy/config.toml"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+        server.join().expect("server");
+        let report = serde_json::from_slice(&output.stdout).expect("report");
+        fs::remove_dir_all(home).expect("cleanup");
+        report
+    }
+    let unsupported = report_for(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "doctor-unsupported",
+    );
+    let check = unsupported["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "provider.metadata")
+        .unwrap();
+    assert_eq!(check["status"], "warning");
+    assert_eq!(check["details"]["http_status"], 404);
+
+    let body = "not-json";
+    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let parsed = report_for(&response, "doctor-parse");
+    let check = parsed["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "provider.metadata")
+        .unwrap();
+    assert_eq!(check["status"], "fail");
+    assert!(check["message"].as_str().unwrap().contains("parsed"));
+}
+
+#[test]
+fn doctor_live_makes_one_inference_request_without_tools_or_persistent_mutation() {
+    let metadata = json!({"data":[{"id":"mock-model","context_length":12345}]}).to_string();
+    let chunk = json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}).to_string();
+    let stream = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+    let server = MockServer::start(vec![metadata, stream]);
+    let (home, project) = temporary_tree("doctor-live");
+    write_config(&home, &server.base_url, "ignored", "mock-model");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home.join(".config/lucy"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            home.join(".config/lucy/config.toml"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let config_before = fs::read(home.join(".config/lucy/config.toml")).unwrap();
+    let output = run_lucy(&home, &project, &["doctor", "--live", "--json"], "");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == "provider.live" && c["status"] == "pass"));
+    let requests = server.join();
+    assert_eq!(requests.len(), 2); // one metadata request and exactly one inference request
+    let live: Value = serde_json::from_str(&requests[1]).unwrap();
+    assert_eq!(live["stream"], true);
+    assert_eq!(live["tools"][0]["function"]["name"], "cmd");
+    assert_eq!(
+        fs::read(home.join(".config/lucy/config.toml")).unwrap(),
+        config_before
+    );
+    assert!(!home.join(".lucy").exists());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_rejects_symlinked_session_path_without_touching_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let server = MockServer::start(vec![json!({"data":[{"id":"mock-model"}]}).to_string()]);
+    let (home, project) = temporary_tree("doctor-session-symlink");
+    write_config(&home, &server.base_url, "ignored", "mock-model");
+    fs::set_permissions(home.join(".config/lucy"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(
+        home.join(".config/lucy/config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let target = home.join("target-sessions");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("marker"), b"unchanged").unwrap();
+    fs::create_dir(home.join(".lucy")).unwrap();
+    symlink(&target, home.join(".lucy/sessions")).unwrap();
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == "session.storage" && c["status"] == "fail"));
+    assert_eq!(fs::read(target.join("marker")).unwrap(), b"unchanged");
+    assert_eq!(fs::read_link(home.join(".lucy/sessions")).unwrap(), target);
+    server.join();
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_does_not_contact_provider_from_unsafe_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (home, project) = temporary_tree("doctor-unsafe-config-no-network");
+    write_config(
+        &home,
+        &format!("http://{address}/v1"),
+        "ignored",
+        "mock-model",
+    );
+    fs::set_permissions(home.join(".config/lucy"), fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(
+        home.join(".config/lucy/config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn doctor_rejects_effort_not_advertised_by_selected_model() {
+    let server = MockServer::start(vec![
+        json!({"data":[{"id":"mock-model","supported_reasoning_efforts":["low"]}]}).to_string(),
+    ]);
+    let (home, project) = temporary_tree("doctor-effort-mismatch");
+    write_config(&home, &server.base_url, "ignored", "mock-model");
+    let path = home.join(".config/lucy/config.toml");
+    let config = fs::read_to_string(&path).unwrap().replace(
+        "model = \"mock-model\"",
+        "model = \"mock-model\"\neffort = \"high\"",
+    );
+    fs::write(&path, config).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(home.join(".config/lucy"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let output = run_lucy(&home, &project, &["doctor", "--json"], "");
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == "provider.metadata"
+            && c["status"] == "fail"
+            && c["message"].as_str().unwrap().contains("effort")));
+    server.join();
+    fs::remove_dir_all(home).unwrap();
 }

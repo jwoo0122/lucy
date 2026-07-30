@@ -12,7 +12,10 @@ use crate::auth::{
 use crate::cancellation::CancellationToken;
 use crate::config::LlmSettings;
 use crate::model::{ChatMessage, ChatToolCall, OBSERVATION_ROLE};
-use crate::provider::{ProviderError, ProviderModel, ProviderStreamEvent, ProviderTurn};
+use crate::provider::{
+    DiagnosticFailure, DiagnosticFailureKind, DiagnosticMetadata, ProviderError, ProviderModel,
+    ProviderStreamEvent, ProviderTurn,
+};
 use crate::redaction::{redact_secret, redaction_marker};
 
 pub const CODEX_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -111,6 +114,38 @@ impl CodexProvider {
 
     pub fn api_key_env(&self) -> &str {
         CODEX_ENV_SENTINEL
+    }
+
+    pub(crate) fn diagnostic_metadata(&self) -> Result<DiagnosticMetadata, DiagnosticFailure> {
+        let catalog = self.model_catalog().map_err(|error| {
+            let message = error.to_string().to_ascii_lowercase();
+            let kind = if message.contains("not logged in") || message.contains("credentials") {
+                DiagnosticFailureKind::Login
+            } else if message.contains("refresh") || message.contains("oauth") {
+                DiagnosticFailureKind::Refresh
+            } else if message.contains("http status") {
+                DiagnosticFailureKind::Http
+            } else if message.contains("invalid") || message.contains("empty") {
+                DiagnosticFailureKind::Parse
+            } else if message.contains("unable to load") || message.contains("request") {
+                DiagnosticFailureKind::Transport
+            } else {
+                DiagnosticFailureKind::Catalog
+            };
+            let http_status = message
+                .split("http status ")
+                .nth(1)
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse().ok());
+            DiagnosticFailure { kind, http_status }
+        })?;
+        Ok(DiagnosticMetadata {
+            selected_context_window: catalog
+                .iter()
+                .find(|entry| entry.model.id == self.model)
+                .and_then(|entry| entry.context_window),
+            models: catalog.into_iter().map(|entry| entry.model).collect(),
+        })
     }
 
     pub fn models(&self) -> Vec<ProviderModel> {
@@ -301,6 +336,31 @@ impl CodexProvider {
                 }
             }
         }
+    }
+
+    pub(crate) fn diagnostic_live_once(
+        &self,
+        messages: &[ChatMessage],
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderTurn, ProviderError> {
+        let (access, account_id) = self.access_token()?;
+        let request = codex_request(
+            &self.model,
+            messages,
+            &self.effort,
+            true,
+            self.session_id.as_deref(),
+        );
+        let response =
+            self.send_request_cancellable(&request, &access, &account_id, cancellation)?;
+        if !response.status().is_success() {
+            return Err(ProviderError::new(format!(
+                "Codex provider returned HTTP status {}",
+                response.status().as_u16()
+            )));
+        }
+        parse_stream_cancellable(response, access, cancellation, on_event)
     }
 
     pub fn stream_chat(

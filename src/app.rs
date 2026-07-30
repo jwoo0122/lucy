@@ -34,6 +34,7 @@ enum CliCommand {
     CodexLogin,
     CodexLogout,
     Setup,
+    Doctor { json: bool, live: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +165,18 @@ where
         }
         return 0;
     }
+    if let Some(CliCommand::Doctor { json, live }) = options.command {
+        let report = crate::doctor::run(home, cwd, live, stdin_is_tty, stdout_is_tty, !json);
+        if json {
+            if serde_json::to_writer(&mut output, &report).is_err() || writeln!(output).is_err() {
+                write_diagnostic(&mut diagnostics, "unable to write doctor report");
+                return 1;
+            }
+        } else if report.write_human(&mut diagnostics).is_err() {
+            return 1;
+        }
+        return report.exit_code();
+    }
     if let Some(command) = options.command {
         if command == CliCommand::Setup {
             if !(stdin_is_tty && stdout_is_tty) {
@@ -222,7 +235,7 @@ where
         };
         if !crate::setup::configuration_is_complete(home, &config) {
             if mode == FrontendMode::Jsonl {
-                write_diagnostic(&mut diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+                write_diagnostic(&mut diagnostics, "configuration is incomplete; run `lucy setup` in a terminal, then `lucy doctor`");
                 return 1;
             }
             match crate::setup::run(home, &mut input, &mut output) {
@@ -1408,6 +1421,19 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         version: false,
         command: None,
     };
+    if args.first().is_some_and(|arg| arg == "doctor") {
+        let mut json = false;
+        let mut live = false;
+        for argument in &args[1..] {
+            match argument.as_str() {
+                "--json" if !json => json = true,
+                "--live" if !live => live = true,
+                _ => return Err("usage: lucy doctor [--live] [--json]".to_owned()),
+            }
+        }
+        options.command = Some(CliCommand::Doctor { json, live });
+        return Ok(options);
+    }
     if args.len() == 1 && args[0] == "setup" {
         options.command = Some(CliCommand::Setup);
         return Ok(options);
@@ -1462,7 +1488,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: lucy setup | lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
+                    "usage: lucy setup | lucy doctor [--live] [--json] | lucy [--version] [--jsonl|--tui] [--session <id>] [--list-sessions] | lucy codex <login|logout>"
                         .to_owned(),
                 );
             }
@@ -1508,6 +1534,7 @@ fn run_codex_command<W: Write, E: Write>(
     diagnostics: &mut E,
 ) -> i32 {
     match command {
+        CliCommand::Doctor { .. } => unreachable!("doctor is dispatched before Codex commands"),
         CliCommand::Setup => unreachable!("setup is dispatched before Codex commands"),
         CliCommand::CodexLogin => match crate::auth::login(home) {
             Ok(_) => {
@@ -1581,7 +1608,7 @@ fn resume_session<W: Write>(
         }
     };
     if !crate::setup::configuration_is_complete(home, &config) {
-        write_diagnostic(diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+        write_diagnostic(diagnostics, "configuration is incomplete; run `lucy setup` in a terminal, then `lucy doctor`");
         return None;
     }
     let auth = match config.resolved_auth() {

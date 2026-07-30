@@ -82,7 +82,7 @@ Interactive users receive a terminal chat experience, while scripts and other ag
 
 ## Enforcement
 
-Integration tests MUST exercise TTY and non-TTY mode selection, JSONL input/output, normalized text streaming, the `cmd` tool loop, explicit skill invocation and snapshot persistence, stdout purity, session creation/resume across separate processes, and interruption ordering. Provider tests MUST verify that `cmd` remains the only model-facing tool. Tests MUST also verify that provider-specific streams are not forwarded as public events, no subagent/background-result protocol or session records are emitted, and a `cmd` child inherits ordinary environment variables including the configured provider key while credentials remain absent from protocol, diagnostics, and persisted records. Compaction tests MUST verify that summary requests expose no tools and occur only at complete provider/cmd boundaries.
+Integration tests MUST exercise TTY and non-TTY mode selection, JSONL input/output, normalized text streaming, the `cmd` tool loop, explicit skill invocation and snapshot persistence, stdout purity, session creation/resume across separate processes, and interruption ordering. Provider tests MUST verify that `cmd` remains the only model-facing tool. Tests MUST also verify that provider-specific streams are not forwarded as public events, no subagent/background-result protocol or session records are emitted, and a `cmd` child inherits ordinary environment variables while the configured provider-key variable is removed before spawn and credentials remain absent from protocol, diagnostics, and persisted records. Compaction tests MUST verify that summary requests expose no tools and occur only at complete provider/cmd boundaries.
 
 ## Revisit when
 

@@ -160,6 +160,29 @@ pub struct ProviderModel {
     pub efforts: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiagnosticFailureKind {
+    Transport,
+    Http,
+    Parse,
+    Unsupported,
+    Login,
+    Refresh,
+    Catalog,
+}
+
+#[derive(Debug)]
+pub(crate) struct DiagnosticFailure {
+    pub kind: DiagnosticFailureKind,
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticMetadata {
+    pub models: Vec<ProviderModel>,
+    pub selected_context_window: Option<usize>,
+}
+
 pub struct Provider {
     client: Client,
     async_client: AsyncClient,
@@ -414,6 +437,97 @@ impl Provider {
 
     pub fn api_key_env(&self) -> &str {
         &self.api_key_env
+    }
+
+    pub(crate) fn diagnostic_metadata(&self) -> Result<DiagnosticMetadata, DiagnosticFailure> {
+        if let Some(codex) = &self.codex {
+            return codex.diagnostic_metadata();
+        }
+        let Some(base_url) = self.endpoint.strip_suffix("/chat/completions") else {
+            return Err(DiagnosticFailure {
+                kind: DiagnosticFailureKind::Parse,
+                http_status: None,
+            });
+        };
+        let response = self
+            .client
+            .get(format!("{base_url}/models"))
+            .bearer_auth(&self.api_key)
+            .timeout(MODEL_METADATA_TIMEOUT)
+            .send()
+            .map_err(|_| DiagnosticFailure {
+                kind: DiagnosticFailureKind::Transport,
+                http_status: None,
+            })?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let kind = if matches!(status, 404 | 405 | 501) {
+                DiagnosticFailureKind::Unsupported
+            } else {
+                DiagnosticFailureKind::Http
+            };
+            return Err(DiagnosticFailure {
+                kind,
+                http_status: Some(status),
+            });
+        }
+        let bytes = response.bytes().map_err(|_| DiagnosticFailure {
+            kind: DiagnosticFailureKind::Transport,
+            http_status: None,
+        })?;
+        if bytes.len() > MAX_MODEL_METADATA_BYTES {
+            return Err(DiagnosticFailure {
+                kind: DiagnosticFailureKind::Parse,
+                http_status: None,
+            });
+        }
+        let payload: Value = serde_json::from_slice(&bytes).map_err(|_| DiagnosticFailure {
+            kind: DiagnosticFailureKind::Parse,
+            http_status: None,
+        })?;
+        let entries = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(DiagnosticFailure {
+                kind: DiagnosticFailureKind::Parse,
+                http_status: None,
+            })?;
+        let mut models = entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry
+                    .get("id")
+                    .or_else(|| entry.get("name"))
+                    .and_then(Value::as_str)?
+                    .trim();
+                (!id.is_empty()).then(|| ProviderModel {
+                    id: id.to_owned(),
+                    efforts: model_efforts(entry),
+                })
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+        Ok(DiagnosticMetadata {
+            selected_context_window: context_window_from_models(&payload, &self.model),
+            models,
+        })
+    }
+
+    pub(crate) fn diagnostic_live_once(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<ProviderTurn, ProviderError> {
+        let cancellation = CancellationToken::new();
+        let mut ignored = |_event| Ok(());
+        if let Some(codex) = &self.codex {
+            return codex.diagnostic_live_once(messages, &mut ignored, &cancellation);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ProviderError::new("unable to initialize provider runtime"))?;
+        runtime.block_on(self.stream_chat_async_once(messages, &mut ignored, &cancellation, true))
     }
 
     pub(crate) fn models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
