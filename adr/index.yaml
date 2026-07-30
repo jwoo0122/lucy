@@ -41,8 +41,8 @@ decisions:
     status: accepted
     scope: harness
     decision_type: execution
-    summary: Lucy executes trusted shell commands locally with bounded time and output,
-      including process-scoped background execution.
+    summary: Lucy executes model-selected shell commands locally with bounded time
+      and output, including process-scoped background execution.
     applies_to:
       - src/**
       - tests/**
@@ -54,7 +54,7 @@ decisions:
       - harness.session-and-context-lifecycle
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-07-22'
+    last_reviewed: '2026-07-30'
     enforcement:
       - id: background-command-contract
         path: tests/cli.rs

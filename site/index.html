@@ -553,7 +553,7 @@
           <article class="principle" data-reveal>
             <span class="principle-number">01</span>
             <h3>A single sharp edge</h3>
-            <p><code>cmd</code> is the only model-facing tool. The AI works through the shell it already understands, from your project directory, without a parallel suite of file tools.</p>
+            <p><code>cmd</code> is the only model-facing tool. Commands run with your user privileges; Lucy bounds execution but is not a sandbox. <a href="https://github.com/jwoo0122/lucy/blob/main/docs/trust-model.md">Read the trust model.</a></p>
           </article>
           <article class="principle" data-reveal style="--reveal-delay: 80ms">
             <span class="principle-number">02</span>
@@ -603,7 +603,7 @@
             <span class="step-number">03</span>
             <div>
               <h3>Run</h3>
-              <p>Start the TUI in a terminal. Pipe JSONL and Lucy automatically becomes a machine interface over the same turn engine.</p>
+              <p>Start the TUI in a terminal. Pipe JSONL and Lucy automatically becomes a machine interface over the same turn engine. Use external isolation for untrusted repositories.</p>
               <div class="command">
                 <code>lucy</code>
                 <button class="copy-btn" type="button" data-command="lucy" aria-label="Copy run command">copy</button>

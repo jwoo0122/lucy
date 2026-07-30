@@ -7,14 +7,14 @@ applies_to:
   - "src/**"
   - "tests/**"
   - "README.md"
-summary: Lucy executes trusted shell commands locally with bounded time and output, including process-scoped background execution.
+summary: Lucy executes model-selected shell commands locally with bounded time and output, including process-scoped background execution.
 constrains: []
 depends_on:
   - harness.agent-boundary-and-protocol
   - harness.session-and-context-lifecycle
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-22"
+last_reviewed: "2026-07-30"
 enforcement:
   - id: background-command-contract
     path: tests/cli.rs
@@ -49,7 +49,7 @@ enforcement:
 enforcement_exception: null
 ---
 
-# Trusted local command execution
+# Bounded, default-allow command execution
 
 ## Decision question
 
@@ -63,7 +63,7 @@ Each command MUST have a 10-minute timeout. A `cmd` call MAY set `background: tr
 
 ## Context and forces
 
-The model is explicitly trusted and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy treats the command environment as a trusted terminal environment and redacts the provider credential from captured/persisted tool output. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; however, shell startup files or commands may independently reintroduce credentials, so this does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the protocol or consuming the model context without limit.
+The model is explicitly authorized to select commands and the harness is local-only, so v1 does not add approval, sandboxing, or an allowlist. Lucy runs commands in the ordinary user terminal environment and redacts the provider credential from captured/persisted tool output. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; however, shell startup files or commands may independently reintroduce credentials, so this does not provide OS-level isolation from parent-process inspection or transformed side channels. Bounds are required to prevent a hung or unbounded command from blocking the protocol or consuming the model context without limit.
 
 ## Invariants
 
@@ -90,7 +90,7 @@ A dedicated argv API would reduce shell interpretation but would not satisfy the
 
 ## Consequences
 
-A background completion can no longer carry harness-level authority, so a model that treats delimited command output as an instruction is a model-side failure rather than a harness-granted privilege. Commands that exceed the timeout or output cap require the model to rerun them with narrower output or a shorter operation. Background completion can create an automatic provider request after control has returned to the user, but provider requests remain serialized. A trusted command can still inspect Lucy or exfiltrate transformed data outside the direct-output guarantee. The shell behavior is Unix-specific until a future platform decision is made.
+A background completion can no longer carry harness-level authority, so a model that treats delimited command output as an instruction is a model-side failure rather than a harness-granted privilege. Commands that exceed the timeout or output cap require the model to rerun them with narrower output or a shorter operation. Background completion can create an automatic provider request after control has returned to the user, but provider requests remain serialized. A model-selected command can still inspect Lucy or exfiltrate transformed data outside the direct-output guarantee. The shell behavior is Unix-specific until a future platform decision is made.
 
 ## Enforcement
 
@@ -98,4 +98,4 @@ Integration tests MUST cover successful commands, non-zero exit codes, inherited
 
 ## Revisit when
 
-Reconsider this decision if callers need Windows, interactive stdin, durable background-job recovery, explicit job polling/stopping, persistent shell state, or stronger isolation than a trusted local shell.
+Reconsider this decision if callers need Windows, interactive stdin, durable background-job recovery, explicit job polling/stopping, persistent shell state, or stronger isolation than a user-privileged local shell.

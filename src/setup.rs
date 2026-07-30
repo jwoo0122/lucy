@@ -134,7 +134,7 @@ fn run_inner<R: BufRead, W: Write>(
     Config::save_setup(home, &selection).map_err(|error| error.to_string())?;
     writeln!(
         output,
-        "Configuration saved to {}. Run `lucy doctor` to verify it.",
+        "Configuration saved to {}. Run `lucy doctor` to verify it. Trust model: https://github.com/jwoo0122/lucy/blob/main/docs/trust-model.md.",
         config_path(home).display()
     )
     .map_err(io_error)?;

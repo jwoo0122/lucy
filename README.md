@@ -14,7 +14,7 @@
 
 ## Project purpose
 
-Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects an OpenAI-compatible Chat Completions provider or a Codex subscription provider and exposes a model-facing `cmd` tool, with both an interactive TUI and a JSONL session interface for automation powered by the same turn engine.
+Lucy is a lightweight local coding-agent harness for macOS and Linux. By default, it authorizes the model to run arbitrary shell commands with the invoking user's OS privileges; a configured deny policy can reject commands before spawn. Lucy is not a sandbox. Read the [trust model](docs/trust-model.md) before use. It connects an OpenAI-compatible Chat Completions provider or a Codex subscription provider and exposes a model-facing `cmd` tool, with both an interactive TUI and a JSONL session interface for automation powered by the same turn engine.
 
 ## Installation
 
@@ -76,9 +76,18 @@ provider = "codex_subscription"
 model = "gpt-5.3-codex"
 ```
 
+## Command deny policy
+
+Execution is default-allow. To add a user-owned guardrail, set `execution.policy` to an executable hook path in `config.toml`. Lucy evaluates a successfully loaded hook before spawning each foreground or background model `cmd` command. A denial is not OS isolation: allowed commands run with your user privileges and may reach equivalent effects through other programs or modify owner-writable policy files. See the [command-policy contract](docs/command-policy.md) and [trust model](docs/trust-model.md).
+
+```toml
+[execution]
+policy = "~/.config/lucy/deny-policy.sh"
+```
+
 ## Troubleshooting
 
-Run static configuration, storage, authentication, provider-metadata, shell, terminal, and protocol checks without creating a conversation session:
+Security-sensitive diagnostics follow the [diagnostics contract](docs/diagnostics.md) and [trust model](docs/trust-model.md). Run configuration, storage, authentication, provider-metadata, shell, terminal, and protocol checks without creating a conversation session:
 
 ```sh
 lucy doctor
@@ -116,9 +125,9 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
 - **Tool activity UI:** Renders `cmd` as a compact one-line card. The main-agent ready/working indicator appears in the bottom status line, and the prompt border uses a left-to-right teal-to-green gradient.
 - **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification for completion, cancellation, or error when the terminal supports it; JSONL output is unchanged.
-- **Safe local command execution:** Runs trusted `cmd` shell commands from the session's starting directory with time and output limits. Commands may set `background: true` to return a background ID immediately; Lucy delivers the bounded completion result to the model automatically, including through a follow-up turn after the originating turn ends.
+- **Bounded, default-allow command execution:** Runs model-selected `cmd` shell commands with the invoking user's privileges from the session's starting directory with time and output limits. Commands may set `background: true` to return a background ID immediately; Lucy delivers the bounded completion result to the model automatically, including through a follow-up turn after the originating turn ends.
 - **Agent process boundary:** Other agents can invoke `lucy --jsonl` through `cmd`, capture the returned `session_id`, and continue the conversation with `lucy --jsonl --session <id>`. Lucy does not coordinate relationships between independent sessions.
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
 - **Context and skills:** Composes built-in guidance with the working directory, README files, global `$XDG_CONFIG_HOME/lucy/AGENTS.md` (or `~/.config/lucy/AGENTS.md`), project `AGENTS.md`/`CLAUDE.md`, and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
 - **Automatic context compaction:** At 95% estimated context usage, safely summarizes older complete turns with the configured model, retains recent context, and resumes the active turn without rewriting session history.
-- **Credential protection:** OpenRouter API keys are read only from environment variables and are not written to configuration, sessions, the public protocol, or diagnostics. Codex subscription tokens are stored in Lucy's private credential store and are never exposed to model tools or persisted sessions. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; shell startup files may still reintroduce credentials independently.
+- **Credential protection:** OpenRouter API keys are read only from environment variables and are not written to configuration, sessions, the public protocol, or diagnostics. Codex subscription tokens are stored in Lucy's private credential store, are not injected into model-tool environments, and are not persisted in sessions. An unsandboxed command running as you may still read the credential file. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; shell startup files may still reintroduce credentials independently.
