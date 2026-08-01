@@ -388,7 +388,7 @@ mod tests {
     fn unconfigured_to_json_is_empty() {
         let outcome = PolicyOutcome::Unconfigured;
         let json = outcome.to_json("echo hi");
-        assert!(json.as_object().map_or(false, |obj| obj.is_empty()));
+        assert!(json.as_object().is_some_and(|obj| obj.is_empty()));
     }
 
     #[test]
