@@ -20,10 +20,7 @@ pub enum ProtocolEvent {
         capabilities: Vec<&'static str>,
     },
     #[serde(rename = "session")]
-    Session {
-        session_id: String,
-        resumed: bool,
-    },
+    Session { session_id: String, resumed: bool },
     /// A chunk of assistant text streamed from the provider.
     #[serde(rename = "assistant_delta")]
     AssistantDelta {
@@ -265,11 +262,7 @@ impl<W: Write> ProtocolWriter<W> {
         self.error_correlated(message, None)
     }
 
-    pub fn error_correlated(
-        &mut self,
-        message: &str,
-        request_id: Option<&str>,
-    ) -> io::Result<()> {
+    pub fn error_correlated(&mut self, message: &str, request_id: Option<&str>) -> io::Result<()> {
         self.emit(&ProtocolEvent::Error {
             message: message.to_owned(),
             request_id: request_id.map(str::to_owned),
