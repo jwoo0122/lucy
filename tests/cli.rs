@@ -657,7 +657,8 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
     assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
 
     let records = parse_lines(&output.stdout);
-    assert_eq!(records[0]["type"], "session");
+    assert_eq!(records[0]["type"], "protocol");
+    assert_eq!(records[1]["type"], "session");
     assert!(records
         .iter()
         .any(|record| record["type"] == "assistant_delta"));
@@ -733,7 +734,7 @@ fn reasoning_details_survive_tool_follow_up_and_session_resume_without_public_ou
     let first_output = String::from_utf8_lossy(&first.stdout);
     assert!(!first_output.contains("reasoning_details"));
     assert!(!first_output.contains("private reasoning"));
-    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+    let session_id = parse_lines(&first.stdout)[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -1628,7 +1629,8 @@ fn forced_jsonl_keeps_the_machine_protocol() {
     );
     assert!(output.status.success(), "stderr: {:?}", output.stderr);
     let records = parse_lines(&output.stdout);
-    assert_eq!(records[0]["type"], "session");
+    assert_eq!(records[0]["type"], "protocol");
+    assert_eq!(records[1]["type"], "session");
     assert!(records.iter().any(|record| record["type"] == "turn_end"));
     assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(home).expect("cleanup");
@@ -1790,7 +1792,7 @@ fn resume_reloads_model_and_effort_from_config() {
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
     let first_records = parse_lines(&first.stdout);
-    let session_id = first_records[0]["session_id"]
+    let session_id = first_records[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -1830,7 +1832,7 @@ fn resume_rejects_malformed_current_config_without_leaking_secrets() {
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
     let first_records = parse_lines(&first.stdout);
-    let session_id = first_records[0]["session_id"]
+    let session_id = first_records[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -1994,7 +1996,7 @@ fn resumed_skill_commands_use_the_immutable_discovered_snapshot() {
         "{\"type\":\"message\",\"text\":\"start session\"}\n",
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
-    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+    let session_id = parse_lines(&first.stdout)[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -2034,7 +2036,7 @@ fn resumed_session_uses_original_instruction_snapshot_after_source_edit() {
         "{\"type\":\"message\",\"text\":\"first request\"}\n",
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
-    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+    let session_id = parse_lines(&first.stdout)[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
@@ -2074,11 +2076,11 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     );
     assert!(first.status.success(), "stderr: {:?}", first.stderr);
     let first_records = parse_lines(&first.stdout);
-    let session_id = first_records[0]["session_id"]
+    let session_id = first_records[1]["session_id"]
         .as_str()
         .expect("session id")
         .to_owned();
-    assert_eq!(first_records[0]["resumed"], false);
+    assert_eq!(first_records[1]["resumed"], false);
 
     let session_path = home
         .join(".lucy/sessions")
@@ -2107,8 +2109,8 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     );
     assert!(second.status.success(), "stderr: {:?}", second.stderr);
     let second_records = parse_lines(&second.stdout);
-    assert_eq!(second_records[0]["session_id"], session_id);
-    assert_eq!(second_records[0]["resumed"], true);
+    assert_eq!(second_records[1]["session_id"], session_id);
+    assert_eq!(second_records[1]["resumed"], true);
     assert!(second_records
         .iter()
         .any(|record| record["type"] == "assistant_delta" && record["text"] == "second answer"));
