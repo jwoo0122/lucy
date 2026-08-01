@@ -167,12 +167,18 @@ where
     if let Some(command) = options.command {
         if command == CliCommand::Setup {
             if !(stdin_is_tty && stdout_is_tty) {
-                write_diagnostic(&mut diagnostics, "lucy setup requires a terminal on stdin and stdout");
+                write_diagnostic(
+                    &mut diagnostics,
+                    "lucy setup requires a terminal on stdin and stdout",
+                );
                 return 2;
             }
             return match crate::setup::run(home, &mut input, &mut output) {
                 Ok(_) => 0,
-                Err(error) => { write_diagnostic(&mut diagnostics, &error); 1 }
+                Err(error) => {
+                    write_diagnostic(&mut diagnostics, &error);
+                    1
+                }
             };
         }
         return run_codex_command(command, home, output, &mut diagnostics);
@@ -218,17 +224,26 @@ where
     if !options.list_sessions && options.session.is_none() {
         let config = match Config::load_or_create(home) {
             Ok(config) => config,
-            Err(error) => { write_diagnostic(&mut diagnostics, &error.to_string()); return 1; }
+            Err(error) => {
+                write_diagnostic(&mut diagnostics, &error.to_string());
+                return 1;
+            }
         };
         if !crate::setup::configuration_is_complete(home, &config) {
             if mode == FrontendMode::Jsonl {
-                write_diagnostic(&mut diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+                write_diagnostic(
+                    &mut diagnostics,
+                    "configuration is incomplete; run `lucy setup` in a terminal",
+                );
                 return 1;
             }
             match crate::setup::run(home, &mut input, &mut output) {
                 Ok(crate::setup::SetupOutcome::Saved) => {}
                 Ok(crate::setup::SetupOutcome::Cancelled) => return 0,
-                Err(error) => { write_diagnostic(&mut diagnostics, &error); return 1; }
+                Err(error) => {
+                    write_diagnostic(&mut diagnostics, &error);
+                    return 1;
+                }
             }
         }
     }
@@ -1584,7 +1599,10 @@ fn resume_session<W: Write>(
         }
     };
     if !crate::setup::configuration_is_complete(home, &config) {
-        write_diagnostic(diagnostics, "configuration is incomplete; run `lucy setup` in a terminal");
+        write_diagnostic(
+            diagnostics,
+            "configuration is incomplete; run `lucy setup` in a terminal",
+        );
         return None;
     }
     let auth = match config.resolved_auth() {
