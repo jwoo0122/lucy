@@ -244,7 +244,10 @@ where
         };
         if !crate::setup::configuration_is_complete(home, &config) {
             if mode == FrontendMode::Jsonl {
-                write_diagnostic(&mut diagnostics, "configuration is incomplete; run `lucy setup` in a terminal, then `lucy doctor`");
+                write_diagnostic(
+                    &mut diagnostics,
+                    "configuration is incomplete; run `lucy setup` in a terminal, then `lucy doctor`",
+                );
                 return 1;
             }
             match crate::setup::run(home, &mut input, &mut output) {
