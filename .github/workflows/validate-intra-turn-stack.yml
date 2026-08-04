@@ -1,4 +1,4 @@
-name: Validate intra-turn compaction stack
+name: Validate intra-turn compaction stack v2
 
 on:
   pull_request:
