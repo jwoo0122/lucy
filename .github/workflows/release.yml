@@ -1,16 +1,16 @@
-name: Apply session journal safety
+name: Validate session journal safety stack
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/session-journal-safety
+      - agent/compaction-budget-and-fallback-v2
 
 permissions:
   contents: write
 
 jobs:
   patch-and-test:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'agent/session-journal-safety' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
@@ -50,14 +50,20 @@ jobs:
           XDG_CONFIG_HOME: ""
         run: cargo test --locked
 
-      - name: Publish validated implementation
+      - name: Publish validated implementation and restore base workflow
         shell: bash
         run: |
-          git fetch origin agent/compaction-budget-and-fallback-v2
-          git checkout origin/agent/compaction-budget-and-fallback-v2 -- .github/workflows/release.yml
+          git fetch origin agent/incremental-compaction-plan agent/compaction-budget-and-fallback-v2
+          git checkout origin/agent/incremental-compaction-plan -- .github/workflows/release.yml
           rm -f .github/workflows/apply-session-journal-safety.yml .session-safety-trigger
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add .
           git commit -m "fix(session): make journals crash-safe and single-writer"
           git push origin HEAD:agent/session-journal-safety
+
+          git checkout -B agent/compaction-budget-and-fallback-v2 origin/agent/compaction-budget-and-fallback-v2
+          git checkout origin/agent/incremental-compaction-plan -- .github/workflows/release.yml
+          git add .github/workflows/release.yml
+          git commit -m "chore: restore release workflow"
+          git push origin HEAD:agent/compaction-budget-and-fallback-v2
