@@ -29,19 +29,31 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           path = Path("src/app.rs")
           source = path.read_text()
-          old = '''    if let Err(error) =
-              session.append_provider_settings(session.llm.model.clone(), session.llm.effort.clone())
-          {'''
-          new = '''    let selected_model = session.llm.model.clone();
-          let selected_effort = session.llm.effort.clone();
-          if let Err(error) = session.append_provider_settings(selected_model, selected_effort) {'''
-          if source.count(old) != 1:
-              raise SystemExit("unexpected provider settings call")
-          path.write_text(source.replace(old, new))
+          pattern = re.compile(
+              r'(?m)^(\s*)if let Err\(error\) =\s*\n'
+              r'\s*session\.append_provider_settings\('
+              r'session\.llm\.model\.clone\(\), session\.llm\.effort\.clone\(\)'
+              r'\)\s*\n\s*\{'
+          )
+
+          def replacement(match: re.Match[str]) -> str:
+              indent = match.group(1)
+              return (
+                  f"{indent}let selected_model = session.llm.model.clone();\n"
+                  f"{indent}let selected_effort = session.llm.effort.clone();\n"
+                  f"{indent}if let Err(error) = "
+                  "session.append_provider_settings(selected_model, selected_effort) {"
+              )
+
+          source, count = pattern.subn(replacement, source)
+          if count != 1:
+              raise SystemExit(f"unexpected provider settings call count: {count}")
+          path.write_text(source)
           PY
 
       - name: Apply formatting
