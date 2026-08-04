@@ -1,4 +1,6 @@
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, not(unix)))]
+use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -328,9 +330,8 @@ fn load_turn_records(path: &Path) -> Result<Vec<TurnLifecycleRecord>, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let stored: StoredTurnRecord = serde_json::from_str(&line).map_err(|_| {
-            format!("invalid turn lifecycle record at line {}", line_number + 1)
-        })?;
+        let stored: StoredTurnRecord = serde_json::from_str(&line)
+            .map_err(|_| format!("invalid turn lifecycle record at line {}", line_number + 1))?;
         if stored.record != "turn" || stored.version != TURN_JOURNAL_VERSION {
             return Err(format!(
                 "unsupported turn lifecycle record at line {}",
@@ -372,9 +373,10 @@ fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnSta
                 });
             }
             TurnEvent::PhaseChanged => {
-                let Some(state) = latest.as_mut().filter(|state| {
-                    state.turn_id == lifecycle.turn_id && state.is_pending()
-                }) else {
+                let Some(state) = latest
+                    .as_mut()
+                    .filter(|state| state.turn_id == lifecycle.turn_id && state.is_pending())
+                else {
                     return Err("invalid turn phase record".to_owned());
                 };
                 let Some(phase) = lifecycle.phase else {
@@ -393,9 +395,10 @@ fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnSta
                 state.error = None;
             }
             TurnEvent::Finished => {
-                let Some(state) = latest.as_mut().filter(|state| {
-                    state.turn_id == lifecycle.turn_id && state.is_pending()
-                }) else {
+                let Some(state) = latest
+                    .as_mut()
+                    .filter(|state| state.turn_id == lifecycle.turn_id && state.is_pending())
+                else {
                     return Err("invalid turn finish record".to_owned());
                 };
                 let Some(outcome) = lifecycle.outcome else {
