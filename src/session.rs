@@ -1,8 +1,11 @@
 mod base;
+mod lease;
+mod recovery;
 mod turn;
 
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::config::LlmSettings;
 use crate::context::SkillEntry;
@@ -39,36 +42,47 @@ impl From<base::SessionError> for SessionError {
     }
 }
 
-/// A thin compatibility wrapper around Lucy's existing append-only session
-/// implementation. It intercepts semantic transcript boundaries while
-/// preserving the established private JSONL format and public field access.
+/// A compatibility wrapper around Lucy's append-only session. Every
+/// mutable handle owns the same process-shared, OS-backed writer lease.
 #[derive(Debug, Clone)]
-pub struct Session(base::Session);
+pub struct Session {
+    inner: base::Session,
+    _lease: Arc<lease::SessionLease>,
+}
 
 impl Deref for Session {
     type Target = base::Session;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl DerefMut for Session {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 impl Session {
+    fn wrap_created(home: &Path, inner: base::Session) -> Result<Self, SessionError> {
+        let lease =
+            Arc::new(lease::SessionLease::acquire(home, &inner.id).map_err(SessionError::new)?);
+        Ok(Self {
+            inner,
+            _lease: lease,
+        })
+    }
+
     pub fn create(
         home: &Path,
         cwd: &Path,
         boot_system_prompt: String,
         llm: LlmSettings,
     ) -> Result<Self, SessionError> {
-        base::Session::create(home, cwd, boot_system_prompt, llm)
-            .map(Self)
-            .map_err(Into::into)
+        let inner = base::Session::create(home, cwd, boot_system_prompt, llm)
+            .map_err(SessionError::from)?;
+        Self::wrap_created(home, inner)
     }
 
     pub fn create_with_secret(
@@ -78,9 +92,9 @@ impl Session {
         llm: LlmSettings,
         secret: Option<&str>,
     ) -> Result<Self, SessionError> {
-        base::Session::create_with_secret(home, cwd, boot_system_prompt, llm, secret)
-            .map(Self)
-            .map_err(Into::into)
+        let inner = base::Session::create_with_secret(home, cwd, boot_system_prompt, llm, secret)
+            .map_err(SessionError::from)?;
+        Self::wrap_created(home, inner)
     }
 
     pub fn create_with_skills_and_secret(
@@ -91,7 +105,7 @@ impl Session {
         skills: Vec<SkillEntry>,
         secret: Option<&str>,
     ) -> Result<Self, SessionError> {
-        base::Session::create_with_skills_and_secret(
+        let inner = base::Session::create_with_skills_and_secret(
             home,
             cwd,
             boot_system_prompt,
@@ -99,14 +113,12 @@ impl Session {
             skills,
             secret,
         )
-        .map(Self)
-        .map_err(Into::into)
+        .map_err(SessionError::from)?;
+        Self::wrap_created(home, inner)
     }
 
     pub fn resume(home: &Path, id: &str) -> Result<Self, SessionError> {
-        base::Session::resume(home, id)
-            .map(Self)
-            .map_err(Into::into)
+        Self::resume_with_secret(home, id, None)
     }
 
     pub fn resume_with_secret(
@@ -114,9 +126,15 @@ impl Session {
         id: &str,
         external_secret: Option<&str>,
     ) -> Result<Self, SessionError> {
-        base::Session::resume_with_secret(home, id, external_secret)
-            .map(Self)
-            .map_err(Into::into)
+        base::validate_session_id(id).map_err(SessionError::from)?;
+        let lease = Arc::new(lease::SessionLease::acquire(home, id).map_err(SessionError::new)?);
+        recovery::recover_journals(home, id).map_err(SessionError::new)?;
+        let inner = base::Session::resume_with_secret(home, id, external_secret)
+            .map_err(SessionError::from)?;
+        Ok(Self {
+            inner,
+            _lease: lease,
+        })
     }
 
     pub fn list(home: &Path) -> Result<Vec<SessionMetadata>, SessionError> {
@@ -148,7 +166,7 @@ impl Session {
                 .map_err(SessionError::new)?;
         }
 
-        self.0
+        self.inner
             .append_message(message.clone())
             .map_err(SessionError::from)?;
 
@@ -179,7 +197,7 @@ impl Session {
         &mut self,
         interruption: InterruptionRecord,
     ) -> Result<(), SessionError> {
-        self.0
+        self.inner
             .append_interruption(interruption)
             .map_err(SessionError::from)?;
         if let Some(turn) = self.latest_turn().map_err(SessionError::new)? {
@@ -197,7 +215,7 @@ impl Session {
         first_kept_message: usize,
         tokens_before: usize,
     ) -> Result<(), SessionError> {
-        self.0
+        self.inner
             .append_compaction(summary, first_kept_message, tokens_before)
             .map_err(SessionError::from)?;
         if let Some(turn) = self
@@ -240,7 +258,7 @@ impl Session {
         }
 
         let turn_id = self.start_turn(TurnKind::User).map_err(SessionError::new)?;
-        if let Err(error) = self.0.append_message(message) {
+        if let Err(error) = self.inner.append_message(message) {
             let _ = self.finish_turn(
                 &turn_id,
                 TurnOutcome::TerminalFailure,
@@ -318,6 +336,60 @@ mod wrapper_tests {
             session.latest_turn().expect("state").expect("turn").status,
             TurnStatus::Completed
         );
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+    #[test]
+    fn second_mutable_session_handle_is_rejected_until_the_lease_is_released() {
+        let (home, session) = session();
+        let id = session.id.clone();
+        let error = Session::resume(&home, &id).expect_err("second writer");
+        assert_eq!(error.to_string(), "session is already open for writing");
+        drop(session);
+        Session::resume(&home, &id).expect("writer after release");
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn resume_recovers_only_an_unterminated_trailing_fragment() {
+        use std::io::Write;
+        let (home, session) = session();
+        let id = session.id.clone();
+        let path = session.path.clone();
+        drop(session);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append partial record");
+        file.write_all(b"{\"record\":\"message\",\"timestamp\":9,\"message\":")
+            .expect("partial record");
+        file.sync_data().expect("partial checkpoint");
+
+        let resumed = Session::resume(&home, &id).expect("recover trailing fragment");
+        assert!(std::fs::read(&path).expect("transcript").ends_with(b"\n"));
+        assert!(home
+            .join(".lucy/recovery")
+            .read_dir()
+            .expect("evidence")
+            .next()
+            .is_some());
+        drop(resumed);
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn complete_middle_corruption_remains_fatal() {
+        use std::io::Write;
+        let (home, session) = session();
+        let id = session.id.clone();
+        let path = session.path.clone();
+        drop(session);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append corrupt record");
+        file.write_all(b"not-json\n").expect("corrupt record");
+        file.sync_data().expect("corrupt checkpoint");
+        assert!(Session::resume(&home, &id).is_err());
         fs::remove_dir_all(home).expect("cleanup");
     }
 }
