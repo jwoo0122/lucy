@@ -94,7 +94,7 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 - **TUI and JSONL:** Supports terminal chat and line-delimited JSON automation.
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
 - **Tool activity UI:** Renders `cmd` as a compact one-line card. The main-agent ready/working indicator appears in the bottom status line, and the prompt border uses a left-to-right teal-to-green gradient.
-- **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification for completion, cancellation, or error when the terminal supports it; JSONL output is unchanged.
+- **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification with the final agent message, or a fixed cancellation/error status, when the terminal supports it; JSONL output is unchanged.
 - **Safe local command execution:** Runs trusted `cmd` shell commands from the session's starting directory with time and output limits. Commands may set `background: true` to return a background ID immediately; Lucy delivers the bounded completion result to the model automatically, including through a follow-up turn after the originating turn ends.
 - **Agent process boundary:** Other agents can invoke `lucy --jsonl` through `cmd`, capture the returned `session_id`, and continue the conversation with `lucy --jsonl --session <id>`. Lucy does not coordinate relationships between independent sessions.
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
