@@ -14,7 +14,7 @@ depends_on:
   - harness.session-and-context-lifecycle
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-22"
+last_reviewed: "2026-08-04"
 enforcement:
   - id: background-command-contract
     path: tests/cli.rs
@@ -46,6 +46,20 @@ enforcement:
       - "pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);"
       - "pub const COMMAND_OUTPUT_CAP: usize = 64 * 1024;"
     must_not_contain: []
+  - id: command-environment-credential-boundary
+    path: src/command.rs
+    must_contain:
+      - "process.env_remove(api_key_env);"
+      - "fn preserves_normal_inherited_environment_variable()"
+      - "fn removes_active_provider_credential_from_foreground_command()"
+      - "fn removes_active_provider_credential_from_background_command()"
+    must_not_contain: []
+  - id: command-environment-integration
+    path: tests/cli.rs
+    must_contain:
+      - "fn cmd_removes_provider_key_and_preserves_ordinary_environment()"
+    must_not_contain:
+      - "fn cmd_inherits_provider_key_but_redacts_captured_output()"
 enforcement_exception: null
 ---
 
@@ -57,7 +71,7 @@ What execution semantics does the v1 `cmd` tool provide?
 
 ## Current decision
 
-Lucy MUST target macOS/Linux in v1 and execute `cmd` arguments through the user environment's `$SHELL -lc`, falling back to `/bin/sh -lc` when `SHELL` is unset or empty. The command MUST run from the session's starting cwd and inherit the Lucy process environment, including the configured provider API-key environment variable. stdin MUST be disconnected. Lucy MUST support finite foreground commands and process-scoped background commands; interactive process management remains out of scope.
+Lucy MUST target macOS/Linux in v1 and execute `cmd` arguments through the user environment's `$SHELL -lc`, falling back to `/bin/sh -lc` when `SHELL` is unset or empty. The command MUST run from the session's starting cwd and inherit the Lucy process environment except for the configured provider API-key environment variable, which MUST be removed before spawn. stdin MUST be disconnected. Lucy MUST support finite foreground commands and process-scoped background commands; interactive process management remains out of scope.
 
 Each command MUST have a 10-minute timeout. A `cmd` call MAY set `background: true`; Lucy MUST then register the command internally, immediately return a stable background ID with running status, and execute the otherwise unchanged command concurrently. stdout and stderr MUST each be bounded to 64 KiB; truncation MUST be represented in the normalized tool result. A non-zero exit is a successful tool invocation with its exit code and captured output, not a harness-level protocol error. A completed background command MUST re-enter the conversation as a low-privilege observation message rather than as system context, because command output is untrusted data that MUST NOT gain system-instruction authority in any provider request.
 
@@ -94,7 +108,7 @@ A background completion can no longer carry harness-level authority, so a model 
 
 ## Enforcement
 
-Integration tests MUST cover successful commands, non-zero exit codes, inherited cwd, timeout termination, stdout/stderr capture, output truncation, immediate background registration, and automatic completion delivery before and after an originating turn ends. Tests MUST verify that a timed-out shell/process group is terminated and that escaped-descendant capture returns within the grace bound.
+Integration tests MUST cover successful commands, non-zero exit codes, inherited cwd and ordinary environment variables, removal of the configured provider credential, timeout termination, stdout/stderr capture, output truncation, immediate background registration, and automatic completion delivery before and after an originating turn ends. Tests MUST verify that a timed-out shell/process group is terminated and that escaped-descendant capture returns within the grace bound.
 
 ## Revisit when
 
