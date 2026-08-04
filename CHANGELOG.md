@@ -6,6 +6,13 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.4](https://github.com/jwoo0122/lucy/compare/v1.14.3...v1.14.4) - 2026-08-04
+
+### Fixed
+
+- *(tui)* pad background task indicator ([#80](https://github.com/jwoo0122/lucy/pull/80))
+- *(tui)* show final agent message in turn notification ([#79](https://github.com/jwoo0122/lucy/pull/79))
+
 ## [1.14.3](https://github.com/jwoo0122/lucy/compare/v1.14.2...v1.14.3) - 2026-07-29
 
 ### Fixed
