@@ -57,16 +57,21 @@ jobs:
 
           test_path = Path("tests/cli.rs")
           tests = test_path.read_text()
-          old_name = "fn cmd_inherits_provider_key_but_redacts_captured_output()"
-          new_name = "fn cmd_removes_provider_key_and_preserves_ordinary_environment()"
-          if tests.count(old_name) != 1:
-              raise SystemExit("unexpected provider environment test name")
-          tests = tests.replace(old_name, new_name)
-          old_assert = 'assert_eq!(tool_result["result"]["stdout"], "[REDACTED]");'
-          new_assert = 'assert_eq!(tool_result["result"]["stdout"], "");'
-          if tests.count(old_assert) != 1:
-              raise SystemExit("unexpected provider environment assertion")
-          test_path.write_text(tests.replace(old_assert, new_assert))
+          tests, name_count = re.subn(
+              r"fn\s+cmd_inherits_provider_key_but_redacts_captured_output\s*\(\s*\)",
+              "fn cmd_removes_provider_key_and_preserves_ordinary_environment()",
+              tests,
+          )
+          tests, assertion_count = re.subn(
+              r'assert_eq!\(\s*tool_result\["result"\]\["stdout"\]\s*,\s*"\[REDACTED\]"\s*\);',
+              'assert_eq!(tool_result["result"]["stdout"], "");',
+              tests,
+          )
+          if name_count != 1 or assertion_count != 1:
+              raise SystemExit(
+                  f"unexpected provider environment patch counts: name={name_count}, assertion={assertion_count}"
+              )
+          test_path.write_text(tests)
           PY
 
       - name: Apply formatting
