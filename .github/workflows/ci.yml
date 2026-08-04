@@ -75,23 +75,36 @@ jobs:
               )
           tests = before + target + after
 
-          old_write = '''    child
-              .stdin
-              .take()
-              .expect("stdin")
-              .write_all(input.as_bytes())
-              .expect("input");'''
-          new_write = '''    if let Err(error) = child
-              .stdin
-              .take()
-              .expect("stdin")
-              .write_all(input.as_bytes())
-          {
-              assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "input: {error}");
-          }'''
-          if tests.count(old_write) != 1:
-              raise SystemExit("unexpected child stdin write block")
-          test_path.write_text(tests.replace(old_write, new_write))
+          write_pattern = re.compile(
+              r'(?m)^(\s*)child\s*\n'
+              r'\s*\.stdin\s*\n'
+              r'\s*\.take\(\)\s*\n'
+              r'\s*\.expect\("stdin"\)\s*\n'
+              r'\s*\.write_all\(input\.as_bytes\(\)\)\s*\n'
+              r'\s*\.expect\("input"\);'
+          )
+
+          def write_replacement(match: re.Match[str]) -> str:
+              indent = match.group(1)
+              return (
+                  f"{indent}if let Err(error) = child\n"
+                  f"{indent}    .stdin\n"
+                  f"{indent}    .take()\n"
+                  f"{indent}    .expect(\"stdin\")\n"
+                  f"{indent}    .write_all(input.as_bytes())\n"
+                  f"{indent}{{\n"
+                  f"{indent}    assert_eq!(\n"
+                  f"{indent}        error.kind(),\n"
+                  f"{indent}        std::io::ErrorKind::BrokenPipe,\n"
+                  f"{indent}        \"input: {{error}}\"\n"
+                  f"{indent}    );\n"
+                  f"{indent}}}"
+              )
+
+          tests, write_count = write_pattern.subn(write_replacement, tests)
+          if write_count != 1:
+              raise SystemExit(f"unexpected child stdin write count: {write_count}")
+          test_path.write_text(tests)
           PY
 
       - name: Apply formatting
