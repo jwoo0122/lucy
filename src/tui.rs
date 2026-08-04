@@ -387,6 +387,7 @@ fn event_loop<W: Write>(
                         state.start_queued_user(&text);
                     }
                     state.active_cancel = Some(cancel);
+                    state.turn_start_transcript_len = state.transcript.len();
                     state.set_busy(true);
                     state.set_status("working");
                 }
@@ -795,7 +796,7 @@ enum TurnNotification {
 }
 
 impl TurnNotification {
-    fn body(self) -> &'static str {
+    fn fallback_body(self) -> &'static str {
         match self {
             Self::Completed => "Turn complete",
             Self::Interrupted => "Turn interrupted",
@@ -814,28 +815,56 @@ fn turn_notification_for_status(status: &str) -> TurnNotification {
 
 /// Ask terminal emulators that support OSC 777 to show a desktop notification.
 ///
-/// The title and body are fixed Lucy-owned strings rather than model/provider
-/// text, so completion notifications cannot inject terminal control data or
-/// expose a secret. Terminals without OSC 777 support safely ignore the OSC.
-fn send_turn_notification<W: Write>(
-    writer: &mut W,
-    notification: TurnNotification,
-) -> io::Result<()> {
+/// The body must already be stripped of terminal control data. Terminals
+/// without OSC 777 support safely ignore the OSC.
+fn send_turn_notification<W: Write>(writer: &mut W, body: &str) -> io::Result<()> {
     writer.write_all(b"\x1b]777;notify;Lucy;")?;
-    writer.write_all(notification.body().as_bytes())?;
+    writer.write_all(body.as_bytes())?;
     writer.write_all(b"\x07")?;
     writer.flush()
+}
+
+fn notification_body(state: &UiState, notification: TurnNotification) -> String {
+    if notification != TurnNotification::Completed {
+        return notification.fallback_body().to_owned();
+    }
+
+    let message = state
+        .transcript
+        .get(state.turn_start_transcript_len..)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            TranscriptItem::Assistant(message) if !message.trim().is_empty() => Some(message),
+            _ => None,
+        });
+    let Some(message) = message else {
+        return notification.fallback_body().to_owned();
+    };
+
+    redact_secret(message, Some(&state.secret))
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn release_finished_turn<W: Write>(writer: &mut W, state: &mut UiState) {
     let was_busy = state.busy;
     let notification = turn_notification_for_status(&state.status);
+    let body = notification_body(state, notification);
     state.set_busy(false);
     state.active_cancel = None;
     if was_busy {
         // Notification failure must never change the completed turn result or
         // make the TUI unusable.
-        let _ = send_turn_notification(writer, notification);
+        let _ = send_turn_notification(writer, &body);
     }
 }
 
@@ -939,6 +968,7 @@ struct UiState {
     context_tokens: usize,
     secret: String,
     transcript: Vec<TranscriptItem>,
+    turn_start_transcript_len: usize,
     queued_messages: Vec<String>,
     input: String,
     cursor: usize,
@@ -983,6 +1013,7 @@ impl UiState {
             context_tokens: 1,
             secret: secret.to_owned(),
             transcript: Vec::new(),
+            turn_start_transcript_len: 0,
             queued_messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -1012,6 +1043,7 @@ impl UiState {
         for record in history {
             state.add_history_record(record);
         }
+        state.turn_start_transcript_len = state.transcript.len();
         state
     }
 
@@ -3856,21 +3888,62 @@ mod tests {
     }
 
     #[test]
-    fn turn_notifications_use_osc_777_with_fixed_secret_safe_messages() {
-        let cases = [
-            (TurnNotification::Completed, "Turn complete"),
-            (TurnNotification::Interrupted, "Turn interrupted"),
-            (TurnNotification::Failed, "Turn failed"),
-        ];
+    fn completed_turn_notification_uses_the_last_assistant_message() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.add_assistant_message("first response");
+        state.add_user("follow-up", "secret");
+        state.turn_start_transcript_len = state.transcript.len();
+        state.add_assistant_message("final response");
+        state
+            .transcript
+            .push(TranscriptItem::Info("✓ turn complete".to_owned()));
 
-        for (notification, body) in cases {
-            let mut output = Vec::new();
-            send_turn_notification(&mut output, notification).expect("notification");
-            assert_eq!(
-                output,
-                format!("\x1b]777;notify;Lucy;{body}\x07").into_bytes()
-            );
-        }
+        let body = notification_body(&state, TurnNotification::Completed);
+        let mut output = Vec::new();
+        send_turn_notification(&mut output, &body).expect("notification");
+
+        assert_eq!(output, b"\x1b]777;notify;Lucy;final response\x07".to_vec());
+    }
+
+    #[test]
+    fn turn_notifications_keep_fixed_fallback_and_failure_messages() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.add_assistant_message("previous response");
+        state.add_user("new turn", "secret");
+        state.turn_start_transcript_len = state.transcript.len();
+
+        assert_eq!(
+            notification_body(&state, TurnNotification::Completed),
+            "Turn complete"
+        );
+        assert_eq!(
+            notification_body(&state, TurnNotification::Interrupted),
+            "Turn interrupted"
+        );
+        assert_eq!(
+            notification_body(&state, TurnNotification::Failed),
+            "Turn failed"
+        );
+    }
+
+    #[test]
+    fn completed_turn_notification_redacts_secrets_and_strips_control_data() {
+        let mut state = UiState::from_history(
+            &[],
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
+        state.add_assistant_message("done\nprovider-secret\x1b]777;notify;Other;injected\x07");
+
+        let body = notification_body(&state, TurnNotification::Completed);
+
+        assert!(!body.contains("provider-secret"));
+        assert!(!body.chars().any(char::is_control));
     }
 
     #[test]
