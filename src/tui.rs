@@ -1660,7 +1660,7 @@ fn tui_viewport(area: Rect) -> Rect {
 }
 
 fn background_indicator_height(state: &UiState) -> u16 {
-    u16::from(state.background_active_count.load(Ordering::Relaxed) > 0)
+    3 * u16::from(state.background_active_count.load(Ordering::Relaxed) > 0)
 }
 
 fn background_indicator_area(state: &UiState, input_area: Rect) -> Option<Rect> {
@@ -1669,7 +1669,7 @@ fn background_indicator_area(state: &UiState, input_area: Rect) -> Option<Rect> 
             input_area.x,
             input_area.y + input_area.height,
             input_area.width,
-            1,
+            background_indicator_height(state),
         )
     })
 }
@@ -2273,10 +2273,16 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
             Block::default().style(Style::default().bg(BACKGROUND_INDICATOR_BACKGROUND)),
             indicator_area,
         );
+        let text_area = Rect::new(
+            indicator_area.x.saturating_add(2),
+            indicator_area.y.saturating_add(1),
+            indicator_area.width.saturating_sub(4),
+            indicator_area.height.saturating_sub(2),
+        );
         frame.render_widget(
             Paragraph::new(format!("Background task(s) {active_count} is running..."))
                 .style(indicator_style),
-            indicator_area,
+            text_area,
         );
     }
 
@@ -5657,7 +5663,7 @@ mod tests {
     }
 
     #[test]
-    fn background_indicator_fills_the_row_below_the_prompt_surface() {
+    fn background_indicator_has_two_cell_horizontal_and_one_row_vertical_padding() {
         let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.background_active_count.store(2, Ordering::Relaxed);
         let area = Rect::new(0, 0, 80, 10);
@@ -5675,20 +5681,28 @@ mod tests {
             background_indicator_area(&state, input_area).expect("visible background indicator");
         assert_eq!(indicator_area.y, input_area.y + input_area.height);
         assert!(indicator_area.y + indicator_area.height <= viewport.y + viewport.height);
+        assert_eq!(indicator_area.height, 3);
         let buffer = terminal.backend().buffer();
-        for x in indicator_area.x..indicator_area.x + indicator_area.width {
-            assert_eq!(
-                buffer[(x, indicator_area.y)].bg,
-                BACKGROUND_INDICATOR_BACKGROUND
-            );
+        for y in indicator_area.y..indicator_area.y + indicator_area.height {
+            for x in indicator_area.x..indicator_area.x + indicator_area.width {
+                assert_eq!(buffer[(x, y)].bg, BACKGROUND_INDICATOR_BACKGROUND);
+            }
         }
         let expected = "Background task(s) 2 is running...";
+        let text_y = indicator_area.y + 1;
         let rendered = (indicator_area.x..indicator_area.x + indicator_area.width)
-            .map(|x| buffer[(x, indicator_area.y)].symbol())
+            .map(|x| buffer[(x, text_y)].symbol())
             .collect::<String>();
-        assert!(rendered.starts_with(expected));
-        for x in indicator_area.x..indicator_area.x + expected.len() as u16 {
-            assert_eq!(buffer[(x, indicator_area.y)].fg, BACKGROUND_INDICATOR_COLOR);
+        assert!(rendered.starts_with(&format!("  {expected}")));
+        assert!(rendered.ends_with("  "));
+        for x in indicator_area.x + 2..indicator_area.x + 2 + expected.len() as u16 {
+            assert_eq!(buffer[(x, text_y)].fg, BACKGROUND_INDICATOR_COLOR);
+        }
+        for y in [indicator_area.y, indicator_area.y + 2] {
+            let rendered = (indicator_area.x..indicator_area.x + indicator_area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            assert!(rendered.trim().is_empty());
         }
     }
 
