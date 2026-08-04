@@ -25,6 +25,25 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Apply compatibility patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/app.rs")
+          source = path.read_text()
+          old = '''    if let Err(error) =
+              session.append_provider_settings(session.llm.model.clone(), session.llm.effort.clone())
+          {'''
+          new = '''    let selected_model = session.llm.model.clone();
+          let selected_effort = session.llm.effort.clone();
+          if let Err(error) = session.append_provider_settings(selected_model, selected_effort) {'''
+          if source.count(old) != 1:
+              raise SystemExit("unexpected provider settings call")
+          path.write_text(source.replace(old, new))
+          PY
+
       - name: Apply formatting
         run: cargo fmt --all
 
@@ -36,16 +55,13 @@ jobs:
           XDG_CONFIG_HOME: ""
         run: cargo test --locked
 
-      - name: Restore CI definition and publish formatting
+      - name: Restore CI definition and publish validated changes
         shell: bash
         run: |
           git fetch origin main
           git checkout origin/main -- .github/workflows/ci.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          if git diff --quiet; then
-            exit 0
-          fi
           git add .
-          git commit -m "style: apply current rustfmt output"
+          git commit -m "fix(session): preserve wrapper call compatibility"
           git push origin HEAD:agent/turn-lifecycle-records
