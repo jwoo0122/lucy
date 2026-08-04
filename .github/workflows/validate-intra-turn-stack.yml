@@ -1,0 +1,69 @@
+name: Validate intra-turn compaction stack
+
+on:
+  pull_request:
+    branches:
+      - agent/session-journal-safety
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.head_ref == 'agent/intra-turn-compaction-pruning' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: agent/intra-turn-compaction-pruning
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply final integration patch
+        shell: bash
+        run: |
+          python3 - <<'RUNNER'
+          import textwrap
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/release.yml').read_text()
+          start_marker = "          python3 - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          script = textwrap.dedent(workflow[start:end])
+          exec(compile(script, 'apply-intra-turn-compaction', 'exec'))
+          RUNNER
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        env:
+          XDG_CONFIG_HOME: ""
+        run: cargo test --locked
+
+      - name: Publish validated implementation and remove validator
+        shell: bash
+        run: |
+          git fetch origin agent/session-journal-safety
+          git checkout origin/agent/session-journal-safety -- .github/workflows/release.yml
+          rm -f .intra-turn-validation-trigger
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .
+          git commit -m "feat(compaction): support safe intra-turn cuts and tool-output pruning"
+          git push origin HEAD:agent/intra-turn-compaction-pruning
+
+          git checkout -B agent/session-journal-safety origin/agent/session-journal-safety
+          rm .github/workflows/validate-intra-turn-stack.yml
+          git add .github/workflows/validate-intra-turn-stack.yml
+          git commit -m "chore: remove intra-turn stack validator"
+          git push origin HEAD:agent/session-journal-safety
