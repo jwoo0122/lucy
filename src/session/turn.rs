@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::Session;
+use crate::config::{ensure_not_symlink, ensure_private_dir};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -257,10 +258,34 @@ impl Session {
 }
 
 fn turn_journal_path(session_path: &Path) -> PathBuf {
-    session_path.with_extension("turns")
+    let sessions_directory = session_path
+        .parent()
+        .expect("session transcript has a parent directory");
+    let lucy_directory = sessions_directory
+        .parent()
+        .expect("sessions directory has a Lucy parent");
+    let file_name = session_path
+        .file_name()
+        .expect("session transcript has a file name");
+    lucy_directory.join("turns").join(file_name)
+}
+
+fn secure_turn_journal_directory(path: &Path, create: bool) -> Result<bool, String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "turn lifecycle journal has no parent".to_owned())?;
+    ensure_not_symlink(directory)
+        .map_err(|_| "turn lifecycle journal directory is unsafe".to_owned())?;
+    if !directory.exists() && !create {
+        return Ok(false);
+    }
+    ensure_private_dir(directory)
+        .map_err(|_| "unable to secure turn lifecycle journal directory".to_owned())?;
+    Ok(true)
 }
 
 fn open_turn_journal_for_append(path: &Path) -> Result<File, String> {
+    secure_turn_journal_directory(path, true)?;
     #[cfg(not(unix))]
     reject_symlink(path)?;
 
@@ -279,6 +304,9 @@ fn open_turn_journal_for_append(path: &Path) -> Result<File, String> {
 }
 
 fn open_turn_journal_for_read(path: &Path) -> Result<Option<File>, String> {
+    if !secure_turn_journal_directory(path, false)? {
+        return Ok(None);
+    }
     #[cfg(not(unix))]
     reject_symlink(path)?;
 
@@ -502,6 +530,18 @@ mod tests {
         let expected = session.latest_turn().expect("read").expect("turn");
         assert_eq!(expected.status, TurnStatus::Retryable);
         assert_eq!(expected.error.as_deref(), Some("provider unavailable"));
+        assert_eq!(
+            fs::read_dir(home.join(".lucy/sessions"))
+                .expect("sessions")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(home.join(".lucy/turns"))
+                .expect("turn journals")
+                .count(),
+            1
+        );
 
         let resumed = Session::resume(&home, &session.id).expect("resume");
         assert_eq!(resumed.latest_turn().expect("read"), Some(expected));
