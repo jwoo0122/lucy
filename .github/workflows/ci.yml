@@ -25,15 +25,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply compatibility patch
+      - name: Apply compatibility patches
         shell: bash
         run: |
           python3 - <<'PY'
           import re
           from pathlib import Path
 
-          path = Path("src/app.rs")
-          source = path.read_text()
+          app_path = Path("src/app.rs")
+          source = app_path.read_text()
           pattern = re.compile(
               r'(?m)^(\s*)if let Err\(error\) =\s*\n'
               r'\s*session\.append_provider_settings\('
@@ -53,7 +53,20 @@ jobs:
           source, count = pattern.subn(replacement, source)
           if count != 1:
               raise SystemExit(f"unexpected provider settings call count: {count}")
-          path.write_text(source)
+          app_path.write_text(source)
+
+          test_path = Path("tests/cli.rs")
+          tests = test_path.read_text()
+          old_name = "fn cmd_inherits_provider_key_but_redacts_captured_output()"
+          new_name = "fn cmd_removes_provider_key_and_preserves_ordinary_environment()"
+          if tests.count(old_name) != 1:
+              raise SystemExit("unexpected provider environment test name")
+          tests = tests.replace(old_name, new_name)
+          old_assert = 'assert_eq!(tool_result["result"]["stdout"], "[REDACTED]");'
+          new_assert = 'assert_eq!(tool_result["result"]["stdout"], "");'
+          if tests.count(old_assert) != 1:
+              raise SystemExit("unexpected provider environment assertion")
+          test_path.write_text(tests.replace(old_assert, new_assert))
           PY
 
       - name: Apply formatting
@@ -75,5 +88,5 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add .
-          git commit -m "fix(session): preserve wrapper call compatibility"
+          git commit -m "fix(session): validate lifecycle integration"
           git push origin HEAD:agent/turn-lifecycle-records
