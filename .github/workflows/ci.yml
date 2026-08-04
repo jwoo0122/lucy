@@ -1,3 +1,4 @@
+# temporary branch-local validation; restored after success
 name: CI
 
 on:
