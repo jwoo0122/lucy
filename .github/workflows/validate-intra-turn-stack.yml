@@ -24,7 +24,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Apply final integration patch
-        run: python3 scripts/apply_intra_turn.py
+        run: |
+          python3 scripts/apply_intra_turn.py
+          python3 scripts/fix_intra_turn_lints.py
 
       - name: Format
         run: cargo fmt --all
@@ -42,7 +44,7 @@ jobs:
         run: |
           git fetch origin agent/session-journal-safety
           git checkout origin/agent/session-journal-safety -- .github/workflows/release.yml
-          rm -f .intra-turn-validation-trigger scripts/apply_intra_turn.py
+          rm -f .intra-turn-validation-trigger scripts/apply_intra_turn.py scripts/fix_intra_turn_lints.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add .
