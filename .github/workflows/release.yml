@@ -30,22 +30,28 @@ jobs:
           import textwrap
           from pathlib import Path
 
-          turn_path = Path('src/session/turn.rs')
-          turn_source = turn_path.read_text()
-          actual = '''        file.flush()
-              .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;'''
-          normalized = '''        file.flush()
-          .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;'''
-          if turn_source.count(actual) != 1:
-              raise SystemExit('unexpected lifecycle writer source')
-          turn_path.write_text(turn_source.replace(actual, normalized))
-
           workflow = Path('.github/workflows/apply-session-journal-safety.yml').read_text()
           start_marker = "          python3 - <<'PY'\n"
           end_marker = "\n          PY\n"
           start = workflow.index(start_marker) + len(start_marker)
           end = workflow.index(end_marker, start)
           script = textwrap.dedent(workflow[start:end])
+          lifecycle_start = script.index("turn_path = Path('src/session/turn.rs')")
+          lifecycle_patch = (
+              "import re\n"
+              "turn_path = Path('src/session/turn.rs')\n"
+              "turn = turn_path.read_text()\n"
+              "turn, turn_count = re.subn(\n"
+              "    r'file\\.flush\\(\\)\\n\\s*\\.map_err\\(\\|_\\| \"unable to write turn lifecycle journal\"\\.to_owned\\(\\)\\)\\?;',\n"
+              "    'file.sync_data()\\n            .map_err(|_| \"unable to checkpoint turn lifecycle journal\".to_owned())?;',\n"
+              "    turn,\n"
+              "    count=1,\n"
+              ")\n"
+              "if turn_count != 1:\n"
+              "    raise SystemExit('unexpected lifecycle writer implementation')\n"
+              "turn_path.write_text(turn)\n"
+          )
+          script = script[:lifecycle_start] + lifecycle_patch
           exec(compile(script, 'apply-session-journal-safety', 'exec'))
           RUNNER
 
