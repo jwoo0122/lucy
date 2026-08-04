@@ -71,6 +71,26 @@ jobs:
           )
           script = script[:lifecycle_start] + lifecycle_patch
           exec(compile(script, 'apply-session-journal-safety', 'exec'))
+
+          turn_path = Path('src/session/turn.rs')
+          turn = turn_path.read_text()
+          old_round_trip = '''        let resumed = Session::resume(&home, &session.id).expect("resume");
+          assert_eq!(resumed.latest_turn().expect("read"), Some(expected));'''
+          new_round_trip = '''        let session_id = session.id.clone();
+          drop(session);
+          let resumed = Session::resume(&home, &session_id).expect("resume");
+          assert_eq!(resumed.latest_turn().expect("read"), Some(expected));'''
+          old_legacy = '''        let session = create_session(&home);
+          let resumed = Session::resume(&home, &session.id).expect("resume");'''
+          new_legacy = '''        let session = create_session(&home);
+          let session_id = session.id.clone();
+          drop(session);
+          let resumed = Session::resume(&home, &session_id).expect("resume");'''
+          for old, new in [(old_round_trip, new_round_trip), (old_legacy, new_legacy)]:
+              if turn.count(old) != 1:
+                  raise SystemExit('unexpected lifecycle resume test')
+              turn = turn.replace(old, new)
+          turn_path.write_text(turn)
           RUNNER
 
       - name: Format
