@@ -23,15 +23,15 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply budget trigger
+      - name: Apply budget trigger and provider visibility fix
         shell: bash
         run: |
           python3 - <<'PY'
           import re
           from pathlib import Path
 
-          path = Path('src/app.rs')
-          source = path.read_text()
+          app_path = Path('src/app.rs')
+          source = app_path.read_text()
           source, constant_count = re.subn(
               r'^const AUTO_COMPACTION_THRESHOLD_PERCENT: usize = 95;\n',
               '',
@@ -53,7 +53,16 @@ jobs:
               raise SystemExit(
                   f'unexpected compaction trigger matches: constant={constant_count}, function={function_count}'
               )
-          path.write_text(source)
+          app_path.write_text(source)
+
+          provider_path = Path('src/provider/base.rs')
+          provider_source = provider_path.read_text()
+          old_visibility = 'pub(crate) enum ProviderStreamEvent {'
+          if provider_source.count(old_visibility) != 1:
+              raise SystemExit('unexpected ProviderStreamEvent visibility declaration')
+          provider_path.write_text(
+              provider_source.replace(old_visibility, 'pub enum ProviderStreamEvent {')
+          )
           PY
 
       - name: Format
