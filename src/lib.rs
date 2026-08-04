@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cancellation;
 pub(crate) mod codex_provider;
 pub mod command;
+pub(crate) mod compaction;
 pub mod config;
 pub mod context;
 pub mod model;
