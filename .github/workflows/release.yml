@@ -27,6 +27,7 @@ jobs:
         shell: bash
         run: |
           python3 - <<'RUNNER'
+          import re
           import textwrap
           from pathlib import Path
 
@@ -74,22 +75,13 @@ jobs:
 
           turn_path = Path('src/session/turn.rs')
           turn = turn_path.read_text()
-          old_round_trip = '''        let resumed = Session::resume(&home, &session.id).expect("resume");
-          assert_eq!(resumed.latest_turn().expect("read"), Some(expected));'''
-          new_round_trip = '''        let session_id = session.id.clone();
-          drop(session);
-          let resumed = Session::resume(&home, &session_id).expect("resume");
-          assert_eq!(resumed.latest_turn().expect("read"), Some(expected));'''
-          old_legacy = '''        let session = create_session(&home);
-          let resumed = Session::resume(&home, &session.id).expect("resume");'''
-          new_legacy = '''        let session = create_session(&home);
-          let session_id = session.id.clone();
-          drop(session);
-          let resumed = Session::resume(&home, &session_id).expect("resume");'''
-          for old, new in [(old_round_trip, new_round_trip), (old_legacy, new_legacy)]:
-              if turn.count(old) != 1:
-                  raise SystemExit('unexpected lifecycle resume test')
-              turn = turn.replace(old, new)
+          turn, resume_count = re.subn(
+              r'(?m)^(\s*)let resumed = Session::resume\(&home, &session\.id\)\.expect\("resume"\);$',
+              r'\1let session_id = session.id.clone();\n\1drop(session);\n\1let resumed = Session::resume(&home, &session_id).expect("resume");',
+              turn,
+          )
+          if resume_count != 2:
+              raise SystemExit(f'unexpected lifecycle resume test count: {resume_count}')
           turn_path.write_text(turn)
           RUNNER
 
