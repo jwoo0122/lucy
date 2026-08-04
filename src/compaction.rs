@@ -203,11 +203,7 @@ mod tests {
         let messages = input(vec![
             ChatMessage::user("old".to_owned()),
             assistant,
-            ChatMessage::tool(
-                "call-1".to_owned(),
-                "cmd".to_owned(),
-                "result".to_owned(),
-            ),
+            ChatMessage::tool("call-1".to_owned(), "cmd".to_owned(), "result".to_owned()),
             ChatMessage::user("recent".to_owned()),
         ]);
         let planned = prepare_summary_messages_with_budget(&messages, 1).expect("plan");

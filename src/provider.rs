@@ -7,10 +7,10 @@ use crate::cancellation::CancellationToken;
 use crate::config::LlmSettings;
 use crate::model::ChatMessage;
 
+pub(crate) use base::ProviderStreamEvent;
 pub use base::{
     parse_sse, ProviderError, ProviderModel, ProviderTurn, SseParseResult, PROVIDER_TIMEOUT,
 };
-pub(crate) use base::ProviderStreamEvent;
 
 /// Provider facade that keeps normal request behavior in the established
 /// implementation while routing compaction through a provider-neutral plan.
@@ -45,8 +45,8 @@ impl Provider {
         messages: &[ChatMessage],
         cancellation: &CancellationToken,
     ) -> Result<String, ProviderError> {
-        let planned = crate::compaction::prepare_summary_messages(messages)
-            .map_err(ProviderError::new)?;
+        let planned =
+            crate::compaction::prepare_summary_messages(messages).map_err(ProviderError::new)?;
         self.0.summarize(&planned, cancellation)
     }
 }
