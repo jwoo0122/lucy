@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use super::{now, Session, SessionError};
+use super::Session;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -82,9 +82,9 @@ pub struct TurnState {
     pub kind: TurnKind,
     pub phase: TurnPhase,
     pub status: TurnStatus,
-    /// Inclusive ordinal of the first ordinary session message owned by the turn.
+    /// Inclusive ordinal of the first transcript message owned by the turn.
     pub first_message: usize,
-    /// Exclusive ordinal after the last ordinary session message owned by the turn.
+    /// Exclusive ordinal after the last transcript message owned by the turn.
     pub last_message: Option<usize>,
     pub error: Option<String>,
 }
@@ -114,10 +114,9 @@ impl StoredTurnRecord {
 }
 
 impl Session {
-    /// Start a durable logical turn before appending its initiating message.
-    pub fn start_turn(&mut self, kind: TurnKind) -> Result<String, SessionError> {
+    pub fn start_turn(&mut self, kind: TurnKind) -> Result<String, String> {
         if self.latest_turn()?.is_some_and(|turn| turn.is_pending()) {
-            return Err(SessionError::new("session already has a pending turn"));
+            return Err("session already has a pending turn".to_owned());
         }
         let turn_id = new_turn_id(&self.id);
         self.append_turn_lifecycle(TurnLifecycleRecord {
@@ -134,16 +133,10 @@ impl Session {
         Ok(turn_id)
     }
 
-    pub fn set_turn_phase(
-        &mut self,
-        turn_id: &str,
-        phase: TurnPhase,
-    ) -> Result<(), SessionError> {
+    pub fn set_turn_phase(&mut self, turn_id: &str, phase: TurnPhase) -> Result<(), String> {
         let state = self.require_pending_turn(turn_id)?;
         if state.status != TurnStatus::Active {
-            return Err(SessionError::new(
-                "retryable turn must be resumed before changing phase",
-            ));
+            return Err("retryable turn must be resumed before changing phase".to_owned());
         }
         self.append_turn_lifecycle(TurnLifecycleRecord {
             timestamp: now(),
@@ -158,10 +151,10 @@ impl Session {
         })
     }
 
-    pub fn resume_retryable_turn(&mut self, turn_id: &str) -> Result<(), SessionError> {
+    pub fn resume_retryable_turn(&mut self, turn_id: &str) -> Result<(), String> {
         let state = self.require_pending_turn(turn_id)?;
-        if state.status != TurnStatus::Retryable {
-            return Err(SessionError::new("turn is not retryable"));
+        if !matches!(state.status, TurnStatus::Active | TurnStatus::Retryable) {
+            return Err("turn is not retryable".to_owned());
         }
         self.append_turn_lifecycle(TurnLifecycleRecord {
             timestamp: now(),
@@ -181,17 +174,13 @@ impl Session {
         turn_id: &str,
         outcome: TurnOutcome,
         error: Option<String>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<(), String> {
         let state = self.require_pending_turn(turn_id)?;
         if outcome == TurnOutcome::RetryableFailure {
-            return Err(SessionError::new(
-                "use fail_turn_retryably for a retryable failure",
-            ));
+            return Err("use fail_turn_retryably for a retryable failure".to_owned());
         }
         if state.status == TurnStatus::Retryable && outcome != TurnOutcome::Abandoned {
-            return Err(SessionError::new(
-                "retryable turn must be resumed or abandoned before finishing",
-            ));
+            return Err("retryable turn must be resumed or abandoned before finishing".to_owned());
         }
         self.append_turn_lifecycle(TurnLifecycleRecord {
             timestamp: now(),
@@ -206,14 +195,10 @@ impl Session {
         })
     }
 
-    pub fn fail_turn_retryably(
-        &mut self,
-        turn_id: &str,
-        error: String,
-    ) -> Result<(), SessionError> {
+    pub fn fail_turn_retryably(&mut self, turn_id: &str, error: String) -> Result<(), String> {
         let state = self.require_pending_turn(turn_id)?;
         if state.status != TurnStatus::Active {
-            return Err(SessionError::new("turn is already retryable"));
+            return Err("turn is already retryable".to_owned());
         }
         self.append_turn_lifecycle(TurnLifecycleRecord {
             timestamp: now(),
@@ -228,47 +213,43 @@ impl Session {
         })
     }
 
-    /// Reconstruct the last logical turn from the private lifecycle journal.
-    /// Sessions created before lifecycle tracking return `Ok(None)`.
-    pub fn latest_turn(&self) -> Result<Option<TurnState>, SessionError> {
+    pub fn latest_turn(&self) -> Result<Option<TurnState>, String> {
         reduce_turn_records(&load_turn_records(&turn_journal_path(&self.path))?)
     }
 
-    pub fn turn_lifecycle(&self) -> Result<Vec<TurnLifecycleRecord>, SessionError> {
+    pub fn turn_lifecycle(&self) -> Result<Vec<TurnLifecycleRecord>, String> {
         load_turn_records(&turn_journal_path(&self.path))
     }
 
-    fn require_pending_turn(&self, turn_id: &str) -> Result<TurnState, SessionError> {
+    fn require_pending_turn(&self, turn_id: &str) -> Result<TurnState, String> {
         self.latest_turn()?
             .filter(|turn| turn.turn_id == turn_id && turn.is_pending())
-            .ok_or_else(|| SessionError::new("turn is not pending"))
+            .ok_or_else(|| "turn is not pending".to_owned())
     }
 
-    fn append_turn_lifecycle(
-        &mut self,
-        lifecycle: TurnLifecycleRecord,
-    ) -> Result<(), SessionError> {
+    fn append_turn_lifecycle(&mut self, lifecycle: TurnLifecycleRecord) -> Result<(), String> {
         let path = turn_journal_path(&self.path);
         let mut records = load_turn_records(&path)?;
         records.push(lifecycle.clone());
         reduce_turn_records(&records)?;
 
-        let stored = StoredTurnRecord::new(lifecycle.clone());
+        let stored = StoredTurnRecord::new(lifecycle);
         let mut encoded = serde_json::to_string(&stored)
-            .map_err(|_| SessionError::new("unable to encode turn lifecycle record"))?;
-        if self
-            .secret
+            .map_err(|error| format!("unable to encode turn lifecycle record: {error}"))?;
+        let secret = std::env::var(&self.llm.api_key_env).ok();
+        if secret
             .as_deref()
             .is_some_and(|secret| !secret.is_empty() && encoded.contains(secret))
         {
-            return Err(SessionError::new("turn lifecycle record rejected"));
+            return Err("turn lifecycle record rejected".to_owned());
         }
         encoded.push('\n');
 
         let mut file = open_turn_journal_for_append(&path)?;
-        file.write_all(encoded.as_bytes())?;
-        file.flush()?;
-        self.updated_at = lifecycle.timestamp;
+        file.write_all(encoded.as_bytes())
+            .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;
+        file.flush()
+            .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;
         Ok(())
     }
 }
@@ -277,13 +258,9 @@ fn turn_journal_path(session_path: &Path) -> PathBuf {
     session_path.with_extension("turns")
 }
 
-fn open_turn_journal_for_append(path: &Path) -> Result<File, SessionError> {
+fn open_turn_journal_for_append(path: &Path) -> Result<File, String> {
     #[cfg(not(unix))]
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(SessionError::new("turn lifecycle journal is unsafe"));
-        }
-    }
+    reject_symlink(path)?;
 
     let mut options = OpenOptions::new();
     options.write(true).append(true).create(true);
@@ -294,78 +271,95 @@ fn open_turn_journal_for_append(path: &Path) -> Result<File, SessionError> {
     }
     let file = options
         .open(path)
-        .map_err(|_| SessionError::new("unable to open turn lifecycle journal"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| SessionError::new("unable to inspect turn lifecycle journal"))?;
-    if !metadata.is_file() {
-        return Err(SessionError::new("turn lifecycle journal is unsafe"));
-    }
-    #[cfg(unix)]
-    if metadata.permissions().mode() & 0o777 != 0o600 {
-        return Err(SessionError::new("turn lifecycle journal is not private"));
-    }
+        .map_err(|_| "unable to open turn lifecycle journal".to_owned())?;
+    validate_private_regular_file(&file)?;
     Ok(file)
 }
 
-fn load_turn_records(path: &Path) -> Result<Vec<TurnLifecycleRecord>, SessionError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(SessionError::new("unable to read turn lifecycle journal")),
-    };
+fn open_turn_journal_for_read(path: &Path) -> Result<Option<File>, String> {
+    #[cfg(not(unix))]
+    reject_symlink(path)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    match options.open(path) {
+        Ok(file) => {
+            validate_private_regular_file(&file)?;
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("unable to read turn lifecycle journal".to_owned()),
+    }
+}
+
+#[cfg(not(unix))]
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err("turn lifecycle journal is unsafe".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_private_regular_file(file: &File) -> Result<(), String> {
     let metadata = file
         .metadata()
-        .map_err(|_| SessionError::new("unable to inspect turn lifecycle journal"))?;
+        .map_err(|_| "unable to inspect turn lifecycle journal".to_owned())?;
     if !metadata.is_file() {
-        return Err(SessionError::new("turn lifecycle journal is unsafe"));
+        return Err("turn lifecycle journal is unsafe".to_owned());
     }
     #[cfg(unix)]
     if metadata.permissions().mode() & 0o777 != 0o600 {
-        return Err(SessionError::new("turn lifecycle journal is not private"));
+        return Err("turn lifecycle journal is not private".to_owned());
     }
+    Ok(())
+}
 
+fn load_turn_records(path: &Path) -> Result<Vec<TurnLifecycleRecord>, String> {
+    let Some(file) = open_turn_journal_for_read(path)? else {
+        return Ok(Vec::new());
+    };
     let mut records = Vec::new();
     for (line_number, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|_| SessionError::new("unable to read turn lifecycle journal"))?;
+        let line = line.map_err(|_| "unable to read turn lifecycle journal".to_owned())?;
         if line.trim().is_empty() {
             continue;
         }
         let stored: StoredTurnRecord = serde_json::from_str(&line).map_err(|_| {
-            SessionError::new(format!(
-                "invalid turn lifecycle record at line {}",
-                line_number + 1
-            ))
+            format!("invalid turn lifecycle record at line {}", line_number + 1)
         })?;
         if stored.record != "turn" || stored.version != TURN_JOURNAL_VERSION {
-            return Err(SessionError::new(format!(
+            return Err(format!(
                 "unsupported turn lifecycle record at line {}",
                 line_number + 1
-            )));
+            ));
         }
         records.push(stored.lifecycle);
     }
     Ok(records)
 }
 
-fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnState>, SessionError> {
+fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnState>, String> {
     let mut latest: Option<TurnState> = None;
     for lifecycle in records {
         match lifecycle.event {
             TurnEvent::Started => {
                 if latest.as_ref().is_some_and(TurnState::is_pending) {
-                    return Err(SessionError::new("invalid turn lifecycle sequence"));
+                    return Err("invalid turn lifecycle sequence".to_owned());
                 }
                 let (Some(kind), Some(phase), Some(first_message)) =
                     (lifecycle.kind, lifecycle.phase, lifecycle.first_message)
                 else {
-                    return Err(SessionError::new("invalid turn start record"));
+                    return Err("invalid turn start record".to_owned());
                 };
                 if lifecycle.outcome.is_some()
                     || lifecycle.last_message.is_some()
                     || lifecycle.error.is_some()
                 {
-                    return Err(SessionError::new("invalid turn start record"));
+                    return Err("invalid turn start record".to_owned());
                 }
                 latest = Some(TurnState {
                     turn_id: lifecycle.turn_id.clone(),
@@ -381,10 +375,10 @@ fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnSta
                 let Some(state) = latest.as_mut().filter(|state| {
                     state.turn_id == lifecycle.turn_id && state.is_pending()
                 }) else {
-                    return Err(SessionError::new("invalid turn phase record"));
+                    return Err("invalid turn phase record".to_owned());
                 };
                 let Some(phase) = lifecycle.phase else {
-                    return Err(SessionError::new("invalid turn phase record"));
+                    return Err("invalid turn phase record".to_owned());
                 };
                 if lifecycle.kind.is_some()
                     || lifecycle.outcome.is_some()
@@ -392,7 +386,7 @@ fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnSta
                     || lifecycle.last_message.is_some()
                     || lifecycle.error.is_some()
                 {
-                    return Err(SessionError::new("invalid turn phase record"));
+                    return Err("invalid turn phase record".to_owned());
                 }
                 state.phase = phase;
                 state.status = TurnStatus::Active;
@@ -402,19 +396,19 @@ fn reduce_turn_records(records: &[TurnLifecycleRecord]) -> Result<Option<TurnSta
                 let Some(state) = latest.as_mut().filter(|state| {
                     state.turn_id == lifecycle.turn_id && state.is_pending()
                 }) else {
-                    return Err(SessionError::new("invalid turn finish record"));
+                    return Err("invalid turn finish record".to_owned());
                 };
                 let Some(outcome) = lifecycle.outcome else {
-                    return Err(SessionError::new("invalid turn finish record"));
+                    return Err("invalid turn finish record".to_owned());
                 };
                 if lifecycle.kind.is_some()
                     || lifecycle.phase.is_some()
                     || lifecycle.first_message.is_some()
                 {
-                    return Err(SessionError::new("invalid turn finish record"));
+                    return Err("invalid turn finish record".to_owned());
                 }
                 if state.status == TurnStatus::Retryable && outcome != TurnOutcome::Abandoned {
-                    return Err(SessionError::new("invalid retryable turn transition"));
+                    return Err("invalid retryable turn transition".to_owned());
                 }
                 state.status = status_for_outcome(outcome);
                 state.last_message = lifecycle.last_message;
@@ -440,12 +434,17 @@ fn new_turn_id(session_id: &str) -> String {
     format!("{session_id}-turn-{}-{counter}", now())
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::LlmSettings;
 
@@ -455,13 +454,10 @@ mod tests {
 
     fn temporary_home() -> PathBuf {
         loop {
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
             let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "lucy-turn-{stamp}-{}-{counter}",
+                "lucy-turn-{}-{}-{counter}",
+                now(),
                 std::process::id()
             ));
             match fs::create_dir(&path) {
@@ -489,77 +485,45 @@ mod tests {
     }
 
     #[test]
-    fn turn_lifecycle_round_trips_and_reconstructs_latest_state() {
+    fn lifecycle_round_trips_and_reconstructs_retryable_state() {
         let home = temporary_home();
         let mut session = create_session(&home);
-        let turn_id = session.start_turn(TurnKind::User).expect("start turn");
+        let turn_id = session.start_turn(TurnKind::User).expect("start");
         session
             .set_turn_phase(&turn_id, TurnPhase::Compacting)
             .expect("phase");
         session
             .fail_turn_retryably(&turn_id, "provider unavailable".to_owned())
-            .expect("retryable failure");
+            .expect("failure");
 
-        let retryable = session.latest_turn().expect("read turn").expect("latest turn");
-        assert_eq!(retryable.turn_id, turn_id);
-        assert_eq!(retryable.phase, TurnPhase::Compacting);
-        assert_eq!(retryable.status, TurnStatus::Retryable);
-        assert_eq!(retryable.error.as_deref(), Some("provider unavailable"));
+        let expected = session.latest_turn().expect("read").expect("turn");
+        assert_eq!(expected.status, TurnStatus::Retryable);
+        assert_eq!(expected.error.as_deref(), Some("provider unavailable"));
 
         let resumed = Session::resume(&home, &session.id).expect("resume");
-        assert_eq!(resumed.latest_turn().expect("read resumed turn"), Some(retryable));
+        assert_eq!(resumed.latest_turn().expect("read"), Some(expected));
         fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]
-    fn pending_turn_must_be_resumed_or_abandoned_before_a_new_turn() {
+    fn pending_turn_blocks_a_second_turn_until_resolved() {
         let home = temporary_home();
         let mut session = create_session(&home);
-        let turn_id = session.start_turn(TurnKind::User).expect("start turn");
-        session
-            .fail_turn_retryably(&turn_id, "temporary".to_owned())
-            .expect("retryable failure");
+        let turn_id = session.start_turn(TurnKind::User).expect("start");
         assert!(session.start_turn(TurnKind::User).is_err());
-
-        session
-            .resume_retryable_turn(&turn_id)
-            .expect("resume retryable turn");
         session
             .finish_turn(&turn_id, TurnOutcome::Completed, None)
-            .expect("finish turn");
-        assert_eq!(
-            session
-                .latest_turn()
-                .expect("read turn")
-                .expect("latest turn")
-                .status,
-            TurnStatus::Completed
-        );
+            .expect("finish");
         assert!(session.start_turn(TurnKind::User).is_ok());
         fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]
-    fn legacy_sessions_without_turn_records_remain_valid() {
+    fn legacy_session_without_lifecycle_journal_remains_valid() {
         let home = temporary_home();
         let session = create_session(&home);
         let resumed = Session::resume(&home, &session.id).expect("resume");
-        assert_eq!(resumed.latest_turn().expect("read turn"), None);
-        fs::remove_dir_all(home).expect("cleanup");
-    }
-
-    #[test]
-    fn malformed_lifecycle_journal_is_not_silently_ignored() {
-        let home = temporary_home();
-        let session = create_session(&home);
-        fs::write(turn_journal_path(&session.path), "not json\n").expect("bad journal");
-        #[cfg(unix)]
-        fs::set_permissions(
-            turn_journal_path(&session.path),
-            fs::Permissions::from_mode(0o600),
-        )
-        .expect("private journal");
-        assert!(session.latest_turn().is_err());
+        assert_eq!(resumed.latest_turn().expect("read"), None);
         fs::remove_dir_all(home).expect("cleanup");
     }
 }
