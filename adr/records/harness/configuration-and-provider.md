@@ -13,7 +13,7 @@ depends_on:
   - harness.agent-boundary-and-protocol
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-26"
+last_reviewed: "2026-08-04"
 enforcement:
   - id: config-bootstrap-and-migration
     path: src/config.rs
@@ -66,7 +66,7 @@ Lucy MUST compose its current compiled built-in prompt with ambient context at n
 
 ## Context and forces
 
-Boot guidance is part of Lucy's product behavior and must evolve with the binary rather than vary through user configuration. Compatibility still requires accepting existing valid configuration and preserving its bytes; silently rewriting or rejecting a legacy `system_prompt` would turn the ownership change into destructive migration. Cargo installation has no portable user-home post-install hook, so first-run bootstrap remains the reliable installation-independent behavior for provider settings. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter durable user-controlled artifacts or serialized command output. Codex subscription refresh credentials require a private store outside config. Trusted command and context-discovery children inherit the terminal environment, including the provider credential, so the model can invoke another Lucy process through `cmd`; captured output is redacted before persistence. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
+Boot guidance is part of Lucy's product behavior and must evolve with the binary rather than vary through user configuration. Compatibility still requires accepting existing valid configuration and preserving its bytes; silently rewriting or rejecting a legacy `system_prompt` would turn the ownership change into destructive migration. Cargo installation has no portable user-home post-install hook, so first-run bootstrap remains the reliable installation-independent behavior for provider settings. The XDG base directory convention separates configuration from Lucy's legacy session storage while retaining a predictable user-editable location. Credentials are secrets and should not enter durable user-controlled artifacts or serialized command output. Codex subscription refresh credentials require a private store outside config. Context-discovery children inherit the terminal environment, while `cmd` children inherit ordinary variables but have the configured provider credential removed before spawn; captured output is redacted before persistence. This is not OS-level process isolation: parent-process inspection and transformed side channels remain outside the v1 guarantee.
 
 ## Invariants
 
@@ -77,7 +77,7 @@ Boot guidance is part of Lucy's product behavior and must evolve with the binary
 - Existing config bytes are not replaced by defaults.
 - A valid legacy top-level `system_prompt` is accepted and ignored; its entry is preserved through compatibility handling and unrelated settings writes, and it never overrides the compiled built-in prompt.
 - The active API key never appears in error text, JSONL output, or newly written session JSONL; unsafe key values are rejected before output.
-- The configured OpenRouter API-key environment variable remains available to trusted Lucy child environments, including context-discovery helpers and `cmd` shells; serialized output and persisted records still redact it. Codex subscription tokens are never placed in child environments.
+- The configured OpenRouter API-key environment variable remains available to context-discovery helpers but is removed from `cmd` child environments before spawn; serialized output and persisted records still redact it. Codex subscription tokens are never placed in child environments.
 - Early fallback diagnostics scrub every non-empty inherited environment value, including short values; missing-key diagnostics do not echo the configured environment-variable name.
 - A resumed session whose current key is already present in its raw file is rejected rather than sent to the provider or exposed by listing.
 - The session header and every provider-settings audit record are secret-safe; an effort containing the active provider key is rejected like other provider-setting values.

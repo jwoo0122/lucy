@@ -944,9 +944,7 @@ mod tests {
         std::env::set_var(&var_name, "bg-secret-key");
         let mut background = BackgroundCommands::default();
         let _ = execute_managed(
-            &format!(
-                r#"{{"command":"printf ${var_name}","background":true}}"#
-            ),
+            &format!(r#"{{"command":"printf ${var_name}","background":true}}"#),
             &cwd,
             &var_name,
             Some("bg-secret-key"),
@@ -960,10 +958,7 @@ mod tests {
         let completions = background.take_completions();
         assert_eq!(completions.len(), 1);
         assert!(
-            !completions[0]
-                .result
-                .stdout
-                .contains("bg-secret-key"),
+            !completions[0].result.stdout.contains("bg-secret-key"),
             "credential leaked into background command output"
         );
         std::env::remove_var(&var_name);
