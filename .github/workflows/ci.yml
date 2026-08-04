@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   quality:
@@ -17,114 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: agent/turn-lifecycle-records
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Apply compatibility patches
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          app_path = Path("src/app.rs")
-          source = app_path.read_text()
-          pattern = re.compile(
-              r'(?m)^(\s*)if let Err\(error\) =\s*\n'
-              r'\s*session\.append_provider_settings\('
-              r'session\.llm\.model\.clone\(\), session\.llm\.effort\.clone\(\)'
-              r'\)\s*\n\s*\{'
-          )
-
-          def replacement(match: re.Match[str]) -> str:
-              indent = match.group(1)
-              return (
-                  f"{indent}let selected_model = session.llm.model.clone();\n"
-                  f"{indent}let selected_effort = session.llm.effort.clone();\n"
-                  f"{indent}if let Err(error) = "
-                  "session.append_provider_settings(selected_model, selected_effort) {"
-              )
-
-          source, count = pattern.subn(replacement, source)
-          if count != 1:
-              raise SystemExit(f"unexpected provider settings call count: {count}")
-          app_path.write_text(source)
-
-          test_path = Path("tests/cli.rs")
-          tests = test_path.read_text()
-          start = tests.index("fn cmd_inherits_provider_key_but_redacts_captured_output()")
-          end = tests.index("\n#[test]\n", start)
-          before, target, after = tests[:start], tests[start:end], tests[end:]
-          target = target.replace(
-              "fn cmd_inherits_provider_key_but_redacts_captured_output()",
-              "fn cmd_removes_provider_key_and_preserves_ordinary_environment()",
-          )
-          target, assertion_count = re.subn(
-              r'assert_eq!\(\s*tool_result\["result"\]\["stdout"\]\s*,\s*"\[REDACTED\]"\s*\);',
-              'assert_eq!(tool_result["result"]["stdout"], "");',
-              target,
-          )
-          if assertion_count != 1:
-              raise SystemExit(
-                  f"unexpected provider environment assertion count: {assertion_count}"
-              )
-          tests = before + target + after
-
-          write_pattern = re.compile(
-              r'(?m)^(\s*)child\s*\n'
-              r'\s*\.stdin\s*\n'
-              r'\s*\.take\(\)\s*\n'
-              r'\s*\.expect\("stdin"\)\s*\n'
-              r'\s*\.write_all\(input\.as_bytes\(\)\)\s*\n'
-              r'\s*\.expect\("input"\);'
-          )
-
-          def write_replacement(match: re.Match[str]) -> str:
-              indent = match.group(1)
-              return (
-                  f"{indent}if let Err(error) = child\n"
-                  f"{indent}    .stdin\n"
-                  f"{indent}    .take()\n"
-                  f"{indent}    .expect(\"stdin\")\n"
-                  f"{indent}    .write_all(input.as_bytes())\n"
-                  f"{indent}{{\n"
-                  f"{indent}    assert_eq!(\n"
-                  f"{indent}        error.kind(),\n"
-                  f"{indent}        std::io::ErrorKind::BrokenPipe,\n"
-                  f"{indent}        \"input: {{error}}\"\n"
-                  f"{indent}    );\n"
-                  f"{indent}}}"
-              )
-
-          tests, write_count = write_pattern.subn(write_replacement, tests)
-          if write_count != 1:
-              raise SystemExit(f"unexpected child stdin write count: {write_count}")
-          test_path.write_text(tests)
-          PY
-
-      - name: Apply formatting
-        run: cargo fmt --all
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         env:
+          # Keep tests isolated from runner-level XDG configuration.
           XDG_CONFIG_HOME: ""
         run: cargo test --locked
-
-      - name: Restore CI definition and publish validated changes
-        shell: bash
-        run: |
-          git fetch origin main
-          git checkout origin/main -- .github/workflows/ci.yml
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add .
-          git commit -m "fix(session): validate lifecycle integration"
-          git push origin HEAD:agent/turn-lifecycle-records

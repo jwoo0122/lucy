@@ -1528,9 +1528,9 @@ fn resume_session<W: Write>(
             return None;
         }
     };
-    if let Err(error) =
-        session.append_provider_settings(session.llm.model.clone(), session.llm.effort.clone())
-    {
+    let selected_model = session.llm.model.clone();
+    let selected_effort = session.llm.effort.clone();
+    if let Err(error) = session.append_provider_settings(selected_model, selected_effort) {
         write_diagnostic_safe(diagnostics, &error.to_string(), Some(&provider.api_key()));
         return None;
     }

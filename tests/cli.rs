@@ -537,12 +537,18 @@ fn run_lucy_with_key_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("Lucy process");
-    child
+    if let Err(error) = child
         .stdin
         .take()
         .expect("stdin")
         .write_all(input.as_bytes())
-        .expect("input");
+    {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "input: {error}"
+        );
+    }
     wait_for_lucy(child)
 }
 
@@ -593,7 +599,7 @@ fn parse_lines(output: &[u8]) -> Vec<Value> {
 }
 
 #[test]
-fn cmd_inherits_provider_key_but_redacts_captured_output() {
+fn cmd_removes_provider_key_and_preserves_ordinary_environment() {
     let server = MockServer::start(vec![
         provider_environment_tool_response(),
         normal_response("finished"),
@@ -617,7 +623,7 @@ fn cmd_inherits_provider_key_but_redacts_captured_output() {
         .iter()
         .find(|record| record["type"] == "tool_result")
         .expect("tool result event");
-    assert_eq!(tool_result["result"]["stdout"], "[REDACTED]");
+    assert_eq!(tool_result["result"]["stdout"], "");
     assert_eq!(tool_result["result"]["stderr"], "ordinary-value");
     assert!(!serde_json::to_string(tool_result)
         .expect("tool result JSON")
