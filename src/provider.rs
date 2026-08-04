@@ -116,6 +116,14 @@ impl Provider {
     ) -> Result<String, ProviderError> {
         let planned =
             crate::compaction::prepare_summary_messages(messages).map_err(ProviderError::new)?;
+        self.summarize_prepared(planned, cancellation)
+    }
+
+    pub(crate) fn summarize_prepared(
+        &self,
+        planned: Vec<ChatMessage>,
+        cancellation: &CancellationToken,
+    ) -> Result<String, ProviderError> {
         // Context-window metadata is resolved by the interactive harness. The
         // provider facade deliberately avoids a second catalog request here;
         // overflow responses still trigger progressively smaller attempts.
