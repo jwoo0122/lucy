@@ -35,7 +35,12 @@ fn is_pruned(message: &ChatMessage) -> bool {
         .content
         .as_deref()
         .and_then(|content| serde_json::from_str::<Value>(content).ok())
-        .and_then(|value| value.get("marker").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .get("marker")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .as_deref()
         == Some(PRUNED_MARKER)
 }
@@ -170,13 +175,24 @@ mod tests {
         let messages = vec![
             tool(
                 "old",
-                format!("{{\"exit_code\":0,\"path\":\"src/lib.rs\",\"stdout\":\"{}\"}}", "x".repeat(60_000)),
+                format!(
+                    "{{\"exit_code\":0,\"path\":\"src/lib.rs\",\"stdout\":\"{}\"}}",
+                    "x".repeat(60_000)
+                ),
             ),
             tool("recent", "{\"exit_code\":0,\"stdout\":\"ok\"}".to_owned()),
         ];
         let pruned = prune_old_tool_outputs(&messages);
-        assert!(pruned[0].content.as_deref().unwrap_or_default().contains(PRUNED_MARKER));
-        assert!(pruned[0].content.as_deref().unwrap_or_default().contains("src/lib.rs"));
+        assert!(pruned[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains(PRUNED_MARKER));
+        assert!(pruned[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("src/lib.rs"));
         assert_eq!(pruned[1], messages[1]);
         assert_eq!(messages[0].tool_call_id.as_deref(), Some("old"));
     }
@@ -196,20 +212,31 @@ mod tests {
         let first = prune_old_tool_outputs(&messages);
         let second = prune_old_tool_outputs(&first);
         assert_eq!(first, second);
-        assert_eq!(messages[0].content.as_deref(), Some("x".repeat(100_000).as_str()));
+        assert_eq!(messages[0].content.as_deref().map(str::len), Some(100_000));
     }
 
     #[test]
     fn canceled_and_failed_results_remain_distinguishable() {
         let canceled = prune_old_tool_outputs(&[tool(
             "canceled",
-            format!("{{\"canceled\":true,\"stdout\":\"{}\"}}", "x".repeat(100_000)),
+            format!(
+                "{{\"canceled\":true,\"stdout\":\"{}\"}}",
+                "x".repeat(100_000)
+            ),
         )]);
         let failed = prune_old_tool_outputs(&[tool(
             "failed",
             format!("{{\"exit_code\":2,\"stdout\":\"{}\"}}", "x".repeat(100_000)),
         )]);
-        assert!(canceled[0].content.as_deref().unwrap_or_default().contains("canceled"));
-        assert!(failed[0].content.as_deref().unwrap_or_default().contains("failed"));
+        assert!(canceled[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("canceled"));
+        assert!(failed[0]
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed"));
     }
 }

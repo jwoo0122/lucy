@@ -106,19 +106,6 @@ impl Provider {
         Self(self.0.with_session_id(session_id))
     }
 
-    /// Summarize only the history selected for removal. The retained tail is
-    /// deliberately absent from this request and remains verbatim in the
-    /// ordinary provider context after the resulting boundary is committed.
-    pub(crate) fn summarize(
-        &self,
-        messages: &[ChatMessage],
-        cancellation: &CancellationToken,
-    ) -> Result<String, ProviderError> {
-        let planned =
-            crate::compaction::prepare_summary_messages(messages).map_err(ProviderError::new)?;
-        self.summarize_prepared(planned, cancellation)
-    }
-
     pub(crate) fn summarize_prepared(
         &self,
         planned: Vec<ChatMessage>,

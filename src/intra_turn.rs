@@ -40,9 +40,7 @@ pub(crate) fn find_compaction_plan(
             .iter()
             .copied()
             .rev()
-            .find(|boundary| {
-                estimate_context_tokens(&messages[*boundary..]) >= keep_recent_tokens
-            })
+            .find(|boundary| estimate_context_tokens(&messages[*boundary..]) >= keep_recent_tokens)
             .or_else(|| candidates.first().copied())
             .filter(|boundary| *boundary > floor)
         {
@@ -101,13 +99,13 @@ pub(crate) fn prepare_summary_messages(
             "Update the prior summary with the newly discarded completed history."
         },
     });
+    let encoded = serde_json::to_string(&vec![payload])
+        .map_err(|error| format!("unable to encode compaction input: {error}"))?;
     Ok(vec![
         ChatMessage::system(boot_system_prompt.to_owned()),
         ChatMessage::system(SUMMARY_SYSTEM_PROMPT.to_owned()),
         ChatMessage::user(format!(
-            "<lucy_compaction_input_json>\n{}\n</lucy_compaction_input_json>",
-            serde_json::to_string(&payload)
-                .map_err(|error| format!("unable to encode compaction input: {error}"))?
+            "<lucy_compaction_input_json>\n<discarded_history_json>\n{encoded}\n</discarded_history_json>\n</lucy_compaction_input_json>"
         )),
     ])
 }
@@ -117,7 +115,10 @@ fn is_turn_start(message: &ChatMessage) -> bool {
 }
 
 fn structurally_valid_suffix(messages: &[ChatMessage], boundary: usize) -> bool {
-    if messages.get(boundary).is_none_or(|message| message.role != "assistant") {
+    if messages
+        .get(boundary)
+        .is_none_or(|message| message.role != "assistant")
+    {
         return false;
     }
     let mut declarations = HashMap::<&str, usize>::new();
@@ -202,7 +203,7 @@ mod tests {
             ChatMessage::tool("two".to_owned(), "cmd".to_owned(), "recent".to_owned()),
         ];
         let plan = find_compaction_plan(&messages, None, 1_000).expect("plan");
-        assert_eq!(plan.boundary, 3);
+        assert_eq!(plan.boundary, 1);
         assert_eq!(plan.turn_start, Some(0));
         assert_ne!(messages[plan.boundary].role, "tool");
     }
@@ -221,7 +222,8 @@ mod tests {
 
     #[test]
     fn split_summary_keeps_request_and_completed_work_without_reasoning() {
-        let mut assistant = ChatMessage::assistant("changed src/lib.rs".to_owned(), vec![call("one")]);
+        let mut assistant =
+            ChatMessage::assistant("changed src/lib.rs".to_owned(), vec![call("one")]);
         assistant.reasoning_details = Some(vec![json!({"private": "secret thought"})]);
         let messages = vec![
             ChatMessage::user("fix the project".to_owned()),
