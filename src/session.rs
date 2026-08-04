@@ -148,6 +148,10 @@ impl Session {
         base::Session::list_with_secret(home, external_secret).map_err(Into::into)
     }
 
+    pub fn provider_messages(&self) -> Vec<ChatMessage> {
+        crate::tool_pruning::prune_old_tool_outputs(&self.inner.provider_messages())
+    }
+
     /// Append a semantic message while maintaining one explicit logical turn.
     /// `!retry` is a control input: it resumes the existing turn without
     /// becoming another provider-visible user message.
@@ -390,6 +394,54 @@ mod wrapper_tests {
         file.write_all(b"not-json\n").expect("corrupt record");
         file.sync_data().expect("corrupt checkpoint");
         assert!(Session::resume(&home, &id).is_err());
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+    #[test]
+    fn pruned_provider_context_is_stable_across_resume_without_mutating_raw_history() {
+        let (home, mut session) = session();
+        session
+            .append_message(ChatMessage::user("run a large command".to_owned()))
+            .expect("user");
+        session
+            .append_message(ChatMessage::assistant(
+                "running".to_owned(),
+                vec![crate::model::ChatToolCall {
+                    id: "large".to_owned(),
+                    name: "cmd".to_owned(),
+                    arguments: "{}".to_owned(),
+                }],
+            ))
+            .expect("assistant");
+        session
+            .append_message(ChatMessage::tool(
+                "large".to_owned(),
+                "cmd".to_owned(),
+                "x".repeat(100_000),
+            ))
+            .expect("tool");
+        let id = session.id.clone();
+        let first = session.provider_messages();
+        assert_eq!(
+            session
+                .messages
+                .last()
+                .and_then(|message| message.content.as_deref())
+                .map(str::len),
+            Some(100_000)
+        );
+        drop(session);
+
+        let resumed = Session::resume(&home, &id).expect("resume");
+        assert_eq!(resumed.provider_messages(), first);
+        assert_eq!(
+            resumed
+                .messages
+                .last()
+                .and_then(|message| message.content.as_deref())
+                .map(str::len),
+            Some(100_000)
+        );
+        drop(resumed);
         fs::remove_dir_all(home).expect("cleanup");
     }
 }

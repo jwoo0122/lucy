@@ -106,16 +106,11 @@ impl Provider {
         Self(self.0.with_session_id(session_id))
     }
 
-    /// Summarize only the history selected for removal. The retained tail is
-    /// deliberately absent from this request and remains verbatim in the
-    /// ordinary provider context after the resulting boundary is committed.
-    pub(crate) fn summarize(
+    pub(crate) fn summarize_prepared(
         &self,
-        messages: &[ChatMessage],
+        planned: Vec<ChatMessage>,
         cancellation: &CancellationToken,
     ) -> Result<String, ProviderError> {
-        let planned =
-            crate::compaction::prepare_summary_messages(messages).map_err(ProviderError::new)?;
         // Context-window metadata is resolved by the interactive harness. The
         // provider facade deliberately avoids a second catalog request here;
         // overflow responses still trigger progressively smaller attempts.
