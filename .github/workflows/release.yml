@@ -23,7 +23,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Apply budget trigger and provider visibility fix
+      - name: Apply budget trigger, tests, and provider visibility fix
         shell: bash
         run: |
           python3 - <<'PY'
@@ -49,6 +49,27 @@ jobs:
               crate::context_budget::should_compact(context_tokens, context_window)
           }'''
           source, function_count = pattern.subn(replacement, source)
+
+          old_test = '''    #[test]
+              fn auto_compaction_triggers_at_or_above_ninety_five_percent_only() {
+                  assert!(!should_compact_context(94, 100));
+                  assert!(should_compact_context(95, 100));
+                  assert!(should_compact_context(96, 100));
+                  assert!(!should_compact_context(100, 0));
+              }
+'''
+          new_test = '''    #[test]
+              fn auto_compaction_reserves_output_and_estimation_headroom() {
+                  assert!(!should_compact_context(109_055, 128_000));
+                  assert!(should_compact_context(109_056, 128_000));
+                  assert!(should_compact_context(110_000, 128_000));
+                  assert!(!should_compact_context(100, 0));
+              }
+'''
+          if source.count(old_test) != 1:
+              raise SystemExit('unexpected compaction threshold test')
+          source = source.replace(old_test, new_test)
+
           if constant_count != 1 or function_count != 1:
               raise SystemExit(
                   f'unexpected compaction trigger matches: constant={constant_count}, function={function_count}'
