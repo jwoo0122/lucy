@@ -30,16 +30,22 @@ jobs:
           import textwrap
           from pathlib import Path
 
+          turn_path = Path('src/session/turn.rs')
+          turn_source = turn_path.read_text()
+          actual = '''        file.flush()
+              .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;'''
+          normalized = '''        file.flush()
+          .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;'''
+          if turn_source.count(actual) != 1:
+              raise SystemExit('unexpected lifecycle writer source')
+          turn_path.write_text(turn_source.replace(actual, normalized))
+
           workflow = Path('.github/workflows/apply-session-journal-safety.yml').read_text()
           start_marker = "          python3 - <<'PY'\n"
           end_marker = "\n          PY\n"
           start = workflow.index(start_marker) + len(start_marker)
           end = workflow.index(end_marker, start)
           script = textwrap.dedent(workflow[start:end])
-          script = script.replace(
-              "'''        file.flush()\n          .map_err",
-              "'''        file.flush()\n            .map_err",
-          )
           exec(compile(script, 'apply-session-journal-safety', 'exec'))
           RUNNER
 
