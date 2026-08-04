@@ -36,6 +36,10 @@ jobs:
           start = workflow.index(start_marker) + len(start_marker)
           end = workflow.index(end_marker, start)
           script = textwrap.dedent(workflow[start:end])
+          script = script.replace(
+              "'''        file.flush()\n          .map_err",
+              "'''        file.flush()\n            .map_err",
+          )
           exec(compile(script, 'apply-session-journal-safety', 'exec'))
           RUNNER
 
