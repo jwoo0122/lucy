@@ -57,21 +57,23 @@ jobs:
 
           test_path = Path("tests/cli.rs")
           tests = test_path.read_text()
-          tests, name_count = re.subn(
-              r"fn\s+cmd_inherits_provider_key_but_redacts_captured_output\s*\(\s*\)",
+          start = tests.index("fn cmd_inherits_provider_key_but_redacts_captured_output()")
+          end = tests.index("\n#[test]\n", start)
+          before, target, after = tests[:start], tests[start:end], tests[end:]
+          target = target.replace(
+              "fn cmd_inherits_provider_key_but_redacts_captured_output()",
               "fn cmd_removes_provider_key_and_preserves_ordinary_environment()",
-              tests,
           )
-          tests, assertion_count = re.subn(
+          target, assertion_count = re.subn(
               r'assert_eq!\(\s*tool_result\["result"\]\["stdout"\]\s*,\s*"\[REDACTED\]"\s*\);',
               'assert_eq!(tool_result["result"]["stdout"], "");',
-              tests,
+              target,
           )
-          if name_count != 1 or assertion_count != 1:
+          if assertion_count != 1:
               raise SystemExit(
-                  f"unexpected provider environment patch counts: name={name_count}, assertion={assertion_count}"
+                  f"unexpected provider environment assertion count: {assertion_count}"
               )
-          test_path.write_text(tests)
+          test_path.write_text(before + target + after)
           PY
 
       - name: Apply formatting
