@@ -24,20 +24,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Apply final integration patch
-        shell: bash
-        run: |
-          python3 - <<'RUNNER'
-          import textwrap
-          from pathlib import Path
-
-          workflow = Path('.github/workflows/release.yml').read_text()
-          start_marker = "          python3 - <<'PY'\n"
-          end_marker = "\n          PY\n"
-          start = workflow.index(start_marker) + len(start_marker)
-          end = workflow.index(end_marker, start)
-          script = textwrap.dedent(workflow[start:end])
-          exec(compile(script, 'apply-intra-turn-compaction', 'exec'))
-          RUNNER
+        run: python3 scripts/apply_intra_turn.py
 
       - name: Format
         run: cargo fmt --all
@@ -55,7 +42,7 @@ jobs:
         run: |
           git fetch origin agent/session-journal-safety
           git checkout origin/agent/session-journal-safety -- .github/workflows/release.yml
-          rm -f .intra-turn-validation-trigger
+          rm -f .intra-turn-validation-trigger scripts/apply_intra_turn.py
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add .
