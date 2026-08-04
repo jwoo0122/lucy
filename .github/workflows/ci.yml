@@ -73,7 +73,25 @@ jobs:
               raise SystemExit(
                   f"unexpected provider environment assertion count: {assertion_count}"
               )
-          test_path.write_text(before + target + after)
+          tests = before + target + after
+
+          old_write = '''    child
+              .stdin
+              .take()
+              .expect("stdin")
+              .write_all(input.as_bytes())
+              .expect("input");'''
+          new_write = '''    if let Err(error) = child
+              .stdin
+              .take()
+              .expect("stdin")
+              .write_all(input.as_bytes())
+          {
+              assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "input: {error}");
+          }'''
+          if tests.count(old_write) != 1:
+              raise SystemExit("unexpected child stdin write block")
+          test_path.write_text(tests.replace(old_write, new_write))
           PY
 
       - name: Apply formatting
