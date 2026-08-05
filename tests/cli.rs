@@ -537,12 +537,18 @@ fn run_lucy_with_key_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("Lucy process");
-    child
+    if let Err(error) = child
         .stdin
         .take()
         .expect("stdin")
         .write_all(input.as_bytes())
-        .expect("input");
+    {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "input: {error}"
+        );
+    }
     wait_for_lucy(child)
 }
 
