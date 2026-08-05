@@ -6,6 +6,37 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.5](https://github.com/jwoo0122/lucy/compare/v1.14.4...v1.14.5) - 2026-08-05
+
+### Fixed
+
+- *(session)* validate lifecycle integration
+
+### Other
+
+- build clean final reliability branch
+- restack final reliability PR
+- start reliability stack restack
+- restack reliability PRs on main
+- restore standard CI definition
+- *(session)* isolate turn journals from transcripts
+- trigger transcript fixture validation
+- validate transcript fixture selection
+- robustly patch early diagnostic pipe handling
+- tolerate expected early diagnostic pipe closure
+- scope provider environment assertion patch
+- tolerate formatted integration assertions
+- validate lifecycle integration against current security contract
+- make wrapper compatibility patch robust
+- apply wrapper compatibility fix in CI
+- validate and apply current rustfmt
+- *(session)* apply current rustfmt output
+- *(session)* make lifecycle storage wrapper-compatible
+- *(session)* wrap transcript storage for lifecycle extensions
+- *(session)* persist lifecycle in private journal
+- *(session)* split lifecycle storage module
+- *(session)* add turn lifecycle model
+
 ## [1.14.4](https://github.com/jwoo0122/lucy/compare/v1.14.3...v1.14.4) - 2026-08-04
 
 ### Fixed
