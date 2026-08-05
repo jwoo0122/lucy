@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use crate::cancellation::CancellationToken;
 use crate::config::{AuthProvider, Config, LlmSettings};
 use crate::context::{resolve_boot_context_with_api_key_env, InstructionSource, SkillEntry};
-use crate::model::{estimate_context_tokens, estimate_message_tokens, ChatMessage, ChatToolCall};
+use crate::model::{estimate_context_tokens, ChatMessage, ChatToolCall};
 use crate::protocol::{EventSink, ProtocolEvent, ProtocolWriter};
 use crate::provider::{Provider, ProviderStreamEvent, ProviderTurn};
 use crate::redaction::{
@@ -45,9 +45,7 @@ struct InputRecord {
 const USER_CANCEL_REASON: &str = "user_cancelled";
 const PROVIDER_PHASE: &str = "provider_stream";
 const COMMAND_PHASE: &str = "cmd";
-const AUTO_COMPACTION_THRESHOLD_PERCENT: usize = 95;
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
-const COMPACTION_SYSTEM_PROMPT: &str = "You are compacting a coding-agent conversation. Produce a concise, factual continuation summary. Preserve the user's goals, explicit decisions, constraints, files and code changes, commands and results, current implementation state, unresolved work, and exact identifiers that future turns need. Do not invent facts. Return only the summary text; do not call tools.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendMode {
@@ -476,44 +474,27 @@ pub(crate) struct Harness {
 }
 
 fn should_compact_context(context_tokens: usize, context_window: usize) -> bool {
-    context_window > 0
-        && context_tokens as u128 * 100
-            >= context_window as u128 * AUTO_COMPACTION_THRESHOLD_PERCENT as u128
+    crate::context_budget::should_compact(context_tokens, context_window)
 }
 
+fn find_compaction_plan(
+    messages: &[ChatMessage],
+    previous_boundary: Option<usize>,
+) -> Option<crate::intra_turn::CompactionPlan> {
+    let pruned = crate::tool_pruning::prune_old_tool_outputs(messages);
+    crate::intra_turn::find_compaction_plan(
+        &pruned,
+        previous_boundary,
+        COMPACTION_KEEP_RECENT_TOKENS,
+    )
+}
+
+#[cfg(test)]
 fn find_compaction_boundary(
     messages: &[ChatMessage],
     previous_boundary: Option<usize>,
 ) -> Option<usize> {
-    let user_starts = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| (message.role == "user").then_some(index))
-        .collect::<Vec<_>>();
-    let mut start = *user_starts.last()?;
-    let end = messages.len();
-    let mut kept_tokens = messages[start..end]
-        .iter()
-        .map(estimate_message_tokens)
-        .sum::<usize>();
-
-    while kept_tokens < COMPACTION_KEEP_RECENT_TOKENS {
-        let Some(previous_start) = user_starts
-            .iter()
-            .copied()
-            .rev()
-            .find(|candidate| *candidate < start)
-        else {
-            break;
-        };
-        start = previous_start;
-        kept_tokens = messages[start..end]
-            .iter()
-            .map(estimate_message_tokens)
-            .sum::<usize>();
-    }
-
-    (start > 0 && previous_boundary.is_none_or(|previous| start > previous)).then_some(start)
+    find_compaction_plan(messages, previous_boundary).map(|plan| plan.boundary)
 }
 
 impl Harness {
@@ -553,7 +534,7 @@ impl Harness {
             .is_some_and(|window| should_compact_context(estimate_context_tokens(messages), window))
     }
 
-    fn compaction_boundary(&self) -> Option<usize> {
+    fn compaction_plan(&self) -> Option<crate::intra_turn::CompactionPlan> {
         let latest_boundary = self
             .session
             .history
@@ -565,7 +546,7 @@ impl Harness {
                 }
                 _ => None,
             });
-        find_compaction_boundary(&self.session.messages, latest_boundary)
+        find_compaction_plan(&self.session.messages, latest_boundary)
     }
 
     fn compact_context<S: EventSink>(
@@ -573,34 +554,53 @@ impl Harness {
         sink: &mut S,
         cancellation: Option<&crate::cancellation::CancellationToken>,
         tokens_before: usize,
-    ) -> Result<(), String> {
-        let Some(boundary) = self.compaction_boundary() else {
-            return Err("context cannot be compacted without an earlier complete turn".to_owned());
+    ) -> Result<usize, String> {
+        let Some(plan) = self.compaction_plan() else {
+            return Err("context cannot be compacted at a structurally safe boundary".to_owned());
         };
         let Some(cancellation) = cancellation else {
             return Err("context compaction requires a cancellable turn".to_owned());
         };
+        let (previous_boundary, previous_summary) = self
+            .session
+            .history
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                crate::session::SessionHistoryRecord::Compaction(compaction) => Some((
+                    Some(compaction.first_kept_message),
+                    Some(compaction.summary.clone()),
+                )),
+                _ => None,
+            })
+            .unwrap_or((None, None));
         sink.compaction_started()
             .map_err(|error| format!("unable to emit compaction state: {error}"))?;
-        let context_messages = self.session.provider_messages();
-        let mut summary_messages = Vec::with_capacity(context_messages.len() + 1);
-        summary_messages.push(ChatMessage::system(self.session.boot_system_prompt.clone()));
-        summary_messages.push(ChatMessage::system(COMPACTION_SYSTEM_PROMPT.to_owned()));
-        summary_messages.extend(context_messages.into_iter().skip(1));
-        let summary = match self.provider.summarize(&summary_messages, cancellation) {
+        let summary_messages = crate::intra_turn::prepare_summary_messages(
+            &self.session.boot_system_prompt,
+            previous_summary.as_deref(),
+            &self.session.messages,
+            previous_boundary,
+            plan,
+        )?;
+        let summary = match self
+            .provider
+            .summarize_prepared(summary_messages, cancellation)
+        {
             Ok(summary) => redact_secret(&summary, Some(self.provider.api_key().as_str())),
             Err(error) if cancellation.is_cancelled() || error.is_cancelled() => {
-                return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
+                self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new())?;
+                return Ok(plan.boundary);
             }
             Err(error) => return Err(format!("unable to compact context: {error}")),
         };
         self.session
-            .append_compaction(summary, boundary, tokens_before)
+            .append_compaction(summary, plan.boundary, tokens_before)
             .map_err(|error| format!("unable to persist context compaction: {error}"))?;
         let tokens_after = estimate_context_tokens(&self.session.provider_messages());
         sink.compaction_finished(tokens_before, tokens_after)
             .map_err(|error| format!("unable to emit compaction state: {error}"))?;
-        Ok(())
+        Ok(plan.boundary)
     }
 
     pub(crate) fn handle_message<S: EventSink>(
@@ -680,7 +680,7 @@ impl Harness {
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Result<(), String> {
         let secret = self.provider.api_key();
-        let mut compacted_for_turn = false;
+        let mut last_compaction_boundary = None;
         loop {
             self.append_background_completions()?;
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -688,9 +688,12 @@ impl Harness {
             }
             let mut messages = self.session.provider_messages();
             let tokens_before = estimate_context_tokens(&messages);
-            if !compacted_for_turn && self.should_compact(&messages) {
-                self.compact_context(sink, cancellation, tokens_before)?;
-                compacted_for_turn = true;
+            if self.should_compact(&messages) {
+                let boundary = self.compact_context(sink, cancellation, tokens_before)?;
+                if last_compaction_boundary == Some(boundary) {
+                    return Err("context compaction did not advance its boundary".to_owned());
+                }
+                last_compaction_boundary = Some(boundary);
                 messages = self.session.provider_messages();
             }
             sink.context_usage(estimate_context_tokens(&messages))
@@ -1669,10 +1672,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_compaction_triggers_at_or_above_ninety_five_percent_only() {
-        assert!(!should_compact_context(94, 100));
-        assert!(should_compact_context(95, 100));
-        assert!(should_compact_context(96, 100));
+    fn auto_compaction_reserves_output_and_estimation_headroom() {
+        assert!(!should_compact_context(109_055, 128_000));
+        assert!(should_compact_context(109_056, 128_000));
+        assert!(should_compact_context(110_000, 128_000));
         assert!(!should_compact_context(100, 0));
     }
 
@@ -1685,8 +1688,8 @@ mod tests {
             ChatMessage::assistant("recent answer ".repeat(8_000), Vec::new()),
         ];
 
-        assert_eq!(find_compaction_boundary(&messages, None), Some(2));
-        assert_eq!(find_compaction_boundary(&messages, Some(2)), None);
+        assert_eq!(find_compaction_boundary(&messages, None), Some(3));
+        assert_eq!(find_compaction_boundary(&messages, Some(3)), None);
     }
 
     #[test]
