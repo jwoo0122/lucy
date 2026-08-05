@@ -251,8 +251,8 @@ impl Session {
         let mut file = open_turn_journal_for_append(&path)?;
         file.write_all(encoded.as_bytes())
             .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;
-        file.flush()
-            .map_err(|_| "unable to write turn lifecycle journal".to_owned())?;
+        file.sync_data()
+            .map_err(|_| "unable to checkpoint turn lifecycle journal".to_owned())?;
         Ok(())
     }
 }
@@ -543,7 +543,11 @@ mod tests {
             1
         );
 
-        let resumed = Session::resume(&home, &session.id).expect("resume");
+        let session_id = session.id.clone();
+
+        drop(session);
+
+        let resumed = Session::resume(&home, &session_id).expect("resume");
         assert_eq!(resumed.latest_turn().expect("read"), Some(expected));
         fs::remove_dir_all(home).expect("cleanup");
     }
@@ -565,7 +569,9 @@ mod tests {
     fn legacy_session_without_lifecycle_journal_remains_valid() {
         let home = temporary_home();
         let session = create_session(&home);
-        let resumed = Session::resume(&home, &session.id).expect("resume");
+        let session_id = session.id.clone();
+        drop(session);
+        let resumed = Session::resume(&home, &session_id).expect("resume");
         assert_eq!(resumed.latest_turn().expect("read"), None);
         fs::remove_dir_all(home).expect("cleanup");
     }
