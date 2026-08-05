@@ -1114,11 +1114,11 @@ fn open_session_for_append(path: &Path) -> Result<File, SessionError> {
 }
 
 fn write_json_record<T: Serialize>(file: &mut File, record: &T) -> Result<(), SessionError> {
-    let line = serde_json::to_string(record)
+    let mut line = serde_json::to_vec(record)
         .map_err(|error| SessionError::new(format!("unable to encode session record: {error}")))?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()?;
+    line.push(b'\n');
+    file.write_all(&line)?;
+    file.sync_data()?;
     Ok(())
 }
 
