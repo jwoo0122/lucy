@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.6](https://github.com/jwoo0122/lucy/compare/v1.14.5...v1.14.6) - 2026-08-06
+
+### Fixed
+
+- Replace fullscreen TUI with inline terminal view ([#85](https://github.com/jwoo0122/lucy/pull/85))
+
 ## [1.14.5](https://github.com/jwoo0122/lucy/compare/v1.14.4...v1.14.5) - 2026-08-05
 
 ### Fixed
