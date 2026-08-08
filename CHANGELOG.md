@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.7](https://github.com/jwoo0122/lucy/compare/v1.14.6...v1.14.7) - 2026-08-08
+
+### Fixed
+
+- WSL Codex login browser launch ([#86](https://github.com/jwoo0122/lucy/pull/86))
+
 ## [1.14.6](https://github.com/jwoo0122/lucy/compare/v1.14.5...v1.14.6) - 2026-08-06
 
 ### Fixed
