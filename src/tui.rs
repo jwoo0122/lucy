@@ -19,7 +19,7 @@ use ratatui::layout::{Alignment, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -385,6 +385,12 @@ fn event_loop<W: Write>(
             match messages.try_recv() {
                 Ok(WorkerMessage::Event(event)) => state.apply_event(event),
                 Ok(WorkerMessage::Started { cancel, user_text }) => {
+                    state.turn_transcript_start = state.next_turn_transcript_start(&user_text);
+                    // Archiving is intentionally best-effort: an unsupported or
+                    // failing terminal operation must not end an otherwise valid
+                    // agent turn. On failure the transcript remains untouched and
+                    // continues to use the in-app scrolling fallback.
+                    let _ = archive_previous_turns(terminal, state);
                     if let Some(text) = user_text {
                         state.start_queued_user(&text);
                     }
@@ -864,6 +870,50 @@ fn release_finished_turn<W: Write>(writer: &mut W, state: &mut UiState) {
     }
 }
 
+/// Move completed turns above the current one into the emulator's native
+/// scrollback. The newest turn remains in the live viewport, while older turns
+/// stop consuming its fixed height and can be revisited with normal terminal
+/// scrolling, selection, and search.
+fn archive_previous_turns<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut UiState,
+) -> Result<(), String> {
+    let item_count = state.turn_transcript_start.min(state.transcript.len());
+    if item_count == 0 {
+        return Ok(());
+    }
+
+    let size = terminal
+        .size()
+        .map_err(|error| format!("unable to read terminal size: {error}"))?;
+    let content_area = bottom_console_area(Rect::new(0, 0, size.width, 0), 0, 0);
+    let lines = render_transcript_items(
+        &state.transcript[..item_count],
+        content_area.width.max(1) as usize,
+        state,
+    );
+    for lines in lines.chunks(u16::MAX as usize) {
+        let height = lines.len() as u16;
+        terminal
+            .insert_before(height, |buffer| {
+                Paragraph::new(lines.to_vec()).render(
+                    Rect::new(content_area.x, 0, content_area.width, height),
+                    buffer,
+                );
+            })
+            .map_err(|error| {
+                format!("unable to append transcript to terminal scrollback: {error}")
+            })?;
+    }
+
+    state.transcript.drain(..item_count);
+    state.turn_transcript_start = 0;
+    state.turn_start_transcript_len = state.turn_start_transcript_len.saturating_sub(item_count);
+    state.scroll = 0;
+    state.auto_scroll = true;
+    Ok(())
+}
+
 enum WorkerRequest {
     Turn {
         text: String,
@@ -964,6 +1014,7 @@ struct UiState {
     context_tokens: usize,
     secret: String,
     transcript: Vec<TranscriptItem>,
+    turn_transcript_start: usize,
     turn_start_transcript_len: usize,
     queued_messages: Vec<String>,
     input: String,
@@ -1009,6 +1060,7 @@ impl UiState {
             context_tokens: 1,
             secret: secret.to_owned(),
             transcript: Vec::new(),
+            turn_transcript_start: 0,
             turn_start_transcript_len: 0,
             queued_messages: Vec::new(),
             input: String::new(),
@@ -1515,6 +1567,27 @@ impl UiState {
         };
         if queued {
             self.add_user(text, &self.secret.clone());
+        }
+    }
+
+    fn next_turn_transcript_start(&self, user_text: &Option<String>) -> usize {
+        let Some(text) = user_text else {
+            return self.transcript.len();
+        };
+        let safe = redact_secret(text, Some(&self.secret));
+        if self.queued_messages.iter().any(|queued| queued == &safe) {
+            self.transcript.len()
+        } else {
+            // An idle submission is rendered before the worker acknowledges
+            // it. Locate that exact user item instead of assuming the final
+            // transcript item is still the user message: protocol events may
+            // already have arrived by the time `Started` is processed.
+            self.transcript
+                .iter()
+                .rposition(
+                    |item| matches!(item, TranscriptItem::User { text, .. } if text == &safe),
+                )
+                .unwrap_or(self.transcript.len())
         }
     }
 
@@ -3992,6 +4065,65 @@ mod tests {
         release_finished_turn(&mut output, &mut state);
 
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn completed_previous_turns_move_into_native_scrollback() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.add_assistant_message("older response");
+        state.turn_transcript_start = state.transcript.len();
+        state.add_user("latest question", "secret");
+        state.add_assistant_message("latest response");
+
+        let backend = ratatui::backend::TestBackend::new(40, 4);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .expect("inline terminal");
+        terminal
+            .draw(|frame| draw(frame, &state))
+            .expect("initial draw");
+
+        archive_previous_turns(&mut terminal, &mut state).expect("archive transcript");
+
+        assert_eq!(state.transcript.len(), 2);
+        assert!(matches!(
+            &state.transcript[1],
+            TranscriptItem::Assistant(text) if text == "latest response"
+        ));
+        let scrollback = terminal
+            .backend()
+            .scrollback()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(scrollback.contains("older response"));
+        assert!(!scrollback.contains("latest response"));
+    }
+
+    #[test]
+    fn turn_boundary_matches_the_started_message_even_with_a_pending_queue() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.add_assistant_message("older response");
+        state.add_user("active question", "secret");
+        state.queue_user("queued follow-up");
+
+        assert_eq!(
+            state.next_turn_transcript_start(&Some("active question".to_owned())),
+            1,
+            "an unrelated queued message must not reclassify the active submission"
+        );
+        assert_eq!(
+            state.next_turn_transcript_start(&Some("queued follow-up".to_owned())),
+            state.transcript.len(),
+            "the queued message is appended only after its worker turn starts"
+        );
     }
 
     #[test]
