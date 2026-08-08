@@ -8,6 +8,8 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -568,7 +570,7 @@ fn linux_browser_launchers(
     wsl_distro_name: Option<&std::ffi::OsStr>,
     kernel_os_release: Option<&str>,
 ) -> &'static [&'static str] {
-    const WSL: &[&str] = &["explorer.exe", "xdg-open"];
+    const WSL: &[&str] = &["powershell.exe", "xdg-open"];
     const LINUX: &[&str] = &["xdg-open"];
 
     let is_wsl = wsl_interop.is_some_and(|value| !value.is_empty())
@@ -583,12 +585,35 @@ fn linux_browser_launchers(
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserLaunchError {
+    Spawn,
+    Stdin,
+    Write,
+    Wait,
+    Exit,
+}
+
+#[cfg(target_os = "linux")]
 fn launch_browser_with(
     programs: &[&str],
     url: &str,
-    mut launch: impl FnMut(&str, &str) -> bool,
+    mut launch: impl FnMut(&str, &[&str], Option<&[u8]>) -> Result<(), BrowserLaunchError>,
 ) -> bool {
-    programs.iter().any(|program| launch(program, url))
+    const POWERSHELL_ARGS: &[&str] = &[
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "try { Start-Process -FilePath ([Console]::In.ReadToEnd()) -ErrorAction Stop; exit 0 } catch { exit 1 }",
+    ];
+
+    programs.iter().any(|program| {
+        if *program == "powershell.exe" {
+            launch(program, POWERSHELL_ARGS, Some(url.as_bytes())).is_ok()
+        } else {
+            launch(program, &[url], None).is_ok()
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -599,8 +624,30 @@ fn open_browser(url: &str) -> bool {
         std::env::var_os("WSL_DISTRO_NAME").as_deref(),
         kernel_os_release.as_deref(),
     );
-    launch_browser_with(programs, url, |program, url| {
-        Command::new(program).arg(url).spawn().is_ok()
+    launch_browser_with(programs, url, |program, args, stdin| {
+        let mut command = Command::new(program);
+        command.args(args);
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command.spawn().map_err(|_| BrowserLaunchError::Spawn)?;
+        if let Some(bytes) = stdin {
+            let Some(mut child_stdin) = child.stdin.take() else {
+                let _ = child.wait();
+                return Err(BrowserLaunchError::Stdin);
+            };
+            if child_stdin.write_all(bytes).is_err() {
+                drop(child_stdin);
+                let _ = child.wait();
+                return Err(BrowserLaunchError::Write);
+            }
+            drop(child_stdin);
+            let status = child.wait().map_err(|_| BrowserLaunchError::Wait)?;
+            if !status.success() {
+                return Err(BrowserLaunchError::Exit);
+            }
+        }
+        Ok(())
     })
 }
 
@@ -884,8 +931,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_browser_launchers_prefer_explorer_in_wsl() {
-        let wsl_launchers = ["explorer.exe", "xdg-open"];
+    fn linux_browser_launchers_prefer_powershell_in_wsl() {
+        let wsl_launchers = ["powershell.exe", "xdg-open"];
         assert_eq!(
             linux_browser_launchers(Some(OsStr::new("/run/WSL/1_interop")), None, None),
             wsl_launchers
@@ -919,24 +966,88 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn browser_launch_preserves_url_and_falls_back_after_failure() {
-        let url = "https://example.test/oauth?x=1&y=a%20b";
+    fn wsl_browser_launch_preserves_special_url_in_powershell_stdin() {
+        let url = "https://example.test/oauth?x=1&y=a%20b#fragment;$value";
         let mut calls = Vec::new();
 
         assert!(launch_browser_with(
-            &["explorer.exe", "xdg-open"],
+            &["powershell.exe", "xdg-open"],
             url,
-            |program, argument| {
-                calls.push((program.to_owned(), argument.to_owned()));
-                program == "xdg-open"
+            |program, arguments, stdin| {
+                calls.push((
+                    program.to_owned(),
+                    arguments
+                        .iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect::<Vec<_>>(),
+                    stdin.map(<[u8]>::to_vec),
+                ));
+                Ok(())
             }
         ));
         assert_eq!(
             calls,
-            [
-                ("explorer.exe".to_owned(), url.to_owned()),
-                ("xdg-open".to_owned(), url.to_owned())
-            ]
+            [(
+                "powershell.exe".to_owned(),
+                vec![
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    "try { Start-Process -FilePath ([Console]::In.ReadToEnd()) -ErrorAction Stop; exit 0 } catch { exit 1 }".to_owned(),
+                ],
+                Some(url.as_bytes().to_vec()),
+            )]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wsl_browser_launch_falls_back_after_powershell_failure() {
+        let url = "https://example.test/oauth?x=1&y=a%20b";
+
+        for powershell_error in [
+            BrowserLaunchError::Spawn,
+            BrowserLaunchError::Stdin,
+            BrowserLaunchError::Write,
+            BrowserLaunchError::Wait,
+            BrowserLaunchError::Exit,
+        ] {
+            let mut calls = Vec::new();
+            assert!(launch_browser_with(
+                &["powershell.exe", "xdg-open"],
+                url,
+                |program, arguments, stdin| {
+                    calls.push((
+                        program.to_owned(),
+                        arguments
+                            .iter()
+                            .map(|argument| (*argument).to_owned())
+                            .collect::<Vec<_>>(),
+                        stdin.map(<[u8]>::to_vec),
+                    ));
+                    if program == "powershell.exe" {
+                        Err(powershell_error)
+                    } else {
+                        Ok(())
+                    }
+                }
+            ));
+            assert_eq!(
+                calls,
+                [
+                    (
+                        "powershell.exe".to_owned(),
+                        vec![
+                            "-NoProfile".to_owned(),
+                            "-NonInteractive".to_owned(),
+                            "-Command".to_owned(),
+                            "try { Start-Process -FilePath ([Console]::In.ReadToEnd()) -ErrorAction Stop; exit 0 } catch { exit 1 }".to_owned(),
+                        ],
+                        Some(url.as_bytes().to_vec()),
+                    ),
+                    ("xdg-open".to_owned(), vec![url.to_owned()], None,),
+                ]
+            );
+        }
     }
 }
