@@ -562,14 +562,55 @@ fn random_url_value() -> Result<String, AuthError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_browser_launchers(
+    wsl_interop: Option<&std::ffi::OsStr>,
+    wsl_distro_name: Option<&std::ffi::OsStr>,
+    kernel_os_release: Option<&str>,
+) -> &'static [&'static str] {
+    const WSL: &[&str] = &["explorer.exe", "xdg-open"];
+    const LINUX: &[&str] = &["xdg-open"];
+
+    let is_wsl = wsl_interop.is_some_and(|value| !value.is_empty())
+        || wsl_distro_name.is_some_and(|value| !value.is_empty())
+        || kernel_os_release
+            .is_some_and(|release| release.to_ascii_lowercase().contains("microsoft"));
+    if is_wsl {
+        WSL
+    } else {
+        LINUX
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn launch_browser_with(
+    programs: &[&str],
+    url: &str,
+    mut launch: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    programs.iter().any(|program| launch(program, url))
+}
+
+#[cfg(target_os = "linux")]
+fn open_browser(url: &str) -> bool {
+    let kernel_os_release = fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    let programs = linux_browser_launchers(
+        std::env::var_os("WSL_INTEROP").as_deref(),
+        std::env::var_os("WSL_DISTRO_NAME").as_deref(),
+        kernel_os_release.as_deref(),
+    );
+    launch_browser_with(programs, url, |program, url| {
+        Command::new(program).arg(url).spawn().is_ok()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
 fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
-    #[cfg(target_os = "linux")]
-    let command = ("xdg-open", vec![url]);
     #[cfg(target_os = "windows")]
     let command = ("cmd", vec!["/C", "start", "", url]);
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let command: (&str, Vec<&str>) = ("", Vec::new());
 
     !command.0.is_empty() && Command::new(command.0).args(command.1).spawn().is_ok()
@@ -839,5 +880,63 @@ mod tests {
         };
         assert!(credentials.near_expiry(700));
         assert!(!credentials.near_expiry(699));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_browser_launchers_prefer_explorer_in_wsl() {
+        let wsl_launchers = ["explorer.exe", "xdg-open"];
+        assert_eq!(
+            linux_browser_launchers(Some(OsStr::new("/run/WSL/1_interop")), None, None),
+            wsl_launchers
+        );
+        assert_eq!(
+            linux_browser_launchers(None, Some(OsStr::new("Ubuntu")), None),
+            wsl_launchers
+        );
+        assert_eq!(
+            linux_browser_launchers(None, None, Some("6.6.0-Microsoft-standard-WSL2")),
+            wsl_launchers
+        );
+        assert_eq!(
+            linux_browser_launchers(None, None, Some("6.8.0-generic")),
+            ["xdg-open"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_wsl_environment_uses_the_linux_launcher() {
+        assert_eq!(
+            linux_browser_launchers(
+                Some(OsStr::new("")),
+                Some(OsStr::new("")),
+                Some("6.8.0-generic")
+            ),
+            ["xdg-open"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_launch_preserves_url_and_falls_back_after_failure() {
+        let url = "https://example.test/oauth?x=1&y=a%20b";
+        let mut calls = Vec::new();
+
+        assert!(launch_browser_with(
+            &["explorer.exe", "xdg-open"],
+            url,
+            |program, argument| {
+                calls.push((program.to_owned(), argument.to_owned()));
+                program == "xdg-open"
+            }
+        ));
+        assert_eq!(
+            calls,
+            [
+                ("explorer.exe".to_owned(), url.to_owned()),
+                ("xdg-open".to_owned(), url.to_owned())
+            ]
+        );
     }
 }
