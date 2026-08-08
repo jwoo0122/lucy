@@ -20,7 +20,7 @@ decisions:
     last_reviewed: '2026-08-04'
     enforcement:
       - id: cmd-only-tool-schema
-        path: src/provider.rs
+        path: src/provider/base.rs
         must_contain:
           - fn normal_requests_expose_only_cmd()
           - '"name": "cmd"'
@@ -132,7 +132,7 @@ decisions:
           - fn auth_provider_rejects_mixed_credentials()
         must_not_contain: []
       - id: openrouter-session-identity-and-attribution
-        path: src/provider.rs
+        path: src/provider/base.rs
         must_contain:
           - fn openrouter_requests_include_session_and_app_metadata()
           - fn compatible_requests_omit_provider_specific_session_metadata()
@@ -166,7 +166,7 @@ decisions:
     last_reviewed: '2026-07-29'
     enforcement:
       - id: session-resume-and-context
-        path: src/session.rs
+        path: src/session/base.rs
         must_contain:
           - fn creates_appends_resumes_and_lists_jsonl_session()
           - fn resume_retains_historical_boot_system_prompt()

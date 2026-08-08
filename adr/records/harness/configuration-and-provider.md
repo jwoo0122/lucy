@@ -27,7 +27,7 @@ enforcement:
       - "fn auth_provider_rejects_mixed_credentials()"
     must_not_contain: []
   - id: openrouter-session-identity-and-attribution
-    path: src/provider.rs
+    path: src/provider/base.rs
     must_contain:
       - "fn openrouter_requests_include_session_and_app_metadata()"
       - "fn compatible_requests_omit_provider_specific_session_metadata()"

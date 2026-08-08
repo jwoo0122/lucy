@@ -16,7 +16,7 @@ superseded_by: []
 last_reviewed: "2026-08-04"
 enforcement:
   - id: cmd-only-tool-schema
-    path: src/provider.rs
+    path: src/provider/base.rs
     must_contain:
       - "fn normal_requests_expose_only_cmd()"
       - '"name": "cmd"'

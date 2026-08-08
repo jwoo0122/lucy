@@ -17,7 +17,7 @@ superseded_by: []
 last_reviewed: "2026-07-29"
 enforcement:
   - id: session-resume-and-context
-    path: src/session.rs
+    path: src/session/base.rs
     must_contain:
       - "fn creates_appends_resumes_and_lists_jsonl_session()"
       - "fn resume_retains_historical_boot_system_prompt()"
