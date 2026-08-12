@@ -8,19 +8,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image as TuiImage, Resize};
@@ -40,6 +42,7 @@ const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
 /// Maximum number of wrapped input rows the input box grows to before it
 /// stops expanding and scrolls its contents internally.
 const MAX_INPUT_ROWS: u16 = 12;
+const TUI_MAX_WIDTH: u16 = 100;
 const WELCOME_MESSAGE: &str = "Coding Agent Harness LUCY";
 const WELCOME_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const WELCOME_TAGLINE: &str = "An ultra-thin harness for tomorrow's most powerful models";
@@ -220,18 +223,7 @@ pub(crate) fn run<W: Write>(
     let stdout = stdout;
     enable_raw_mode().map_err(|error| format!("unable to enable terminal input: {error}"))?;
     let backend = CrosstermBackend::new(stdout);
-    // Keep the UI on the normal screen. An inline viewport preserves the
-    // terminal's scrollback (and therefore native selection/search) instead
-    // of replacing it with an alternate-screen framebuffer.
-    let viewport_height = crossterm::terminal::size()
-        .map(|(_, height)| height.max(1))
-        .unwrap_or(24);
-    let terminal = match Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
-        },
-    ) {
+    let terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
         Err(error) => {
             let _ = disable_raw_mode();
@@ -240,7 +232,13 @@ pub(crate) fn run<W: Write>(
     };
     let mut terminal_guard = TerminalGuard::new(terminal);
     let backend = terminal_guard.terminal_mut().backend_mut();
-    if let Err(error) = execute!(backend, EnableFocusChange, Hide) {
+    if let Err(error) = execute!(
+        backend,
+        EnterAlternateScreen,
+        EnableFocusChange,
+        EnableMouseCapture,
+        Hide
+    ) {
         return Err(format!("unable to enter terminal UI: {error}"));
     }
     // Kitty keyboard protocol makes Shift+Enter (and other modified keys)
@@ -740,7 +738,13 @@ impl<W: Write> Drop for TerminalGuard<W> {
         }
         let _ = terminal.show_cursor();
         let _ = disable_raw_mode();
-        let _ = execute!(terminal.backend_mut(), DisableFocusChange, Show);
+        let _ = execute!(
+            terminal.backend_mut(),
+            DisableFocusChange,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
         let _ = terminal.backend_mut().flush();
     }
 }
@@ -1674,10 +1678,17 @@ enum TranscriptItem {
     },
 }
 
-/// Use the terminal's complete width, matching line-oriented agent CLIs and
-/// leaving wrapping, selection, and scrollback behavior to the emulator.
+/// Center the TUI while reserving one terminal cell on each side when possible.
+/// Extremely narrow terminals retain their full width because two margins would
+/// leave no usable content area.
 fn tui_viewport(area: Rect) -> Rect {
-    area
+    if area.width <= 2 {
+        return area;
+    }
+
+    let width = area.width.saturating_sub(2).min(TUI_MAX_WIDTH);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    Rect::new(x, area.y, width, area.height)
 }
 
 fn background_indicator_height(state: &UiState) -> u16 {
@@ -4057,19 +4068,28 @@ mod tests {
     }
 
     #[test]
-    fn tui_viewport_uses_the_full_terminal_width() {
+    fn tui_viewport_reserves_one_column_on_each_side_when_possible() {
         assert_eq!(
             tui_viewport(Rect::new(0, 0, 80, 10)),
-            Rect::new(0, 0, 80, 10)
+            Rect::new(1, 0, 78, 10)
         );
-        assert_eq!(tui_viewport(Rect::new(0, 0, 2, 10)), Rect::new(0, 0, 2, 10));
+        assert_eq!(
+            tui_viewport(Rect::new(0, 0, 2, 10)),
+            Rect::new(0, 0, 2, 10),
+            "a two-column terminal cannot reserve two gutters"
+        );
     }
 
     #[test]
-    fn tui_viewport_does_not_cap_wide_terminals() {
+    fn tui_viewport_caps_at_one_hundred_columns_and_centers_it() {
         assert_eq!(
             tui_viewport(Rect::new(0, 0, 140, 10)),
-            Rect::new(0, 0, 140, 10)
+            Rect::new(20, 0, TUI_MAX_WIDTH, 10)
+        );
+        assert_eq!(
+            tui_viewport(Rect::new(0, 0, 103, 10)),
+            Rect::new(1, 0, TUI_MAX_WIDTH, 10),
+            "an odd remaining column stays on the right"
         );
     }
 
@@ -4116,7 +4136,7 @@ mod tests {
         let prompt = prompt_area(console, &state);
 
         assert_eq!(ui_prompt_content_width(viewport), prompt.width);
-        assert_eq!(prompt.width, 62);
+        assert_eq!(prompt.width, 60);
         assert_eq!(input_visible_rows(&state, prompt.width), 2);
         assert!(move_input_cursor_vertical(
             &mut state,
