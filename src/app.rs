@@ -351,7 +351,13 @@ where
 
     let mut protocol = ProtocolWriter::new(output);
     let mut harness = harness;
-    if let Err(error) = protocol.session(&harness.session.id, resumed) {
+    if let Err(error) = protocol.session(
+        &harness.session.id,
+        resumed,
+        &harness.session.cwd,
+        &harness.session.saved_cwd,
+        harness.session.cwd_fallback,
+    ) {
         write_diagnostic_safe(
             &mut diagnostics,
             &format!("unable to write session event: {error}"),
@@ -1479,13 +1485,10 @@ fn resume_session<W: Write>(
     mode: FrontendMode,
     diagnostics: &mut W,
 ) -> Option<(Session, Provider)> {
-    let mut session = match Session::resume(home, id) {
-        Ok(session) => session,
-        Err(error) => {
-            write_diagnostic(diagnostics, &error.to_string());
-            return None;
-        }
-    };
+    if let Err(error) = Session::ensure_resumable(home, id) {
+        write_diagnostic(diagnostics, &error.to_string());
+        return None;
+    }
     let config = match Config::load_or_create(home) {
         Ok(config) => config,
         Err(error) => {
@@ -1500,15 +1503,18 @@ fn resume_session<W: Write>(
             return None;
         }
     };
-    if let Some(secret) = configured_codex_secret(home, auth.provider) {
-        session = match Session::resume_with_secret(home, id, Some(&secret)) {
-            Ok(session) => session,
-            Err(error) => {
-                write_diagnostic_safe(diagnostics, &error.to_string(), Some(&secret));
-                return None;
-            }
-        };
-    }
+    let configured_secret = configured_codex_secret(home, auth.provider);
+    let mut session = match Session::resume_with_secret(home, id, configured_secret.as_deref()) {
+        Ok(session) => session,
+        Err(error) => {
+            write_diagnostic_safe(
+                diagnostics,
+                &error.to_string(),
+                configured_secret.as_deref(),
+            );
+            return None;
+        }
+    };
     let mut selected = match config.resolved_llm() {
         Ok(settings) => settings,
         Err(error) => {

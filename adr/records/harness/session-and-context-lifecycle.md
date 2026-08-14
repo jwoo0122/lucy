@@ -7,7 +7,7 @@ applies_to:
   - "src/**"
   - "tests/**"
   - "README.md"
-summary: Lucy persists named JSONL sessions, interruption records, compaction boundaries, and the built-in composed boot prompt snapshot that was current when each session was created.
+summary: Lucy persists named JSONL sessions, previews their latest conversational messages, resumes their saved working directory when available, and preserves interruption, compaction, and boot-context state.
 constrains: []
 depends_on:
   - harness.agent-boundary-and-protocol
@@ -21,6 +21,7 @@ enforcement:
     must_contain:
       - "fn creates_appends_resumes_and_lists_jsonl_session()"
       - "fn resume_retains_historical_boot_system_prompt()"
+      - "fn list_uses_latest_user_and_assistant_messages_and_ignores_tools()"
       - "fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()"
       - "fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()"
     must_not_contain: []
@@ -41,6 +42,8 @@ How should Lucy preserve chat history, interrupted turns, and ambient instructio
 ## Current decision
 
 Lucy MUST store sessions as append-only JSONL files under `~/.lucy/sessions/<session-id>.jsonl`. A run without a session ID creates a new session; `--session <id>` resumes an existing session and MUST fail when the ID does not exist. `--list-sessions` MUST expose enough metadata to find resumable sessions.
+
+Session metadata MUST expose the saved cwd and the latest user and assistant message summaries independently; tool messages MUST NOT replace those conversational previews. Resume MUST use the cwd saved in the immutable session header when it remains an accessible directory. If that cwd is unavailable, resume MUST use the invocation cwd, surface both saved and effective paths plus the fallback status, and MUST NOT rewrite the saved header cwd.
 
 A session MAY contain valid JSONL interruption records. An interruption record MUST preserve the safe assistant output, tool-call/result observations, cancellation phase, and user-cancellation reason that were available at the nearest safe stopping point. Complete provider messages and completed/canceled tool results remain ordinary message records when their provider ordering is valid. If a canceled tool result could not be written as an ordinary message after its assistant tool call was persisted, a safe `cmd` interruption observation MAY be reconstructed as the matching provider tool message on the next request. Incomplete provider tool-call fragments MUST NOT be executed or sent as a malformed provider message. TUI replay MUST preserve the stored record order and show the interruption explicitly.
 
@@ -71,6 +74,8 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 - Symlinked skill roots, directories, and files are followed only when their targets have the expected directory or regular-file type; directory cycles and duplicate resolved directories are not traversed repeatedly.
 - Skill contents captured during discovery, including through a symlink, are persisted in the session snapshot and used by explicit invocation.
 - Lucy does not infer or persist relationships between sessions.
+- The session header cwd remains immutable; an unavailable saved cwd falls back only for the current invocation and is reported to both interactive and machine clients.
+- Session-list previews use the latest user and latest assistant messages, not whichever persisted message happens to be last.
 
 ## Alternatives and trade-offs
 
@@ -78,11 +83,11 @@ Recomposing the prompt on resume would apply the latest binary guidance immediat
 
 ## Consequences
 
-Users must start a new session to pick up a newer built-in prompt or edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. Concurrent writers to one session are not coordinated. Session files remain the source of truth for independent process invocations.
+Users must start a new session to pick up a newer built-in prompt or edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. Concurrent writers to one session are not coordinated. Session files remain the source of truth for independent process invocations. A moved or deleted workspace permits resume from the caller's invocation directory, but callers must inspect the reported cwd fallback before assuming project identity.
 
 ## Enforcement
 
-Tests MUST create, persist, close, and resume a session in a separate process; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
+Tests MUST create, persist, close, and resume a session in a separate process; verify saved-cwd restoration, observable fallback to the invocation cwd without header mutation, and latest user/assistant previews that ignore trailing tool records; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
 
 ## Revisit when
 

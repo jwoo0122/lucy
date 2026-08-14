@@ -149,9 +149,9 @@ decisions:
     status: accepted
     scope: harness
     decision_type: lifecycle
-    summary: Lucy persists named JSONL sessions, interruption records, compaction
-      boundaries, and the built-in composed boot prompt snapshot that was current
-      when each session was created.
+    summary: Lucy persists named JSONL sessions, previews their latest conversational
+      messages, resumes their saved working directory when available, and preserves
+      interruption, compaction, and boot-context state.
     applies_to:
       - src/**
       - tests/**
@@ -170,6 +170,7 @@ decisions:
         must_contain:
           - fn creates_appends_resumes_and_lists_jsonl_session()
           - fn resume_retains_historical_boot_system_prompt()
+          - fn list_uses_latest_user_and_assistant_messages_and_ignores_tools()
           - fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()
           - fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()
         must_not_contain: []

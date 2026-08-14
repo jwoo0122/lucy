@@ -24,7 +24,7 @@ use ratatui::layout::{Alignment, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -121,6 +121,7 @@ const TERMINAL_COLOR_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UiPalette {
     prompt_background: Color,
+    selection_background: Color,
     text: Color,
     assistant_text: Color,
     muted_text: Color,
@@ -132,6 +133,7 @@ impl UiPalette {
     fn fallback() -> Self {
         Self {
             prompt_background: PROMPT_BACKGROUND,
+            selection_background: Color::Rgb(48, 48, 58),
             text: Color::White,
             assistant_text: Color::Reset,
             muted_text: Color::DarkGray,
@@ -146,15 +148,18 @@ impl UiPalette {
             + 0.0722 * f32::from(blue))
         .round() as u8;
         let dark = neutral < 128;
-        let surface_lightness = if dark {
-            neutral.saturating_add(18)
-        } else {
-            neutral.saturating_sub(18)
-        };
-        let surface_channel = |channel: u8| {
-            (f32::from(surface_lightness) + (f32::from(channel) - f32::from(neutral)) * 1.15)
-                .round()
-                .clamp(0.0, 255.0) as u8
+        let surface = |distance: u8| {
+            let lightness = if dark {
+                neutral.saturating_add(distance)
+            } else {
+                neutral.saturating_sub(distance)
+            };
+            let channel = |value: u8| {
+                (f32::from(lightness) + (f32::from(value) - f32::from(neutral)) * 1.15)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            Color::Rgb(channel(red), channel(green), channel(blue))
         };
         let text = if dark {
             Color::Rgb(235, 235, 235)
@@ -162,11 +167,8 @@ impl UiPalette {
             Color::Rgb(32, 32, 32)
         };
         Self {
-            prompt_background: Color::Rgb(
-                surface_channel(red),
-                surface_channel(green),
-                surface_channel(blue),
-            ),
+            prompt_background: surface(18),
+            selection_background: surface(36),
             text,
             assistant_text: text,
             muted_text: if dark {
@@ -180,6 +182,19 @@ impl UiPalette {
                 Color::Rgb(140, 105, 0)
             },
             terminal_background: Some((red, green, blue)),
+        }
+    }
+
+    fn secondary_text(self) -> Color {
+        match (self.text, self.muted_text) {
+            (Color::Rgb(red, green, blue), Color::Rgb(muted_red, muted_green, muted_blue)) => {
+                Color::Rgb(
+                    ((u16::from(red) + u16::from(muted_red)) / 2) as u8,
+                    ((u16::from(green) + u16::from(muted_green)) / 2) as u8,
+                    ((u16::from(blue) + u16::from(muted_blue)) / 2) as u8,
+                )
+            }
+            _ => Color::Gray,
         }
     }
 }
@@ -231,6 +246,13 @@ pub(crate) fn run<W: Write>(
     .with_attached_agents(harness.attached_agents.clone())
     .with_skill_names(skill_names)
     .with_context(context_window, context_tokens);
+    if resumed && harness.session.cwd_fallback {
+        state.transcript.push(TranscriptItem::Info(format!(
+            "warning: saved session cwd is unavailable; saved: {}; using: {}",
+            harness.session.saved_cwd.display(),
+            harness.session.cwd.display()
+        )));
+    }
     state.palette = terminal_palette();
     state.background_active_count = harness.background_active_count();
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
@@ -320,6 +342,9 @@ fn worker_loop(
         .emit_event(&ProtocolEvent::Session {
             session_id: harness.session.id.clone(),
             resumed,
+            cwd: harness.session.cwd.display().to_string(),
+            saved_cwd: harness.session.saved_cwd.display().to_string(),
+            cwd_fallback: harness.session.cwd_fallback,
         })
         .is_err()
     {
@@ -801,43 +826,24 @@ impl<W: Write> Drop for TerminalGuard<W> {
     }
 }
 
-/// Heuristic for terminals that implement the kitty keyboard protocol.
-/// `PushKeyboardEnhancementFlags` is a no-op on supported terminals, but on
-/// unsupported ones the CSI sequence can render as literal text, so it is only
-/// enabled when the terminal advertises support via `TERM`/`TERM_PROGRAM`.
+/// Whether the terminal can report modified Enter separately from Enter.
+/// tmux needs its own `modifyOtherKeys` setup; other terminals can be queried
+/// directly once raw mode is active.
 fn supports_keyboard_enhancement() -> bool {
-    fn env(name: &str) -> Option<String> {
-        std::env::var(name).ok().map(|value| value.to_lowercase())
-    }
-    let term = env("TERM").unwrap_or_default();
-    let program = env("TERM_PROGRAM").unwrap_or_default();
-    if term.starts_with("xterm-kitty")
-        || term.starts_with("ghostty")
-        || term.starts_with("xterm-ghostty")
-    {
-        return true;
-    }
-    if matches!(
-        program.as_str(),
-        "ghostty" | "kitty" | "wezterm" | "alacritty" | "foot" | "footclient" | "iterm.app"
-    ) {
-        return true;
-    }
-    // tmux does not support the kitty keyboard protocol (CSI > flags u)
-    // passthrough, but it does support modifyOtherKeys (CSI > 4;1m). Push
-    // kitty flags anyway so crossterm parses CSI u format sequences, and
-    // separately enable modifyOtherKeys so tmux sends extended keys.
-    if program == "tmux" {
-        return true;
-    }
-    false
+    is_inside_tmux() || crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+}
+
+fn tmux_environment(term_program: Option<&str>, tmux: Option<&str>) -> bool {
+    term_program.is_some_and(|value| value.eq_ignore_ascii_case("tmux"))
+        || tmux.is_some_and(|value| !value.is_empty())
 }
 
 /// Whether the process is running inside a tmux session.
 fn is_inside_tmux() -> bool {
-    std::env::var("TERM_PROGRAM")
-        .map(|value| value.eq_ignore_ascii_case("tmux"))
-        .unwrap_or(false)
+    tmux_environment(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TMUX").ok().as_deref(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1335,6 +1341,7 @@ impl UiState {
         }
         self.sessions = Some(match result {
             Ok(mut sessions) => {
+                sessions.retain(|session| session.session_id != self.active_session_id);
                 sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
                 SessionsState::Sessions {
                     sessions,
@@ -1346,7 +1353,6 @@ impl UiState {
         });
     }
     fn handle_sessions_key(&mut self, key: &KeyEvent) -> Option<String> {
-        let active_session_id = self.active_session_id.clone();
         match self.sessions.as_mut()? {
             SessionsState::Loading => {
                 if key.code == KeyCode::Esc {
@@ -1381,10 +1387,6 @@ impl UiState {
                     let selected_session_id = filtered_sessions(sessions, query)
                         .nth(*focus)
                         .map(|session| session.session_id.clone());
-                    if selected_session_id.as_deref() == Some(active_session_id.as_str()) {
-                        self.sessions = None;
-                        return None;
-                    }
                     return selected_session_id;
                 }
                 _ => {}
@@ -2456,10 +2458,10 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     );
 
     if let Some(settings) = &state.settings {
-        draw_settings(frame, settings, area);
+        draw_settings(frame, settings, area, state.palette);
     }
     if let Some(sessions) = &state.sessions {
-        draw_sessions(frame, sessions, area, &state.secret);
+        draw_sessions(frame, sessions, area, &state.secret, state.palette);
     }
 
     draw_text_selection(frame, state.selection, area);
@@ -2642,18 +2644,19 @@ fn filtered_sessions<'a>(
     let query = query.to_lowercase();
     sessions.iter().filter(move |session| {
         session.session_id.to_lowercase().contains(&query)
+            || session.cwd.to_lowercase().contains(&query)
             || session
-                .first_message
+                .last_user_message
                 .as_deref()
                 .is_some_and(|message| message.to_lowercase().contains(&query))
             || session
-                .last_message
+                .last_assistant_message
                 .as_deref()
                 .is_some_and(|message| message.to_lowercase().contains(&query))
     })
 }
 
-fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
+fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect, palette: UiPalette) {
     let width = area
         .width
         .saturating_sub(2)
@@ -2671,33 +2674,45 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
         height,
     );
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" /settings ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.prompt_background)),
+        popup,
+    );
+    let inner = popup_inner(popup);
+    if inner.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled("/settings", Style::default().fg(Color::Cyan))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let content = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
 
     let lines = match settings {
         SettingsState::Loading => vec![
             Line::styled("Loading provider models…", Style::default().fg(Color::Cyan)),
             Line::raw(""),
-            Line::styled("Esc  cancel", Style::default().fg(Color::DarkGray)),
+            Line::styled("Esc  cancel", Style::default().fg(palette.muted_text)),
         ],
         SettingsState::Applying { model, effort } => vec![
             Line::styled("Applying selection…", Style::default().fg(Color::Cyan)),
-            Line::raw(model.clone()),
-            Line::raw(format!(
-                "effort: {}",
-                effort.as_deref().unwrap_or("default")
-            )),
+            Line::styled(model.clone(), Style::default().fg(palette.text)),
+            Line::styled(
+                format!("effort: {}", effort.as_deref().unwrap_or("default")),
+                Style::default().fg(palette.secondary_text()),
+            ),
         ],
         SettingsState::Error(error) => vec![
             Line::styled("Unable to update settings", Style::default().fg(Color::Red)),
             Line::raw(""),
-            Line::raw(error.clone()),
+            Line::styled(error.clone(), Style::default().fg(palette.text)),
             Line::raw(""),
-            Line::styled("Enter/Esc  close", Style::default().fg(Color::DarkGray)),
+            Line::styled("Enter/Esc  close", Style::default().fg(palette.muted_text)),
         ],
         SettingsState::Models {
             models,
@@ -2710,11 +2725,11 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                 .filter(|model| model.id.to_lowercase().contains(&query_lower))
                 .collect::<Vec<_>>();
             let focus = (*focus).min(filtered.len().saturating_sub(1));
-            let list_rows = inner.height.saturating_sub(4) as usize;
+            let list_rows = content.height.saturating_sub(4) as usize;
             let range = selection_range(filtered.len(), focus, list_rows);
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("Model  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Model  ", Style::default().fg(palette.muted_text)),
                     Span::styled(
                         if query.is_empty() {
                             "type to filter…"
@@ -2722,9 +2737,9 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                             query
                         },
                         Style::default().fg(if query.is_empty() {
-                            Color::DarkGray
+                            palette.muted_text
                         } else {
-                            Color::White
+                            palette.text
                         }),
                     ),
                 ]),
@@ -2738,7 +2753,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                             " · ↑/↓ move · Enter choose"
                         }
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted_text),
                 ),
             ];
             if filtered.is_empty() {
@@ -2756,16 +2771,18 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                             filtered[index].id
                         ),
                         if selected {
-                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                            Style::default()
+                                .fg(palette.text)
+                                .bg(palette.selection_background)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(palette.text)
                         },
                     ));
                 }
             }
             lines.push(Line::styled(
                 "Esc  cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted_text),
             ));
             lines
         }
@@ -2776,13 +2793,13 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
         } => {
             let mut lines = vec![
                 Line::styled(model.id.clone(), Style::default().fg(Color::Cyan)),
-                Line::styled("Reasoning effort", Style::default().fg(Color::DarkGray)),
+                Line::styled("Reasoning effort", Style::default().fg(palette.muted_text)),
             ];
             match &model.efforts {
                 Some(efforts) => {
                     let total = efforts.len() + 1;
                     let focus = (*focus).min(total.saturating_sub(1));
-                    let list_rows = inner.height.saturating_sub(4) as usize;
+                    let list_rows = content.height.saturating_sub(4) as usize;
                     for index in selection_range(total, focus, list_rows) {
                         let value = if index == 0 {
                             "default"
@@ -2793,39 +2810,50 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                         lines.push(Line::styled(
                             format!("{} {value}", if selected { "›" } else { " " }),
                             if selected {
-                                Style::default().fg(Color::Black).bg(Color::Cyan)
+                                Style::default()
+                                    .fg(palette.text)
+                                    .bg(palette.selection_background)
                             } else {
-                                Style::default().fg(Color::White)
+                                Style::default().fg(palette.text)
                             },
                         ));
                     }
                     lines.push(Line::styled(
                         "↑/↓ move · Enter save · Esc cancel",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette.muted_text),
                     ));
                 }
                 None => {
-                    lines.push(Line::raw("Provider did not advertise allowed efforts."));
+                    lines.push(Line::styled(
+                        "Provider did not advertise allowed efforts.",
+                        Style::default().fg(palette.secondary_text()),
+                    ));
                     lines.push(Line::from(vec![
-                        Span::styled("Value  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Value  ", Style::default().fg(palette.muted_text)),
                         Span::styled(
                             if input.is_empty() { "default" } else { input },
-                            Style::default().fg(Color::White),
+                            Style::default().fg(palette.text),
                         ),
                     ]));
                     lines.push(Line::styled(
                         "Type a value · Enter save · Esc cancel",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette.muted_text),
                     ));
                 }
             }
             lines
         }
     };
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), content);
 }
 
-fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, secret: &str) {
+fn draw_sessions(
+    frame: &mut Frame<'_>,
+    sessions: &SessionsState,
+    area: Rect,
+    secret: &str,
+    palette: UiPalette,
+) {
     let width = area
         .width
         .saturating_sub(2)
@@ -2843,25 +2871,40 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
         height,
     );
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" /session ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.prompt_background)),
+        popup,
+    );
+    let inner = popup_inner(popup);
+    if inner.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled("/session", Style::default().fg(Color::Cyan))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let content = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
 
     let lines = match sessions {
         SessionsState::Loading => vec![
             Line::styled("Loading sessions…", Style::default().fg(Color::Cyan)),
             Line::raw(""),
-            Line::styled("Esc  cancel", Style::default().fg(Color::DarkGray)),
+            Line::styled("Esc  cancel", Style::default().fg(palette.muted_text)),
         ],
         SessionsState::Error(error) => vec![
             Line::styled("Unable to list sessions", Style::default().fg(Color::Red)),
             Line::raw(""),
-            Line::raw(redact_secret(error, Some(secret))),
+            Line::styled(
+                redact_secret(error, Some(secret)),
+                Style::default().fg(palette.text),
+            ),
             Line::raw(""),
-            Line::styled("Enter/Esc  close", Style::default().fg(Color::DarkGray)),
+            Line::styled("Enter/Esc  close", Style::default().fg(palette.muted_text)),
         ],
         SessionsState::Sessions {
             sessions,
@@ -2870,11 +2913,11 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
         } => {
             let filtered = filtered_sessions(sessions, query).collect::<Vec<_>>();
             let focus = (*focus).min(filtered.len().saturating_sub(1));
-            let list_rows = inner.height.saturating_sub(4) as usize / 2;
+            let list_rows = content.height.saturating_sub(4) as usize / 3;
             let range = selection_range(filtered.len(), focus, list_rows.max(1));
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("Filter  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Filter  ", Style::default().fg(palette.muted_text)),
                     Span::styled(
                         if query.is_empty() {
                             "type to filter…".to_owned()
@@ -2882,9 +2925,9 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                             redact_secret(query, Some(secret))
                         },
                         Style::default().fg(if query.is_empty() {
-                            Color::DarkGray
+                            palette.muted_text
                         } else {
-                            Color::White
+                            palette.text
                         }),
                     ),
                 ]),
@@ -2898,7 +2941,7 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                             " · ↑/↓ move · Enter attach"
                         }
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted_text),
                 ),
             ];
             if filtered.is_empty() {
@@ -2914,43 +2957,89 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                 for index in range {
                     let session = filtered[index];
                     let selected = index == focus;
-                    let style = if selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    let row_style = Style::default().bg(if selected {
+                        palette.selection_background
                     } else {
-                        Style::default().fg(Color::White)
-                    };
-                    lines.push(Line::styled(
-                        format!(
-                            "{} {} · {}",
-                            if selected { "›" } else { " " },
-                            redact_secret(&session.session_id, Some(secret)),
-                            format_session_time(session.updated_at)
-                        ),
-                        style,
+                        palette.prompt_background
+                    });
+                    let indicator = if selected { "› " } else { "  " };
+                    let user = session.last_user_message.as_deref().unwrap_or("—");
+                    let assistant = session.last_assistant_message.as_deref().unwrap_or("—");
+                    lines.push(session_block_line(
+                        Line::from(vec![
+                            Span::styled(indicator, Style::default().fg(Color::Cyan)),
+                            Span::styled("You   ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                single_line_preview(&redact_secret(user, Some(secret))),
+                                Style::default().fg(palette.text),
+                            ),
+                        ]),
+                        content.width,
+                        row_style,
                     ));
-                    let first = session.first_message.as_deref().unwrap_or("—");
-                    let last = session.last_message.as_deref().unwrap_or("—");
-                    lines.push(Line::styled(
-                        format!(
-                            "  {} → {}",
-                            single_line_preview(&redact_secret(first, Some(secret))),
-                            single_line_preview(&redact_secret(last, Some(secret)))
-                        ),
-                        style,
+                    lines.push(session_block_line(
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("Cwd   ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                redact_secret(&session.cwd, Some(secret)),
+                                Style::default().fg(palette.text),
+                            ),
+                        ]),
+                        content.width,
+                        row_style,
+                    ));
+                    lines.push(session_block_line(
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("Lucy  ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                single_line_preview(&redact_secret(assistant, Some(secret))),
+                                Style::default().fg(palette.secondary_text()),
+                            ),
+                            Span::styled("  ·  ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                redact_secret(&session.session_id, Some(secret)),
+                                Style::default().fg(palette.muted_text),
+                            ),
+                            Span::styled(
+                                format!("  ·  {}", format_session_time(session.updated_at)),
+                                Style::default().fg(palette.muted_text),
+                            ),
+                        ]),
+                        content.width,
+                        row_style,
                     ));
                 }
             }
             lines.push(Line::styled(
                 "Esc  cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted_text),
             ));
             lines
         }
     };
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
-        inner,
+        Paragraph::new(lines).style(Style::default().bg(palette.prompt_background)),
+        content,
     );
+}
+
+fn session_block_line<'a>(mut line: Line<'a>, width: u16, style: Style) -> Line<'a> {
+    let padding = usize::from(width).saturating_sub(line.width());
+    if padding > 0 {
+        line.push_span(Span::raw(" ".repeat(padding)));
+    }
+    line.style(style)
+}
+
+fn popup_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    )
 }
 
 fn format_session_time(updated_at: u64) -> String {
@@ -4056,6 +4145,7 @@ mod tests {
             UiPalette::fallback(),
             UiPalette {
                 prompt_background: PROMPT_BACKGROUND,
+                selection_background: Color::Rgb(48, 48, 58),
                 text: Color::White,
                 assistant_text: Color::Reset,
                 muted_text: Color::DarkGray,
@@ -6359,14 +6449,17 @@ mod skill_picker_tests {
         assert_eq!(builtin_command("/settings-extra"), None);
     }
 
-    fn session(id: &str, first: Option<&str>, last: Option<&str>) -> SessionMetadata {
+    fn session(id: &str, user: Option<&str>, assistant: Option<&str>) -> SessionMetadata {
         SessionMetadata {
             record_type: "session_metadata",
             session_id: id.to_owned(),
             created_at: 1,
             updated_at: 2,
-            first_message: first.map(str::to_owned),
-            last_message: last.map(str::to_owned),
+            cwd: "/workspace/lucy".to_owned(),
+            first_message: user.map(|message| format!("user: {message}")),
+            last_message: assistant.map(|message| format!("assistant: {message}")),
+            last_user_message: user.map(str::to_owned),
+            last_assistant_message: assistant.map(str::to_owned),
         }
     }
 
@@ -6395,6 +6488,106 @@ mod skill_picker_tests {
                 .collect::<Vec<_>>(),
             vec!["beta-id"]
         );
+    }
+
+    #[test]
+    fn settings_and_session_panels_have_no_border_and_use_requested_padding() {
+        let mut settings_terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
+        settings_terminal
+            .draw(|frame| {
+                draw_settings(
+                    frame,
+                    &SettingsState::Loading,
+                    frame.area(),
+                    UiPalette::fallback(),
+                )
+            })
+            .expect("draw settings");
+        let settings = settings_terminal.backend().buffer();
+        assert_eq!(settings[(1, 1)].symbol(), " ");
+        assert_eq!(settings[(1, 1)].bg, UiPalette::fallback().prompt_background);
+        assert_eq!(settings[(3, 2)].symbol(), "/");
+        assert_eq!(settings[(1, 2)].symbol(), " ");
+        assert_eq!(settings[(2, 2)].symbol(), " ");
+        assert_eq!(settings[(1, 8)].symbol(), " ");
+
+        let mut sessions_terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
+        sessions_terminal
+            .draw(|frame| {
+                draw_sessions(
+                    frame,
+                    &SessionsState::Loading,
+                    frame.area(),
+                    "",
+                    UiPalette::fallback(),
+                )
+            })
+            .expect("draw sessions");
+        let sessions = sessions_terminal.backend().buffer();
+        assert_eq!(sessions[(1, 1)].symbol(), " ");
+        assert_eq!(sessions[(1, 1)].bg, UiPalette::fallback().prompt_background);
+        assert_eq!(sessions[(3, 2)].symbol(), "/");
+        assert_eq!(sessions[(1, 2)].symbol(), " ");
+        assert_eq!(sessions[(2, 2)].symbol(), " ");
+        assert_eq!(sessions[(1, 8)].symbol(), " ");
+    }
+
+    #[test]
+    fn session_overlay_renders_three_rows_per_session() {
+        let sessions = SessionsState::Sessions {
+            sessions: vec![session(
+                "session-123",
+                Some("latest user request"),
+                Some("latest assistant answer"),
+            )],
+            query: String::new(),
+            focus: 0,
+        };
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_sessions(frame, &sessions, frame.area(), "", UiPalette::fallback()))
+            .expect("draw sessions");
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("You   latest user request"));
+        assert!(rendered.contains("Cwd   /workspace/lucy"));
+        assert!(rendered.contains("Lucy  latest assistant answer"));
+        let user_position = rendered.find("latest user request").expect("user preview");
+        let cwd_position = rendered.find("/workspace/lucy").expect("cwd");
+        let assistant_position = rendered
+            .find("latest assistant answer")
+            .expect("assistant preview");
+        let id_position = rendered.find("session-123").expect("session id");
+        assert!(user_position < cwd_position);
+        assert!(cwd_position < assistant_position);
+        assert!(assistant_position < id_position);
+
+        let palette = UiPalette::fallback();
+        assert_eq!(buffer[(16, 5)].fg, palette.text);
+        assert_eq!(buffer[(16, 6)].fg, palette.text);
+        assert_eq!(buffer[(16, 7)].fg, palette.secondary_text());
+        assert_eq!(buffer[(53, 7)].fg, palette.muted_text);
+        for y in 5..=7 {
+            for x in 8..=91 {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    palette.selection_background,
+                    "selected session background at ({x}, {y})"
+                );
+            }
+        }
+        assert_eq!(buffer[(7, 5)].bg, palette.prompt_background);
+        assert_eq!(buffer[(92, 5)].bg, palette.prompt_background);
     }
 
     #[test]
@@ -6451,17 +6644,53 @@ mod skill_picker_tests {
     }
 
     #[test]
-    fn enter_on_active_session_closes_overlay_without_attaching() {
+    fn open_sessions_excludes_the_active_session() {
+        let mut state =
+            UiState::from_history(&[], "active-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+        state.open_sessions(Ok(vec![
+            session("active-session", Some("current request"), None),
+            session("other-session", Some("other request"), None),
+        ]));
+
+        let SessionsState::Sessions { sessions, .. } =
+            state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["other-session"]
+        );
+        assert_eq!(
+            state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some("other-session".to_owned())
+        );
+    }
+
+    #[test]
+    fn active_session_alone_produces_an_empty_session_overlay() {
         let mut state =
             UiState::from_history(&[], "active-session", "secret", "model", None, false);
         state.sessions = Some(SessionsState::Loading);
         state.open_sessions(Ok(vec![session("active-session", None, None)]));
 
+        let SessionsState::Sessions {
+            sessions, focus, ..
+        } = state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(*focus, 0);
         assert_eq!(
             state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             None
         );
-        assert!(state.sessions.is_none());
+        assert!(state.sessions.is_some());
     }
 
     #[test]
@@ -6520,7 +6749,15 @@ mod skill_picker_tests {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("test terminal");
         terminal
-            .draw(|frame| draw_sessions(frame, state.sessions.as_ref().unwrap(), frame.area(), ""))
+            .draw(|frame| {
+                draw_sessions(
+                    frame,
+                    state.sessions.as_ref().unwrap(),
+                    frame.area(),
+                    "",
+                    UiPalette::fallback(),
+                )
+            })
             .expect("draw session picker");
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -6729,15 +6966,13 @@ mod skill_picker_tests {
     }
 
     #[test]
-    fn is_inside_tmux_detection() {
-        std::env::set_var("TERM_PROGRAM", "tmux");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "TMUX");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "ghostty");
-        assert!(!is_inside_tmux());
-        std::env::remove_var("TERM_PROGRAM");
-        assert!(!is_inside_tmux());
+    fn tmux_detection_accepts_standard_environment_marker() {
+        assert!(tmux_environment(None, Some("/tmp/tmux-1000/default,1,0")));
+        assert!(tmux_environment(Some("tmux"), None));
+        assert!(tmux_environment(Some("TMUX"), None));
+        assert!(!tmux_environment(Some("ghostty"), None));
+        assert!(!tmux_environment(None, None));
+        assert!(!tmux_environment(None, Some("")));
     }
 
     #[test]
@@ -6817,22 +7052,5 @@ mod skill_picker_tests {
         assert_eq!(buffer[(2, 3)].symbol(), "/");
         assert_eq!(buffer[(2, 3)].fg, QUEUED_MESSAGE_COLOR);
         assert!(!buffer[(2, 3)].modifier.contains(Modifier::BOLD));
-    }
-}
-
-#[cfg(test)]
-mod tmux_keyboard_tests {
-    use super::*;
-
-    #[test]
-    fn is_inside_tmux_detection() {
-        std::env::set_var("TERM_PROGRAM", "tmux");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "TMUX");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "ghostty");
-        assert!(!is_inside_tmux());
-        std::env::remove_var("TERM_PROGRAM");
-        assert!(!is_inside_tmux());
     }
 }
