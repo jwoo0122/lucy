@@ -2969,7 +2969,7 @@ fn draw_sessions(
                     let indicator = if selected { "› " } else { "  " };
                     let user = session.last_user_message.as_deref().unwrap_or("—");
                     let assistant = session.last_assistant_message.as_deref().unwrap_or("—");
-                    lines.push(
+                    lines.push(session_block_line(
                         Line::from(vec![
                             Span::styled(indicator, Style::default().fg(Color::Cyan)),
                             Span::styled("You   ", Style::default().fg(palette.muted_text)),
@@ -2977,10 +2977,11 @@ fn draw_sessions(
                                 single_line_preview(&redact_secret(user, Some(secret))),
                                 Style::default().fg(palette.text),
                             ),
-                        ])
-                        .style(row_style),
-                    );
-                    lines.push(
+                        ]),
+                        content.width,
+                        row_style,
+                    ));
+                    lines.push(session_block_line(
                         Line::from(vec![
                             Span::raw("  "),
                             Span::styled("Cwd   ", Style::default().fg(palette.muted_text)),
@@ -2988,10 +2989,11 @@ fn draw_sessions(
                                 redact_secret(&session.cwd, Some(secret)),
                                 Style::default().fg(palette.text),
                             ),
-                        ])
-                        .style(row_style),
-                    );
-                    lines.push(
+                        ]),
+                        content.width,
+                        row_style,
+                    ));
+                    lines.push(session_block_line(
                         Line::from(vec![
                             Span::raw("  "),
                             Span::styled("Lucy  ", Style::default().fg(palette.muted_text)),
@@ -3008,9 +3010,10 @@ fn draw_sessions(
                                 format!("  ·  {}", format_session_time(session.updated_at)),
                                 Style::default().fg(palette.muted_text),
                             ),
-                        ])
-                        .style(row_style),
-                    );
+                        ]),
+                        content.width,
+                        row_style,
+                    ));
                 }
             }
             lines.push(Line::styled(
@@ -3024,6 +3027,14 @@ fn draw_sessions(
         Paragraph::new(lines).style(Style::default().bg(palette.prompt_background)),
         content,
     );
+}
+
+fn session_block_line<'a>(mut line: Line<'a>, width: u16, style: Style) -> Line<'a> {
+    let padding = usize::from(width).saturating_sub(line.width());
+    if padding > 0 {
+        line.push_span(Span::raw(" ".repeat(padding)));
+    }
+    line.style(style)
 }
 
 fn popup_inner(area: Rect) -> Rect {
@@ -6570,7 +6581,17 @@ mod skill_picker_tests {
         assert_eq!(buffer[(16, 6)].fg, palette.text);
         assert_eq!(buffer[(16, 7)].fg, palette.secondary_text());
         assert_eq!(buffer[(53, 7)].fg, palette.muted_text);
-        assert_eq!(buffer[(8, 5)].bg, palette.selection_background);
+        for y in 5..=7 {
+            for x in 8..=91 {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    palette.selection_background,
+                    "selected session background at ({x}, {y})"
+                );
+            }
+        }
+        assert_eq!(buffer[(7, 5)].bg, palette.prompt_background);
+        assert_eq!(buffer[(92, 5)].bg, palette.prompt_background);
     }
 
     #[test]
