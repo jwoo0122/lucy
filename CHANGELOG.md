@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.10](https://github.com/jwoo0122/lucy/compare/v1.14.9...v1.14.10) - 2026-08-14
+
+### Fixed
+
+- improve session resume and TUI interactions ([#90](https://github.com/jwoo0122/lucy/pull/90))
+
 ## [1.14.9](https://github.com/jwoo0122/lucy/compare/v1.14.8...v1.14.9) - 2026-08-14
 
 ### Fixed
