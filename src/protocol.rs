@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -7,7 +8,13 @@ use serde_json::Value;
 #[serde(tag = "type")]
 pub enum ProtocolEvent {
     #[serde(rename = "session")]
-    Session { session_id: String, resumed: bool },
+    Session {
+        session_id: String,
+        resumed: bool,
+        cwd: String,
+        saved_cwd: String,
+        cwd_fallback: bool,
+    },
     #[serde(rename = "assistant_delta")]
     AssistantDelta { text: String },
     #[serde(rename = "tool_call")]
@@ -96,10 +103,20 @@ impl<W: Write> ProtocolWriter<W> {
         self.writer.flush()
     }
 
-    pub fn session(&mut self, session_id: &str, resumed: bool) -> io::Result<()> {
+    pub fn session(
+        &mut self,
+        session_id: &str,
+        resumed: bool,
+        cwd: &Path,
+        saved_cwd: &Path,
+        cwd_fallback: bool,
+    ) -> io::Result<()> {
         self.emit(&ProtocolEvent::Session {
             session_id: session_id.to_owned(),
             resumed,
+            cwd: cwd.display().to_string(),
+            saved_cwd: saved_cwd.display().to_string(),
+            cwd_fallback,
         })
     }
 

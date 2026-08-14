@@ -171,7 +171,11 @@ pub enum SessionHistoryRecord {
 pub struct Session {
     pub id: String,
     pub path: PathBuf,
+    /// The directory used by tools for this invocation.
     pub cwd: PathBuf,
+    /// The directory persisted in the immutable session header.
+    pub saved_cwd: PathBuf,
+    pub cwd_fallback: bool,
     pub boot_system_prompt: String,
     pub llm: LlmSettings,
     /// Skills are immutable per-session just like the boot prompt, so a
@@ -191,8 +195,23 @@ pub struct SessionMetadata {
     pub session_id: String,
     pub created_at: u64,
     pub updated_at: u64,
+    pub cwd: String,
     pub first_message: Option<String>,
     pub last_message: Option<String>,
+    pub last_user_message: Option<String>,
+    pub last_assistant_message: Option<String>,
+}
+
+fn effective_session_cwd(saved_cwd: &Path) -> Result<(PathBuf, bool), SessionError> {
+    if saved_cwd.is_dir() {
+        if let Ok(cwd) = fs::canonicalize(saved_cwd) {
+            return Ok((cwd, false));
+        }
+    }
+    std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .map(|cwd| (cwd, true))
+        .map_err(|_| SessionError::new("unable to resolve fallback cwd"))
 }
 
 impl Session {
@@ -269,7 +288,9 @@ impl Session {
                     return Ok(Self {
                         id,
                         path,
+                        saved_cwd: cwd.clone(),
                         cwd,
+                        cwd_fallback: false,
                         boot_system_prompt,
                         llm,
                         skills,
@@ -296,22 +317,7 @@ impl Session {
         id: &str,
         external_secret: Option<&str>,
     ) -> Result<Self, SessionError> {
-        validate_session_id(id)?;
-        let directory = sessions_dir(home);
-        let lucy_directory = lucy_dir(home);
-        ensure_not_symlink(&lucy_directory)?;
-        if lucy_directory.is_dir() {
-            ensure_private_dir(&lucy_directory)?;
-        }
-        ensure_not_symlink(&directory)?;
-        if directory.is_dir() {
-            ensure_private_dir(&directory)?;
-        }
-        let path = directory.join(format!("{id}.jsonl"));
-        ensure_not_symlink(&path)?;
-        if !path.is_file() {
-            return Err(SessionError::new("session not found"));
-        }
+        let path = resumable_session_path(home, id)?;
 
         ensure_private_file(&path)?;
         let raw =
@@ -486,11 +492,14 @@ impl Session {
                 active_secret.as_deref(),
             ));
         };
-        let cwd = PathBuf::from(cwd);
+        let saved_cwd = PathBuf::from(cwd);
+        let (cwd, cwd_fallback) = effective_session_cwd(&saved_cwd)?;
         Ok(Self {
             id: id.to_owned(),
             path,
             cwd,
+            saved_cwd,
+            cwd_fallback,
             boot_system_prompt,
             llm,
             skills,
@@ -792,8 +801,21 @@ impl Session {
                 session_id: session.id,
                 created_at: session.created_at,
                 updated_at: session.updated_at,
+                cwd: session.saved_cwd.display().to_string(),
                 first_message: session.messages.first().map(safe_message_summary),
                 last_message: session.messages.last().map(safe_message_summary),
+                last_user_message: session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .map(message_preview),
+                last_assistant_message: session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "assistant")
+                    .map(message_preview),
             });
         }
         Ok(metadata)
@@ -1136,7 +1158,10 @@ fn compaction_summary_message(summary: &str) -> ChatMessage {
 }
 
 fn safe_message_summary(message: &ChatMessage) -> String {
-    let role = message.role.as_str();
+    format!("{}: {}", message.role, message_preview(message))
+}
+
+fn message_preview(message: &ChatMessage) -> String {
     let text = message
         .content
         .as_deref()
@@ -1146,11 +1171,31 @@ fn safe_message_summary(message: &ChatMessage) -> String {
     if text.chars().count() > 120 {
         summary.push('…');
     }
-    format!("{role}: {summary}")
+    summary
 }
 
 pub fn sessions_dir(home: &Path) -> PathBuf {
     home.join(".lucy").join("sessions")
+}
+
+pub(super) fn resumable_session_path(home: &Path, id: &str) -> Result<PathBuf, SessionError> {
+    validate_session_id(id)?;
+    let directory = sessions_dir(home);
+    let lucy_directory = lucy_dir(home);
+    ensure_not_symlink(&lucy_directory)?;
+    if lucy_directory.is_dir() {
+        ensure_private_dir(&lucy_directory)?;
+    }
+    ensure_not_symlink(&directory)?;
+    if directory.is_dir() {
+        ensure_private_dir(&directory)?;
+    }
+    let path = directory.join(format!("{id}.jsonl"));
+    ensure_not_symlink(&path)?;
+    if !path.is_file() {
+        return Err(SessionError::new("session not found"));
+    }
+    Ok(path)
 }
 
 pub fn validate_session_id(id: &str) -> Result<(), SessionError> {
@@ -1397,15 +1442,66 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, id);
         assert!(listed[0]
-            .first_message
+            .last_user_message
             .as_deref()
             .is_some_and(|summary| summary.contains("first")));
+        assert_eq!(listed[0].cwd, resumed.cwd.display().to_string());
+        assert!(listed[0]
+            .last_assistant_message
+            .as_deref()
+            .is_some_and(|summary| summary.contains("last")));
         assert!(Session::resume(&home, "missing").is_err());
 
         let file = fs::read_to_string(resumed.path).expect("session file");
         assert!(file.lines().count() >= 3);
         assert!(!file.contains("TEST_KEY_VALUE"));
         fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn list_uses_latest_user_and_assistant_messages_and_ignores_tools() {
+        let home = temporary_home();
+        let cwd = std::env::current_dir().expect("cwd");
+        let llm = LlmSettings {
+            base_url: "http://localhost".to_owned(),
+            model: "model".to_owned(),
+            api_key_env: "TEST_KEY".to_owned(),
+            effort: None,
+        };
+        let mut session = Session::create(&home, &cwd, "prompt".to_owned(), llm).expect("create");
+        session
+            .append_message(ChatMessage::user("older user".to_owned()))
+            .expect("older user");
+        session
+            .append_message(ChatMessage::assistant(
+                "older assistant".to_owned(),
+                Vec::new(),
+            ))
+            .expect("older assistant");
+        session
+            .append_message(ChatMessage::user("latest user".to_owned()))
+            .expect("latest user");
+        session
+            .append_message(ChatMessage::assistant(
+                "latest assistant".to_owned(),
+                Vec::new(),
+            ))
+            .expect("latest assistant");
+        session
+            .append_message(ChatMessage::tool(
+                "call-1".to_owned(),
+                "cmd".to_owned(),
+                "tool output".to_owned(),
+            ))
+            .expect("tool");
+
+        let listed = Session::list(&home).expect("list");
+        assert_eq!(listed[0].last_user_message.as_deref(), Some("latest user"));
+        assert_eq!(
+            listed[0].last_assistant_message.as_deref(),
+            Some("latest assistant")
+        );
+        fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]

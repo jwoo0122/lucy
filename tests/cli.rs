@@ -1036,6 +1036,64 @@ fn missing_provider_key_diagnostic_is_generic_and_does_not_echo_environment_name
 }
 
 #[test]
+fn codex_session_resume_does_not_conflict_with_its_own_writer_lease() {
+    let (home, project) = temporary_tree("codex-session-resume");
+    let config_dir = home.join(".config/lucy");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::write(
+        config_dir.join("config.toml"),
+        "system_prompt = \"base prompt\"\n\n[auth]\nprovider = \"codex_subscription\"\n\n[llm]\nbase_url = \"https://chatgpt.com/backend-api/codex\"\nmodel = \"gpt-5\"\n",
+    )
+    .expect("config");
+    let credentials_path = config_dir.join("codex-credentials.json");
+    fs::write(
+        &credentials_path,
+        serde_json::to_vec(&json!({
+            "access": "codex-access-secret",
+            "refresh": "codex-refresh-secret",
+            "expires_at": null,
+            "account_id": "account-id"
+        }))
+        .expect("credentials JSON"),
+    )
+    .expect("credentials");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))
+            .expect("credential permissions");
+    }
+
+    let id = "codex-session";
+    let sessions = home.join(".lucy/sessions");
+    fs::create_dir_all(&sessions).expect("sessions");
+    let header = json!({
+        "record": "session",
+        "version": 1,
+        "session_id": id,
+        "created_at": 1,
+        "cwd": project.display().to_string(),
+        "boot_system_prompt": "base prompt",
+        "llm": {
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "model": "gpt-5",
+            "api_key_env": "__LUCY_CODEX_SUBSCRIPTION_TOKEN__"
+        }
+    });
+    fs::write(sessions.join(format!("{id}.jsonl")), format!("{header}\n")).expect("session");
+
+    let resumed = run_lucy(&home, &project, &["--session", id], "");
+
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+    assert!(resumed.stderr.is_empty(), "stderr: {:?}", resumed.stderr);
+    let events = parse_lines(&resumed.stdout);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"], "session");
+    assert_eq!(events[0]["session_id"], id);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
 fn unsafe_session_is_rejected_on_resume_and_omitted_from_list() {
     let (home, project) = temporary_tree("unsafe-session");
     let sessions = home.join(".lucy/sessions");
@@ -1863,9 +1921,9 @@ fn resume_rejects_malformed_current_config_without_leaking_secrets() {
     assert_eq!(metadata.len(), 1);
     assert_eq!(metadata[0]["type"], "session_metadata");
     assert_eq!(metadata[0]["session_id"], session_id);
-    assert!(metadata[0]["first_message"]
+    assert!(metadata[0]["last_user_message"]
         .as_str()
-        .expect("first summary")
+        .expect("last user summary")
         .contains("first message"));
 
     let requests = server.join();
@@ -2085,6 +2143,9 @@ fn separate_lucy_processes_resume_the_same_named_session() {
         .expect("session id")
         .to_owned();
     assert_eq!(first_records[0]["resumed"], false);
+    assert_eq!(first_records[0]["cwd"], project.display().to_string());
+    assert_eq!(first_records[0]["saved_cwd"], project.display().to_string());
+    assert_eq!(first_records[0]["cwd_fallback"], false);
 
     let session_path = home
         .join(".lucy/sessions")
@@ -2115,6 +2176,12 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     let second_records = parse_lines(&second.stdout);
     assert_eq!(second_records[0]["session_id"], session_id);
     assert_eq!(second_records[0]["resumed"], true);
+    assert_eq!(second_records[0]["cwd"], project.display().to_string());
+    assert_eq!(
+        second_records[0]["saved_cwd"],
+        project.display().to_string()
+    );
+    assert_eq!(second_records[0]["cwd_fallback"], false);
     assert!(second_records
         .iter()
         .any(|record| record["type"] == "assistant_delta" && record["text"] == "second answer"));
@@ -2311,4 +2378,50 @@ fn assert_background_completion_framing(content: &str, payload: &str) {
 
     assert!(opening_start < payload_start);
     assert!(payload_start < closing_start);
+}
+
+#[test]
+fn resumed_session_falls_back_to_invocation_cwd_without_rewriting_saved_cwd() {
+    let server = MockServer::start(vec![normal_response("first"), normal_response("second")]);
+    let (home, project) = temporary_tree("missing-session-cwd-fallback");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+    let fallback = home.join("fallback");
+    fs::create_dir(&fallback).expect("fallback cwd");
+
+    let first = run_lucy(
+        &home,
+        &project,
+        &["--jsonl"],
+        "{\"type\":\"message\",\"text\":\"first request\"}\n",
+    );
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    let session_id = parse_lines(&first.stdout)[0]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fs::remove_dir_all(&project).expect("remove saved cwd");
+
+    let resumed = run_lucy(
+        &home,
+        &fallback,
+        &["--jsonl", "--session", &session_id],
+        "{\"type\":\"message\",\"text\":\"second request\"}\n",
+    );
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+    let records = parse_lines(&resumed.stdout);
+    assert_eq!(records[0]["type"], "session");
+    assert_eq!(records[0]["cwd"], fallback.display().to_string());
+    assert_eq!(records[0]["saved_cwd"], project.display().to_string());
+    assert_eq!(records[0]["cwd_fallback"], true);
+
+    let session_path = home
+        .join(".lucy/sessions")
+        .join(format!("{session_id}.jsonl"));
+    let file = fs::read_to_string(session_path).expect("session file");
+    let header: Value = serde_json::from_str(file.lines().next().expect("session header"))
+        .expect("session header JSON");
+    assert_eq!(header["cwd"], project.display().to_string());
+
+    assert_eq!(server.join().len(), 2);
+    fs::remove_dir_all(home).expect("cleanup");
 }

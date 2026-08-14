@@ -121,6 +121,12 @@ impl Session {
         Self::resume_with_secret(home, id, None)
     }
 
+    pub(crate) fn ensure_resumable(home: &Path, id: &str) -> Result<(), SessionError> {
+        base::resumable_session_path(home, id)
+            .map(|_| ())
+            .map_err(SessionError::from)
+    }
+
     pub fn resume_with_secret(
         home: &Path,
         id: &str,

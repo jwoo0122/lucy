@@ -24,7 +24,7 @@ use ratatui::layout::{Alignment, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -231,6 +231,13 @@ pub(crate) fn run<W: Write>(
     .with_attached_agents(harness.attached_agents.clone())
     .with_skill_names(skill_names)
     .with_context(context_window, context_tokens);
+    if resumed && harness.session.cwd_fallback {
+        state.transcript.push(TranscriptItem::Info(format!(
+            "warning: saved session cwd is unavailable; saved: {}; using: {}",
+            harness.session.saved_cwd.display(),
+            harness.session.cwd.display()
+        )));
+    }
     state.palette = terminal_palette();
     state.background_active_count = harness.background_active_count();
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
@@ -320,6 +327,9 @@ fn worker_loop(
         .emit_event(&ProtocolEvent::Session {
             session_id: harness.session.id.clone(),
             resumed,
+            cwd: harness.session.cwd.display().to_string(),
+            saved_cwd: harness.session.saved_cwd.display().to_string(),
+            cwd_fallback: harness.session.cwd_fallback,
         })
         .is_err()
     {
@@ -801,43 +811,24 @@ impl<W: Write> Drop for TerminalGuard<W> {
     }
 }
 
-/// Heuristic for terminals that implement the kitty keyboard protocol.
-/// `PushKeyboardEnhancementFlags` is a no-op on supported terminals, but on
-/// unsupported ones the CSI sequence can render as literal text, so it is only
-/// enabled when the terminal advertises support via `TERM`/`TERM_PROGRAM`.
+/// Whether the terminal can report modified Enter separately from Enter.
+/// tmux needs its own `modifyOtherKeys` setup; other terminals can be queried
+/// directly once raw mode is active.
 fn supports_keyboard_enhancement() -> bool {
-    fn env(name: &str) -> Option<String> {
-        std::env::var(name).ok().map(|value| value.to_lowercase())
-    }
-    let term = env("TERM").unwrap_or_default();
-    let program = env("TERM_PROGRAM").unwrap_or_default();
-    if term.starts_with("xterm-kitty")
-        || term.starts_with("ghostty")
-        || term.starts_with("xterm-ghostty")
-    {
-        return true;
-    }
-    if matches!(
-        program.as_str(),
-        "ghostty" | "kitty" | "wezterm" | "alacritty" | "foot" | "footclient" | "iterm.app"
-    ) {
-        return true;
-    }
-    // tmux does not support the kitty keyboard protocol (CSI > flags u)
-    // passthrough, but it does support modifyOtherKeys (CSI > 4;1m). Push
-    // kitty flags anyway so crossterm parses CSI u format sequences, and
-    // separately enable modifyOtherKeys so tmux sends extended keys.
-    if program == "tmux" {
-        return true;
-    }
-    false
+    is_inside_tmux() || crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+}
+
+fn tmux_environment(term_program: Option<&str>, tmux: Option<&str>) -> bool {
+    term_program.is_some_and(|value| value.eq_ignore_ascii_case("tmux"))
+        || tmux.is_some_and(|value| !value.is_empty())
 }
 
 /// Whether the process is running inside a tmux session.
 fn is_inside_tmux() -> bool {
-    std::env::var("TERM_PROGRAM")
-        .map(|value| value.eq_ignore_ascii_case("tmux"))
-        .unwrap_or(false)
+    tmux_environment(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TMUX").ok().as_deref(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2642,12 +2633,13 @@ fn filtered_sessions<'a>(
     let query = query.to_lowercase();
     sessions.iter().filter(move |session| {
         session.session_id.to_lowercase().contains(&query)
+            || session.cwd.to_lowercase().contains(&query)
             || session
-                .first_message
+                .last_user_message
                 .as_deref()
                 .is_some_and(|message| message.to_lowercase().contains(&query))
             || session
-                .last_message
+                .last_assistant_message
                 .as_deref()
                 .is_some_and(|message| message.to_lowercase().contains(&query))
     })
@@ -2671,12 +2663,24 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
         height,
     );
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" /settings ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
+        popup,
+    );
+    let inner = popup_inner(popup);
+    if inner.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled("/settings", Style::default().fg(Color::Cyan))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let content = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
 
     let lines = match settings {
         SettingsState::Loading => vec![
@@ -2710,7 +2714,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                 .filter(|model| model.id.to_lowercase().contains(&query_lower))
                 .collect::<Vec<_>>();
             let focus = (*focus).min(filtered.len().saturating_sub(1));
-            let list_rows = inner.height.saturating_sub(4) as usize;
+            let list_rows = content.height.saturating_sub(4) as usize;
             let range = selection_range(filtered.len(), focus, list_rows);
             let mut lines = vec![
                 Line::from(vec![
@@ -2782,7 +2786,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                 Some(efforts) => {
                     let total = efforts.len() + 1;
                     let focus = (*focus).min(total.saturating_sub(1));
-                    let list_rows = inner.height.saturating_sub(4) as usize;
+                    let list_rows = content.height.saturating_sub(4) as usize;
                     for index in selection_range(total, focus, list_rows) {
                         let value = if index == 0 {
                             "default"
@@ -2822,7 +2826,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
             lines
         }
     };
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), content);
 }
 
 fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, secret: &str) {
@@ -2843,12 +2847,24 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
         height,
     );
     frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .title(" /session ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
+        popup,
+    );
+    let inner = popup_inner(popup);
+    if inner.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled("/session", Style::default().fg(Color::Cyan))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let content = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
 
     let lines = match sessions {
         SessionsState::Loading => vec![
@@ -2870,7 +2886,7 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
         } => {
             let filtered = filtered_sessions(sessions, query).collect::<Vec<_>>();
             let focus = (*focus).min(filtered.len().saturating_sub(1));
-            let list_rows = inner.height.saturating_sub(4) as usize / 2;
+            let list_rows = content.height.saturating_sub(4) as usize / 3;
             let range = selection_range(filtered.len(), focus, list_rows.max(1));
             let mut lines = vec![
                 Line::from(vec![
@@ -2921,20 +2937,27 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                     };
                     lines.push(Line::styled(
                         format!(
-                            "{} {} · {}",
+                            "{} {} · {} · {}",
                             if selected { "›" } else { " " },
                             redact_secret(&session.session_id, Some(secret)),
-                            format_session_time(session.updated_at)
+                            format_session_time(session.updated_at),
+                            redact_secret(&session.cwd, Some(secret))
                         ),
                         style,
                     ));
-                    let first = session.first_message.as_deref().unwrap_or("—");
-                    let last = session.last_message.as_deref().unwrap_or("—");
+                    let user = session.last_user_message.as_deref().unwrap_or("—");
+                    let assistant = session.last_assistant_message.as_deref().unwrap_or("—");
                     lines.push(Line::styled(
                         format!(
-                            "  {} → {}",
-                            single_line_preview(&redact_secret(first, Some(secret))),
-                            single_line_preview(&redact_secret(last, Some(secret)))
+                            "  user      {}",
+                            single_line_preview(&redact_secret(user, Some(secret)))
+                        ),
+                        style,
+                    ));
+                    lines.push(Line::styled(
+                        format!(
+                            "  assistant {}",
+                            single_line_preview(&redact_secret(assistant, Some(secret)))
                         ),
                         style,
                     ));
@@ -2949,8 +2972,17 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
     };
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
-        inner,
+        content,
     );
+}
+
+fn popup_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    )
 }
 
 fn format_session_time(updated_at: u64) -> String {
@@ -6359,14 +6391,17 @@ mod skill_picker_tests {
         assert_eq!(builtin_command("/settings-extra"), None);
     }
 
-    fn session(id: &str, first: Option<&str>, last: Option<&str>) -> SessionMetadata {
+    fn session(id: &str, user: Option<&str>, assistant: Option<&str>) -> SessionMetadata {
         SessionMetadata {
             record_type: "session_metadata",
             session_id: id.to_owned(),
             created_at: 1,
             updated_at: 2,
-            first_message: first.map(str::to_owned),
-            last_message: last.map(str::to_owned),
+            cwd: "/workspace/lucy".to_owned(),
+            first_message: user.map(|message| format!("user: {message}")),
+            last_message: assistant.map(|message| format!("assistant: {message}")),
+            last_user_message: user.map(str::to_owned),
+            last_assistant_message: assistant.map(str::to_owned),
         }
     }
 
@@ -6395,6 +6430,65 @@ mod skill_picker_tests {
                 .collect::<Vec<_>>(),
             vec!["beta-id"]
         );
+    }
+
+    #[test]
+    fn settings_and_session_panels_have_no_border_and_use_requested_padding() {
+        let mut settings_terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
+        settings_terminal
+            .draw(|frame| draw_settings(frame, &SettingsState::Loading, frame.area()))
+            .expect("draw settings");
+        let settings = settings_terminal.backend().buffer();
+        assert_eq!(settings[(1, 1)].symbol(), " ");
+        assert_eq!(settings[(1, 1)].bg, FLOATING_PANEL_BACKGROUND);
+        assert_eq!(settings[(3, 2)].symbol(), "/");
+        assert_eq!(settings[(1, 2)].symbol(), " ");
+        assert_eq!(settings[(2, 2)].symbol(), " ");
+        assert_eq!(settings[(1, 8)].symbol(), " ");
+
+        let mut sessions_terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
+        sessions_terminal
+            .draw(|frame| draw_sessions(frame, &SessionsState::Loading, frame.area(), ""))
+            .expect("draw sessions");
+        let sessions = sessions_terminal.backend().buffer();
+        assert_eq!(sessions[(1, 1)].symbol(), " ");
+        assert_eq!(sessions[(1, 1)].bg, FLOATING_PANEL_BACKGROUND);
+        assert_eq!(sessions[(3, 2)].symbol(), "/");
+        assert_eq!(sessions[(1, 2)].symbol(), " ");
+        assert_eq!(sessions[(2, 2)].symbol(), " ");
+        assert_eq!(sessions[(1, 8)].symbol(), " ");
+    }
+
+    #[test]
+    fn session_overlay_renders_three_rows_per_session() {
+        let sessions = SessionsState::Sessions {
+            sessions: vec![session(
+                "session-123",
+                Some("latest user request"),
+                Some("latest assistant answer"),
+            )],
+            query: String::new(),
+            focus: 0,
+        };
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_sessions(frame, &sessions, frame.area(), ""))
+            .expect("draw sessions");
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("/workspace/lucy"));
+        assert!(rendered.contains("user      latest user request"));
+        assert!(rendered.contains("assistant latest assistant answer"));
     }
 
     #[test]
@@ -6729,15 +6823,13 @@ mod skill_picker_tests {
     }
 
     #[test]
-    fn is_inside_tmux_detection() {
-        std::env::set_var("TERM_PROGRAM", "tmux");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "TMUX");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "ghostty");
-        assert!(!is_inside_tmux());
-        std::env::remove_var("TERM_PROGRAM");
-        assert!(!is_inside_tmux());
+    fn tmux_detection_accepts_standard_environment_marker() {
+        assert!(tmux_environment(None, Some("/tmp/tmux-1000/default,1,0")));
+        assert!(tmux_environment(Some("tmux"), None));
+        assert!(tmux_environment(Some("TMUX"), None));
+        assert!(!tmux_environment(Some("ghostty"), None));
+        assert!(!tmux_environment(None, None));
+        assert!(!tmux_environment(None, Some("")));
     }
 
     #[test]
@@ -6817,22 +6909,5 @@ mod skill_picker_tests {
         assert_eq!(buffer[(2, 3)].symbol(), "/");
         assert_eq!(buffer[(2, 3)].fg, QUEUED_MESSAGE_COLOR);
         assert!(!buffer[(2, 3)].modifier.contains(Modifier::BOLD));
-    }
-}
-
-#[cfg(test)]
-mod tmux_keyboard_tests {
-    use super::*;
-
-    #[test]
-    fn is_inside_tmux_detection() {
-        std::env::set_var("TERM_PROGRAM", "tmux");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "TMUX");
-        assert!(is_inside_tmux());
-        std::env::set_var("TERM_PROGRAM", "ghostty");
-        assert!(!is_inside_tmux());
-        std::env::remove_var("TERM_PROGRAM");
-        assert!(!is_inside_tmux());
     }
 }
