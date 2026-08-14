@@ -121,6 +121,7 @@ const TERMINAL_COLOR_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UiPalette {
     prompt_background: Color,
+    selection_background: Color,
     text: Color,
     assistant_text: Color,
     muted_text: Color,
@@ -132,6 +133,7 @@ impl UiPalette {
     fn fallback() -> Self {
         Self {
             prompt_background: PROMPT_BACKGROUND,
+            selection_background: Color::Rgb(48, 48, 58),
             text: Color::White,
             assistant_text: Color::Reset,
             muted_text: Color::DarkGray,
@@ -146,15 +148,18 @@ impl UiPalette {
             + 0.0722 * f32::from(blue))
         .round() as u8;
         let dark = neutral < 128;
-        let surface_lightness = if dark {
-            neutral.saturating_add(18)
-        } else {
-            neutral.saturating_sub(18)
-        };
-        let surface_channel = |channel: u8| {
-            (f32::from(surface_lightness) + (f32::from(channel) - f32::from(neutral)) * 1.15)
-                .round()
-                .clamp(0.0, 255.0) as u8
+        let surface = |distance: u8| {
+            let lightness = if dark {
+                neutral.saturating_add(distance)
+            } else {
+                neutral.saturating_sub(distance)
+            };
+            let channel = |value: u8| {
+                (f32::from(lightness) + (f32::from(value) - f32::from(neutral)) * 1.15)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            Color::Rgb(channel(red), channel(green), channel(blue))
         };
         let text = if dark {
             Color::Rgb(235, 235, 235)
@@ -162,11 +167,8 @@ impl UiPalette {
             Color::Rgb(32, 32, 32)
         };
         Self {
-            prompt_background: Color::Rgb(
-                surface_channel(red),
-                surface_channel(green),
-                surface_channel(blue),
-            ),
+            prompt_background: surface(18),
+            selection_background: surface(36),
             text,
             assistant_text: text,
             muted_text: if dark {
@@ -180,6 +182,19 @@ impl UiPalette {
                 Color::Rgb(140, 105, 0)
             },
             terminal_background: Some((red, green, blue)),
+        }
+    }
+
+    fn secondary_text(self) -> Color {
+        match (self.text, self.muted_text) {
+            (Color::Rgb(red, green, blue), Color::Rgb(muted_red, muted_green, muted_blue)) => {
+                Color::Rgb(
+                    ((u16::from(red) + u16::from(muted_red)) / 2) as u8,
+                    ((u16::from(green) + u16::from(muted_green)) / 2) as u8,
+                    ((u16::from(blue) + u16::from(muted_blue)) / 2) as u8,
+                )
+            }
+            _ => Color::Gray,
         }
     }
 }
@@ -2447,10 +2462,10 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
     );
 
     if let Some(settings) = &state.settings {
-        draw_settings(frame, settings, area);
+        draw_settings(frame, settings, area, state.palette);
     }
     if let Some(sessions) = &state.sessions {
-        draw_sessions(frame, sessions, area, &state.secret);
+        draw_sessions(frame, sessions, area, &state.secret, state.palette);
     }
 
     draw_text_selection(frame, state.selection, area);
@@ -2645,7 +2660,7 @@ fn filtered_sessions<'a>(
     })
 }
 
-fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
+fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect, palette: UiPalette) {
     let width = area
         .width
         .saturating_sub(2)
@@ -2664,7 +2679,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
     );
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Block::default().style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
+        Block::default().style(Style::default().bg(palette.prompt_background)),
         popup,
     );
     let inner = popup_inner(popup);
@@ -2686,22 +2701,22 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
         SettingsState::Loading => vec![
             Line::styled("Loading provider models…", Style::default().fg(Color::Cyan)),
             Line::raw(""),
-            Line::styled("Esc  cancel", Style::default().fg(Color::DarkGray)),
+            Line::styled("Esc  cancel", Style::default().fg(palette.muted_text)),
         ],
         SettingsState::Applying { model, effort } => vec![
             Line::styled("Applying selection…", Style::default().fg(Color::Cyan)),
-            Line::raw(model.clone()),
-            Line::raw(format!(
-                "effort: {}",
-                effort.as_deref().unwrap_or("default")
-            )),
+            Line::styled(model.clone(), Style::default().fg(palette.text)),
+            Line::styled(
+                format!("effort: {}", effort.as_deref().unwrap_or("default")),
+                Style::default().fg(palette.secondary_text()),
+            ),
         ],
         SettingsState::Error(error) => vec![
             Line::styled("Unable to update settings", Style::default().fg(Color::Red)),
             Line::raw(""),
-            Line::raw(error.clone()),
+            Line::styled(error.clone(), Style::default().fg(palette.text)),
             Line::raw(""),
-            Line::styled("Enter/Esc  close", Style::default().fg(Color::DarkGray)),
+            Line::styled("Enter/Esc  close", Style::default().fg(palette.muted_text)),
         ],
         SettingsState::Models {
             models,
@@ -2718,7 +2733,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
             let range = selection_range(filtered.len(), focus, list_rows);
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("Model  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Model  ", Style::default().fg(palette.muted_text)),
                     Span::styled(
                         if query.is_empty() {
                             "type to filter…"
@@ -2726,9 +2741,9 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                             query
                         },
                         Style::default().fg(if query.is_empty() {
-                            Color::DarkGray
+                            palette.muted_text
                         } else {
-                            Color::White
+                            palette.text
                         }),
                     ),
                 ]),
@@ -2742,7 +2757,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                             " · ↑/↓ move · Enter choose"
                         }
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted_text),
                 ),
             ];
             if filtered.is_empty() {
@@ -2760,16 +2775,18 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                             filtered[index].id
                         ),
                         if selected {
-                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                            Style::default()
+                                .fg(palette.text)
+                                .bg(palette.selection_background)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(palette.text)
                         },
                     ));
                 }
             }
             lines.push(Line::styled(
                 "Esc  cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted_text),
             ));
             lines
         }
@@ -2780,7 +2797,7 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
         } => {
             let mut lines = vec![
                 Line::styled(model.id.clone(), Style::default().fg(Color::Cyan)),
-                Line::styled("Reasoning effort", Style::default().fg(Color::DarkGray)),
+                Line::styled("Reasoning effort", Style::default().fg(palette.muted_text)),
             ];
             match &model.efforts {
                 Some(efforts) => {
@@ -2797,29 +2814,34 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
                         lines.push(Line::styled(
                             format!("{} {value}", if selected { "›" } else { " " }),
                             if selected {
-                                Style::default().fg(Color::Black).bg(Color::Cyan)
+                                Style::default()
+                                    .fg(palette.text)
+                                    .bg(palette.selection_background)
                             } else {
-                                Style::default().fg(Color::White)
+                                Style::default().fg(palette.text)
                             },
                         ));
                     }
                     lines.push(Line::styled(
                         "↑/↓ move · Enter save · Esc cancel",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette.muted_text),
                     ));
                 }
                 None => {
-                    lines.push(Line::raw("Provider did not advertise allowed efforts."));
+                    lines.push(Line::styled(
+                        "Provider did not advertise allowed efforts.",
+                        Style::default().fg(palette.secondary_text()),
+                    ));
                     lines.push(Line::from(vec![
-                        Span::styled("Value  ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("Value  ", Style::default().fg(palette.muted_text)),
                         Span::styled(
                             if input.is_empty() { "default" } else { input },
-                            Style::default().fg(Color::White),
+                            Style::default().fg(palette.text),
                         ),
                     ]));
                     lines.push(Line::styled(
                         "Type a value · Enter save · Esc cancel",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette.muted_text),
                     ));
                 }
             }
@@ -2829,7 +2851,13 @@ fn draw_settings(frame: &mut Frame<'_>, settings: &SettingsState, area: Rect) {
     frame.render_widget(Paragraph::new(lines), content);
 }
 
-fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, secret: &str) {
+fn draw_sessions(
+    frame: &mut Frame<'_>,
+    sessions: &SessionsState,
+    area: Rect,
+    secret: &str,
+    palette: UiPalette,
+) {
     let width = area
         .width
         .saturating_sub(2)
@@ -2848,7 +2876,7 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
     );
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Block::default().style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
+        Block::default().style(Style::default().bg(palette.prompt_background)),
         popup,
     );
     let inner = popup_inner(popup);
@@ -2870,14 +2898,17 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
         SessionsState::Loading => vec![
             Line::styled("Loading sessions…", Style::default().fg(Color::Cyan)),
             Line::raw(""),
-            Line::styled("Esc  cancel", Style::default().fg(Color::DarkGray)),
+            Line::styled("Esc  cancel", Style::default().fg(palette.muted_text)),
         ],
         SessionsState::Error(error) => vec![
             Line::styled("Unable to list sessions", Style::default().fg(Color::Red)),
             Line::raw(""),
-            Line::raw(redact_secret(error, Some(secret))),
+            Line::styled(
+                redact_secret(error, Some(secret)),
+                Style::default().fg(palette.text),
+            ),
             Line::raw(""),
-            Line::styled("Enter/Esc  close", Style::default().fg(Color::DarkGray)),
+            Line::styled("Enter/Esc  close", Style::default().fg(palette.muted_text)),
         ],
         SessionsState::Sessions {
             sessions,
@@ -2890,7 +2921,7 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
             let range = selection_range(filtered.len(), focus, list_rows.max(1));
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled("Filter  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Filter  ", Style::default().fg(palette.muted_text)),
                     Span::styled(
                         if query.is_empty() {
                             "type to filter…".to_owned()
@@ -2898,9 +2929,9 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                             redact_secret(query, Some(secret))
                         },
                         Style::default().fg(if query.is_empty() {
-                            Color::DarkGray
+                            palette.muted_text
                         } else {
-                            Color::White
+                            palette.text
                         }),
                     ),
                 ]),
@@ -2914,7 +2945,7 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                             " · ↑/↓ move · Enter attach"
                         }
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted_text),
                 ),
             ];
             if filtered.is_empty() {
@@ -2930,48 +2961,67 @@ fn draw_sessions(frame: &mut Frame<'_>, sessions: &SessionsState, area: Rect, se
                 for index in range {
                     let session = filtered[index];
                     let selected = index == focus;
-                    let style = if selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    let row_style = Style::default().bg(if selected {
+                        palette.selection_background
                     } else {
-                        Style::default().fg(Color::White)
-                    };
-                    lines.push(Line::styled(
-                        format!(
-                            "{} {} · {} · {}",
-                            if selected { "›" } else { " " },
-                            redact_secret(&session.session_id, Some(secret)),
-                            format_session_time(session.updated_at),
-                            redact_secret(&session.cwd, Some(secret))
-                        ),
-                        style,
-                    ));
+                        palette.prompt_background
+                    });
+                    let indicator = if selected { "› " } else { "  " };
                     let user = session.last_user_message.as_deref().unwrap_or("—");
                     let assistant = session.last_assistant_message.as_deref().unwrap_or("—");
-                    lines.push(Line::styled(
-                        format!(
-                            "  user      {}",
-                            single_line_preview(&redact_secret(user, Some(secret)))
-                        ),
-                        style,
-                    ));
-                    lines.push(Line::styled(
-                        format!(
-                            "  assistant {}",
-                            single_line_preview(&redact_secret(assistant, Some(secret)))
-                        ),
-                        style,
-                    ));
+                    lines.push(
+                        Line::from(vec![
+                            Span::styled(indicator, Style::default().fg(Color::Cyan)),
+                            Span::styled("You   ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                single_line_preview(&redact_secret(user, Some(secret))),
+                                Style::default().fg(palette.text),
+                            ),
+                        ])
+                        .style(row_style),
+                    );
+                    lines.push(
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("Cwd   ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                redact_secret(&session.cwd, Some(secret)),
+                                Style::default().fg(palette.text),
+                            ),
+                        ])
+                        .style(row_style),
+                    );
+                    lines.push(
+                        Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled("Lucy  ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                single_line_preview(&redact_secret(assistant, Some(secret))),
+                                Style::default().fg(palette.secondary_text()),
+                            ),
+                            Span::styled("  ·  ", Style::default().fg(palette.muted_text)),
+                            Span::styled(
+                                redact_secret(&session.session_id, Some(secret)),
+                                Style::default().fg(palette.muted_text),
+                            ),
+                            Span::styled(
+                                format!("  ·  {}", format_session_time(session.updated_at)),
+                                Style::default().fg(palette.muted_text),
+                            ),
+                        ])
+                        .style(row_style),
+                    );
                 }
             }
             lines.push(Line::styled(
                 "Esc  cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted_text),
             ));
             lines
         }
     };
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(FLOATING_PANEL_BACKGROUND)),
+        Paragraph::new(lines).style(Style::default().bg(palette.prompt_background)),
         content,
     );
 }
@@ -4088,6 +4138,7 @@ mod tests {
             UiPalette::fallback(),
             UiPalette {
                 prompt_background: PROMPT_BACKGROUND,
+                selection_background: Color::Rgb(48, 48, 58),
                 text: Color::White,
                 assistant_text: Color::Reset,
                 muted_text: Color::DarkGray,
@@ -6437,11 +6488,18 @@ mod skill_picker_tests {
         let mut settings_terminal =
             Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
         settings_terminal
-            .draw(|frame| draw_settings(frame, &SettingsState::Loading, frame.area()))
+            .draw(|frame| {
+                draw_settings(
+                    frame,
+                    &SettingsState::Loading,
+                    frame.area(),
+                    UiPalette::fallback(),
+                )
+            })
             .expect("draw settings");
         let settings = settings_terminal.backend().buffer();
         assert_eq!(settings[(1, 1)].symbol(), " ");
-        assert_eq!(settings[(1, 1)].bg, FLOATING_PANEL_BACKGROUND);
+        assert_eq!(settings[(1, 1)].bg, UiPalette::fallback().prompt_background);
         assert_eq!(settings[(3, 2)].symbol(), "/");
         assert_eq!(settings[(1, 2)].symbol(), " ");
         assert_eq!(settings[(2, 2)].symbol(), " ");
@@ -6450,11 +6508,19 @@ mod skill_picker_tests {
         let mut sessions_terminal =
             Terminal::new(ratatui::backend::TestBackend::new(40, 10)).expect("test terminal");
         sessions_terminal
-            .draw(|frame| draw_sessions(frame, &SessionsState::Loading, frame.area(), ""))
+            .draw(|frame| {
+                draw_sessions(
+                    frame,
+                    &SessionsState::Loading,
+                    frame.area(),
+                    "",
+                    UiPalette::fallback(),
+                )
+            })
             .expect("draw sessions");
         let sessions = sessions_terminal.backend().buffer();
         assert_eq!(sessions[(1, 1)].symbol(), " ");
-        assert_eq!(sessions[(1, 1)].bg, FLOATING_PANEL_BACKGROUND);
+        assert_eq!(sessions[(1, 1)].bg, UiPalette::fallback().prompt_background);
         assert_eq!(sessions[(3, 2)].symbol(), "/");
         assert_eq!(sessions[(1, 2)].symbol(), " ");
         assert_eq!(sessions[(2, 2)].symbol(), " ");
@@ -6475,7 +6541,7 @@ mod skill_picker_tests {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(100, 20)).expect("test terminal");
         terminal
-            .draw(|frame| draw_sessions(frame, &sessions, frame.area(), ""))
+            .draw(|frame| draw_sessions(frame, &sessions, frame.area(), "", UiPalette::fallback()))
             .expect("draw sessions");
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
@@ -6486,9 +6552,25 @@ mod skill_picker_tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("/workspace/lucy"));
-        assert!(rendered.contains("user      latest user request"));
-        assert!(rendered.contains("assistant latest assistant answer"));
+        assert!(rendered.contains("You   latest user request"));
+        assert!(rendered.contains("Cwd   /workspace/lucy"));
+        assert!(rendered.contains("Lucy  latest assistant answer"));
+        let user_position = rendered.find("latest user request").expect("user preview");
+        let cwd_position = rendered.find("/workspace/lucy").expect("cwd");
+        let assistant_position = rendered
+            .find("latest assistant answer")
+            .expect("assistant preview");
+        let id_position = rendered.find("session-123").expect("session id");
+        assert!(user_position < cwd_position);
+        assert!(cwd_position < assistant_position);
+        assert!(assistant_position < id_position);
+
+        let palette = UiPalette::fallback();
+        assert_eq!(buffer[(16, 5)].fg, palette.text);
+        assert_eq!(buffer[(16, 6)].fg, palette.text);
+        assert_eq!(buffer[(16, 7)].fg, palette.secondary_text());
+        assert_eq!(buffer[(53, 7)].fg, palette.muted_text);
+        assert_eq!(buffer[(8, 5)].bg, palette.selection_background);
     }
 
     #[test]
@@ -6614,7 +6696,15 @@ mod skill_picker_tests {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("test terminal");
         terminal
-            .draw(|frame| draw_sessions(frame, state.sessions.as_ref().unwrap(), frame.area(), ""))
+            .draw(|frame| {
+                draw_sessions(
+                    frame,
+                    state.sessions.as_ref().unwrap(),
+                    frame.area(),
+                    "",
+                    UiPalette::fallback(),
+                )
+            })
             .expect("draw session picker");
         let buffer = terminal.backend().buffer();
         let rendered = (0..buffer.area.height)
