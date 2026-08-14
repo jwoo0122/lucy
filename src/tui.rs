@@ -1341,6 +1341,7 @@ impl UiState {
         }
         self.sessions = Some(match result {
             Ok(mut sessions) => {
+                sessions.retain(|session| session.session_id != self.active_session_id);
                 sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
                 SessionsState::Sessions {
                     sessions,
@@ -1352,7 +1353,6 @@ impl UiState {
         });
     }
     fn handle_sessions_key(&mut self, key: &KeyEvent) -> Option<String> {
-        let active_session_id = self.active_session_id.clone();
         match self.sessions.as_mut()? {
             SessionsState::Loading => {
                 if key.code == KeyCode::Esc {
@@ -1387,10 +1387,6 @@ impl UiState {
                     let selected_session_id = filtered_sessions(sessions, query)
                         .nth(*focus)
                         .map(|session| session.session_id.clone());
-                    if selected_session_id.as_deref() == Some(active_session_id.as_str()) {
-                        self.sessions = None;
-                        return None;
-                    }
                     return selected_session_id;
                 }
                 _ => {}
@@ -6648,17 +6644,53 @@ mod skill_picker_tests {
     }
 
     #[test]
-    fn enter_on_active_session_closes_overlay_without_attaching() {
+    fn open_sessions_excludes_the_active_session() {
+        let mut state =
+            UiState::from_history(&[], "active-session", "secret", "model", None, false);
+        state.sessions = Some(SessionsState::Loading);
+        state.open_sessions(Ok(vec![
+            session("active-session", Some("current request"), None),
+            session("other-session", Some("other request"), None),
+        ]));
+
+        let SessionsState::Sessions { sessions, .. } =
+            state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["other-session"]
+        );
+        assert_eq!(
+            state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some("other-session".to_owned())
+        );
+    }
+
+    #[test]
+    fn active_session_alone_produces_an_empty_session_overlay() {
         let mut state =
             UiState::from_history(&[], "active-session", "secret", "model", None, false);
         state.sessions = Some(SessionsState::Loading);
         state.open_sessions(Ok(vec![session("active-session", None, None)]));
 
+        let SessionsState::Sessions {
+            sessions, focus, ..
+        } = state.sessions.as_ref().expect("session picker")
+        else {
+            panic!("sessions should be loaded");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(*focus, 0);
         assert_eq!(
             state.handle_sessions_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             None
         );
-        assert!(state.sessions.is_none());
+        assert!(state.sessions.is_some());
     }
 
     #[test]
