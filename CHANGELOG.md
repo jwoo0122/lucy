@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.14.9](https://github.com/jwoo0122/lucy/compare/v1.14.8...v1.14.9) - 2026-08-14
+
+### Fixed
+
+- improve TUI rendering and text selection ([#89](https://github.com/jwoo0122/lucy/pull/89))
+
 ## [1.14.8](https://github.com/jwoo0122/lucy/compare/v1.14.7...v1.14.8) - 2026-08-12
 
 ### Fixed
