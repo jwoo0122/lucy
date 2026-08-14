@@ -6,17 +6,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect, Size};
 use ratatui::prelude::Frame;
 use ratatui::style::{Color, Modifier, Style};
@@ -38,6 +41,19 @@ use crate::redaction::redact_secret;
 use crate::session::{Session, SessionHistoryRecord, SessionMetadata};
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
+
+fn draw_frame<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    state: &mut UiState,
+) -> io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let draw_result = terminal.draw(|frame| draw(frame, state)).map(|frame| {
+        state.rendered_frame = Some(frame.buffer.clone());
+    });
+    execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+    draw_result
+}
+
 const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
 /// Maximum number of wrapped input rows the input box grows to before it
 /// stops expanding and scrolls its contents internally.
@@ -436,16 +452,7 @@ fn event_loop<W: Write>(
             }
         }
 
-        // Ratatui flushes the buffer diff (which issues MoveTo for every
-        // changed cell) before it hides or shows the cursor. If the hardware
-        // cursor is visible during that flush it briefly appears at each
-        // changed cell. Hide it first so the flush phase never shows it; Ratatui
-        // will re-show it at the prompt position after flush when needed.
-        let _ = execute!(terminal.backend_mut(), Hide);
-
-        terminal
-            .draw(|frame| draw(frame, state))
-            .map_err(|error| format!("unable to render TUI: {error}"))?;
+        draw_frame(terminal, state).map_err(|error| format!("unable to render TUI: {error}"))?;
 
         if quitting {
             thread::sleep(EVENT_POLL);
@@ -465,13 +472,22 @@ fn event_loop<W: Write>(
                         .size()
                         .map_err(|error| format!("unable to read terminal size: {error}"))?;
                     let max_scroll = max_scroll_for_area(state, size);
-                    handle_mouse_event(state, mouse.kind, max_scroll);
+                    handle_mouse_event(state, mouse, max_scroll);
                     continue;
                 }
                 Event::Key(key) => key,
                 _ => continue,
             };
             if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+                continue;
+            }
+            if is_copy_selection_key(&key) {
+                if let (Some(selection), Some(buffer)) = (state.selection, &state.rendered_frame) {
+                    let text = selected_text(buffer, selection, tui_viewport(buffer.area));
+                    if !text.is_empty() {
+                        let _ = send_clipboard_osc52(terminal.backend_mut(), &text);
+                    }
+                }
                 continue;
             }
             if is_ctrl_c(&key) {
@@ -656,13 +672,49 @@ fn handle_terminal_focus_event(state: &mut UiState, event: &Event) -> bool {
 }
 
 fn is_ctrl_c(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+    matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers == KeyModifiers::CONTROL
 }
 
-fn handle_mouse_event(state: &mut UiState, kind: MouseEventKind, max_scroll: u16) {
-    match kind {
-        MouseEventKind::ScrollUp => scroll_up(state, max_scroll),
-        MouseEventKind::ScrollDown => scroll_down(state, max_scroll),
+fn is_copy_selection_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'C'))
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
+
+fn handle_mouse_event(state: &mut UiState, event: MouseEvent, max_scroll: u16) {
+    match event.kind {
+        MouseEventKind::ScrollUp => {
+            state.selection = None;
+            scroll_up(state, max_scroll);
+        }
+        MouseEventKind::ScrollDown => {
+            state.selection = None;
+            scroll_down(state, max_scroll);
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let point = SelectionPoint::new(event.column, event.row);
+            state.selection = Some(TextSelection::new(point));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(selection) = state
+                .selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+            {
+                selection.focus = SelectionPoint::new(event.column, event.row);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(selection) = state
+                .selection
+                .as_mut()
+                .filter(|selection| selection.dragging)
+            {
+                selection.focus = SelectionPoint::new(event.column, event.row);
+                selection.dragging = false;
+            }
+        }
         _ => {}
     }
 }
@@ -960,6 +1012,43 @@ struct ActivityTransition {
     to_levels: [usize; PULSE_BAR_PERIODS.len()],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    row: u16,
+    column: u16,
+}
+
+impl SelectionPoint {
+    fn new(column: u16, row: u16) -> Self {
+        Self { row, column }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextSelection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    dragging: bool,
+}
+
+impl TextSelection {
+    fn new(anchor: SelectionPoint) -> Self {
+        Self {
+            anchor,
+            focus: anchor,
+            dragging: true,
+        }
+    }
+
+    fn bounds(self) -> (SelectionPoint, SelectionPoint) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+}
+
 struct UiState {
     active_session_id: String,
     model: String,
@@ -978,6 +1067,8 @@ struct UiState {
     active_cancel: Option<CancellationToken>,
     scroll: u16,
     auto_scroll: bool,
+    selection: Option<TextSelection>,
+    rendered_frame: Option<Buffer>,
     tool_animation_epoch: Instant,
     console_animation_epoch: Instant,
     activity_started_at: Instant,
@@ -1023,6 +1114,8 @@ impl UiState {
             active_cancel: None,
             scroll: 0,
             auto_scroll: true,
+            selection: None,
+            rendered_frame: None,
             tool_animation_epoch: Instant::now(),
             console_animation_epoch: Instant::now(),
             activity_started_at: Instant::now(),
@@ -2369,6 +2462,8 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
         draw_sessions(frame, sessions, area, &state.secret);
     }
 
+    draw_text_selection(frame, state.selection, area);
+
     // A frame cursor makes Ratatui issue `Show` after every redraw. Only set
     // one while focused.
     if state.terminal_focused
@@ -2388,6 +2483,96 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
                 .min(prompt_area.height.saturating_sub(1));
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn draw_text_selection(
+    frame: &mut Frame<'_>,
+    selection: Option<TextSelection>,
+    selectable_area: Rect,
+) {
+    let Some(selection) = selection.filter(|selection| selection.anchor != selection.focus) else {
+        return;
+    };
+    let (start, end) = selection.bounds();
+    let buffer = frame.buffer_mut();
+    for row in start.row..=end.row.min(selectable_area.bottom().saturating_sub(1)) {
+        if row < selectable_area.y {
+            continue;
+        }
+        let Some((first_column, last_column)) = selected_columns(start, end, row, selectable_area)
+        else {
+            continue;
+        };
+        for column in first_column..=last_column {
+            if let Some(cell) = buffer.cell_mut((column, row)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+}
+
+fn selected_text(buffer: &Buffer, selection: TextSelection, selectable_area: Rect) -> String {
+    if selection.anchor == selection.focus {
+        return String::new();
+    }
+    let (start, end) = selection.bounds();
+    let mut lines = Vec::new();
+    for row in start.row..=end.row.min(selectable_area.bottom().saturating_sub(1)) {
+        if row < selectable_area.y {
+            continue;
+        }
+        let Some((first_column, last_column)) = selected_columns(start, end, row, selectable_area)
+        else {
+            continue;
+        };
+        let mut line = String::new();
+        let mut column = first_column;
+        while column <= last_column {
+            let Some(cell) = buffer.cell((column, row)) else {
+                break;
+            };
+            let symbol = cell.symbol();
+            line.push_str(symbol);
+            column = column.saturating_add(UnicodeWidthStr::width(symbol).max(1) as u16);
+        }
+        lines.push(line.trim_end().to_owned());
+    }
+    lines.join("\n")
+}
+
+fn selected_columns(
+    start: SelectionPoint,
+    end: SelectionPoint,
+    row: u16,
+    selectable_area: Rect,
+) -> Option<(u16, u16)> {
+    if selectable_area.is_empty() {
+        return None;
+    }
+    let first = if row == start.row {
+        start.column
+    } else {
+        selectable_area.x
+    };
+    let last = if row == end.row {
+        end.column
+    } else {
+        selectable_area.right().saturating_sub(1)
+    };
+    let first = first.max(selectable_area.x);
+    let last = last.min(selectable_area.right().saturating_sub(1));
+    (first <= last).then_some((first, last))
+}
+
+fn send_clipboard_osc52<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
+    writer.write_all(b"\x1b]52;c;")?;
+    writer.write_all(
+        base64::engine::general_purpose::STANDARD
+            .encode(text)
+            .as_bytes(),
+    )?;
+    writer.write_all(b"\x07")?;
+    writer.flush()
 }
 
 fn draw_message_queue(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
@@ -3791,6 +3976,63 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("writer lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn each_prompt_frame_uses_a_synchronized_terminal_update() {
+        let writer = SharedWriter::default();
+        let output = Arc::clone(&writer.0);
+        let backend = CrosstermBackend::new(writer);
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 40, 10)),
+            },
+        )
+        .expect("test terminal");
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, true);
+
+        draw_frame(&mut terminal, &mut state).expect("first frame");
+        output.lock().expect("writer lock").clear();
+        draw_frame(&mut terminal, &mut state).expect("second frame");
+
+        let output = output.lock().expect("writer lock");
+        let begin = output
+            .windows(8)
+            .position(|bytes| bytes == b"\x1b[?2026h")
+            .expect("synchronized update begin");
+        let end = output
+            .windows(8)
+            .position(|bytes| bytes == b"\x1b[?2026l")
+            .expect("synchronized update end");
+        assert!(begin < end, "frame was not enclosed by synchronized update");
+    }
+
     #[test]
     fn terminal_backgrounds_produce_tinted_surfaces_and_contrasting_palettes() {
         let dark = UiPalette::from_terminal_background(12, 24, 36);
@@ -4900,6 +5142,107 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_selects_visible_text_and_release_keeps_the_selection() {
+        let mut state = UiState::from_history(
+            &[],
+            "current-session",
+            "provider-secret",
+            "model",
+            None,
+            false,
+        );
+
+        handle_mouse_event(
+            &mut state,
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            0,
+        );
+        handle_mouse_event(
+            &mut state,
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 6, 4),
+            0,
+        );
+        assert_eq!(
+            state.selection,
+            Some(TextSelection {
+                anchor: SelectionPoint::new(2, 3),
+                focus: SelectionPoint::new(6, 4),
+                dragging: true,
+            })
+        );
+
+        handle_mouse_event(
+            &mut state,
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 7, 4),
+            0,
+        );
+        assert_eq!(
+            state.selection.expect("selection").focus,
+            SelectionPoint::new(7, 4)
+        );
+        assert!(!state.selection.expect("selection").dragging);
+    }
+
+    #[test]
+    fn selected_text_reads_forward_and_reverse_ranges_from_the_rendered_cells() {
+        let buffer = Buffer::with_lines(["alpha", "bravo", "charlie"]);
+        let forward = TextSelection {
+            anchor: SelectionPoint::new(2, 0),
+            focus: SelectionPoint::new(2, 1),
+            dragging: false,
+        };
+        let reverse = TextSelection {
+            anchor: forward.focus,
+            focus: forward.anchor,
+            dragging: false,
+        };
+
+        let selectable_area = tui_viewport(buffer.area);
+        assert_eq!(selected_text(&buffer, forward, selectable_area), "pha\nra");
+        assert_eq!(selected_text(&buffer, reverse, selectable_area), "pha\nra");
+    }
+
+    #[test]
+    fn selection_overlay_reverses_only_the_selected_cells() {
+        let backend = ratatui::backend::TestBackend::new(5, 2);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let selection = TextSelection {
+            anchor: SelectionPoint::new(1, 0),
+            focus: SelectionPoint::new(2, 1),
+            dragging: false,
+        };
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new("abcde\nfghij"), frame.area());
+                draw_text_selection(frame, Some(selection), tui_viewport(frame.area()));
+            })
+            .expect("draw selection");
+        let buffer = terminal.backend().buffer();
+
+        assert!(!buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(4, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(0, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(2, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer[(3, 1)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn copy_selection_key_emits_an_osc_52_clipboard_sequence() {
+        let key = KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(is_copy_selection_key(&key));
+        assert!(!is_ctrl_c(&key));
+
+        let mut output = Vec::new();
+        send_clipboard_osc52(&mut output, "Lucy 안녕").expect("clipboard sequence");
+        assert_eq!(output, b"\x1b]52;c;THVjeSDslYjrhZU=\x07");
+    }
+
+    #[test]
     fn mouse_wheel_disables_following_and_changes_scroll_offset() {
         let history = [SessionHistoryRecord::Message {
             timestamp: 1,
@@ -4913,10 +5256,14 @@ mod tests {
             None,
             false,
         );
-        handle_mouse_event(&mut state, MouseEventKind::ScrollUp, 10);
+        handle_mouse_event(&mut state, mouse_event(MouseEventKind::ScrollUp, 0, 0), 10);
         assert!(!state.auto_scroll);
         assert_eq!(state.scroll, 7);
-        handle_mouse_event(&mut state, MouseEventKind::ScrollDown, 10);
+        handle_mouse_event(
+            &mut state,
+            mouse_event(MouseEventKind::ScrollDown, 0, 0),
+            10,
+        );
         assert!(
             state.auto_scroll,
             "reaching the bottom resumes transcript following"
