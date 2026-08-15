@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.15.2](https://github.com/jwoo0122/lucy/compare/v1.15.1...v1.15.2) - 2026-08-15
+
+### Fixed
+
+- bound auto-compaction fallback requests ([#94](https://github.com/jwoo0122/lucy/pull/94))
+
 ## [1.15.1](https://github.com/jwoo0122/lucy/compare/v1.15.0...v1.15.1) - 2026-08-15
 
 ### Fixed
