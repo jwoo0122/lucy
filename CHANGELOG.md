@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.15.0](https://github.com/jwoo0122/lucy/compare/v1.14.10...v1.15.0) - 2026-08-15
+
+### Added
+
+- lucy exec ([#92](https://github.com/jwoo0122/lucy/pull/92))
+
+### Other
+
+- update adr docs ([#91](https://github.com/jwoo0122/lucy/pull/91))
+
 ## [1.14.10](https://github.com/jwoo0122/lucy/compare/v1.14.9...v1.14.10) - 2026-08-14
 
 ### Fixed
