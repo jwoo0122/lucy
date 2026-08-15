@@ -49,7 +49,10 @@ pub fn attention_reset_event(surface: &str, source_id: &str) -> Result<JournalEv
 }
 
 fn advances_attention(event: &JournalEvent) -> bool {
-    matches!(event.kind.as_str(), MESSAGE_EVENT_KIND | ATTENTION_RESET_KIND)
+    matches!(
+        event.kind.as_str(),
+        MESSAGE_EVENT_KIND | ATTENTION_RESET_KIND
+    )
 }
 
 /// Derive Lucy's one durable attention head from the canonical journal. The
