@@ -123,11 +123,10 @@ fn gateway_state_path(home: &Path) -> PathBuf {
 
 fn load_state(path: &Path) -> Result<GatewayState, String> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|_| "invalid Telegram gateway state".to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(GatewayState::default())
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|_| "invalid Telegram gateway state".to_owned())
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(GatewayState::default()),
         Err(_) => Err("unable to read Telegram gateway state".to_owned()),
     }
 }
@@ -136,18 +135,15 @@ fn save_state(path: &Path, state: &GatewayState) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "invalid Telegram gateway state path".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|_| "unable to create Telegram gateway state".to_owned())?;
+    fs::create_dir_all(parent).map_err(|_| "unable to create Telegram gateway state".to_owned())?;
     set_private_directory_permissions(parent)?;
 
     let payload = serde_json::to_vec_pretty(state)
         .map_err(|_| "unable to encode Telegram gateway state".to_owned())?;
     let tmp = parent.join(format!(".telegram.json.tmp-{}", std::process::id()));
-    fs::write(&tmp, payload)
-        .map_err(|_| "unable to write Telegram gateway state".to_owned())?;
+    fs::write(&tmp, payload).map_err(|_| "unable to write Telegram gateway state".to_owned())?;
     set_private_file_permissions(&tmp)?;
-    fs::rename(&tmp, path)
-        .map_err(|_| "unable to commit Telegram gateway state".to_owned())?;
+    fs::rename(&tmp, path).map_err(|_| "unable to commit Telegram gateway state".to_owned())?;
     set_private_file_permissions(path)?;
     Ok(())
 }
@@ -209,12 +205,7 @@ fn get_updates(
     Ok(payload.result)
 }
 
-fn send_message(
-    client: &Client,
-    token: &str,
-    chat_id: i64,
-    text: &str,
-) -> Result<(), String> {
+fn send_message(client: &Client, token: &str, chat_id: i64, text: &str) -> Result<(), String> {
     let text = if text.is_empty() {
         "(empty response)"
     } else {
@@ -253,11 +244,7 @@ fn run_lucy_turn(
         args.push("--session".to_owned());
         args.push(session_id.to_owned());
     }
-    args.extend([
-        "--output".to_owned(),
-        "json".to_owned(),
-        "-".to_owned(),
-    ]);
+    args.extend(["--output".to_owned(), "json".to_owned(), "-".to_owned()]);
 
     let mut output = Vec::new();
     let mut diagnostics = Vec::new();
