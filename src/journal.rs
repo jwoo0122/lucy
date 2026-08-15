@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -109,6 +109,7 @@ impl Journal {
 
     pub fn read_all(&self) -> Result<Vec<JournalEvent>, String> {
         let path = self.path();
+        ensure_not_symlink(&path).map_err(|_| "journal path is unsafe".to_owned())?;
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -123,6 +124,7 @@ impl Journal {
         self.prepare_root()?;
         let _lock = JournalAppendLock::acquire(&self.root)?;
         let path = self.path();
+        ensure_not_symlink(&path).map_err(|_| "journal path is unsafe".to_owned())?;
         let mut bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -360,8 +362,7 @@ mod tests {
         let root = temporary_root("corrupt");
         fs::create_dir_all(&root).expect("root");
         let journal = Journal::at_root(root.clone());
-        fs::write(journal.path(), b"not-json\npartial")
-            .expect("corrupt journal");
+        fs::write(journal.path(), b"not-json\npartial").expect("corrupt journal");
 
         assert_eq!(
             journal.recover_incomplete_tail().expect_err("must refuse"),
@@ -400,7 +401,10 @@ mod tests {
         let journal = Journal::at_root(root.clone());
         let events = journal.read_all().expect("read");
         assert_eq!(events.len(), workers * per_worker);
-        let ids = events.iter().map(|event| event.id.as_str()).collect::<std::collections::BTreeSet<_>>();
+        let ids = events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ids.len(), events.len());
         fs::remove_dir_all(root).expect("cleanup");
     }
