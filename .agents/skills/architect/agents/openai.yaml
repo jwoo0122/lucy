@@ -1,0 +1,4 @@
+interface:
+  display_name: "Architect"
+  short_description: "Clarify consequential design and oversee ADRs"
+  default_prompt: "Use $architect to inspect repository and ADR evidence, expose unresolved consequential design choices, preserve durable intent, and complete the authorized repository change."

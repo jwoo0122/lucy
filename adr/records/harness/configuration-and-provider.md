@@ -4,42 +4,103 @@ status: accepted
 scope: harness
 decision_type: configuration
 applies_to:
-  - "src/**"
-  - "tests/**"
-  - "README.md"
+- src/**
+- tests/**
+- README.md
 summary: Lucy owns a compiled built-in boot prompt, bootstraps provider settings in an XDG config file, preserves valid legacy system_prompt keys while ignoring them, and reads provider credentials only from the environment.
 constrains: []
 depends_on:
-  - harness.agent-boundary-and-protocol
+- harness.agent-boundary-and-protocol
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-08-04"
+last_reviewed: '2026-08-04'
 enforcement:
-  - id: config-bootstrap-and-migration
-    path: src/config.rs
-    must_contain:
-      - "fn bootstraps_config_without_overwriting_existing_bytes()"
-      - "fn migrates_a_legacy_config_once_without_overwriting_xdg_config()"
-      - "fn generated_config_omits_system_prompt()"
-      - "fn legacy_system_prompt_is_ignored_without_rewriting_config_bytes()"
-      - "fn settings_updates_preserve_legacy_system_prompt()"
-      - "#[serde(skip)]"
-      - "fn auth_provider_rejects_mixed_credentials()"
-    must_not_contain: []
-  - id: openrouter-session-identity-and-attribution
-    path: src/provider/base.rs
-    must_contain:
-      - "fn openrouter_requests_include_session_and_app_metadata()"
-      - "fn compatible_requests_omit_provider_specific_session_metadata()"
-      - 'const APP_URL: &str = "https://lucyna.run";'
-    must_not_contain: []
-  - id: codex-session-identity
-    path: src/codex_provider.rs
-    must_contain:
-      - "fn codex_request_uses_responses_shape()"
-      - 'request["prompt_cache_key"] = json!(session_id);'
-    must_not_contain: []
-enforcement_exception: null
+- invariant: create-missing-config-once
+  kind: executable
+  check: rust-tests
+- invariant: generated-config-excludes-prompt
+  kind: executable
+  check: rust-tests
+- invariant: xdg-config-root-resolution
+  kind: executable
+  check: rust-tests
+- invariant: non-destructive-legacy-config-migration
+  kind: executable
+  check: rust-tests
+- invariant: existing-config-not-replaced
+  kind: executable
+  check: rust-tests
+- invariant: legacy-prompt-is-inert
+  kind: executable
+  check: rust-tests
+- invariant: serialized-api-key-confidentiality
+  kind: executable
+  check: rust-tests
+- invariant: child-credential-boundary
+  kind: executable
+  check: rust-tests
+- invariant: early-diagnostic-scrubbing
+  kind: executable
+  check: rust-tests
+- invariant: unsafe-resume-rejected
+  kind: executable
+  check: rust-tests
+- invariant: secret-safe-settings-audit
+  kind: executable
+  check: rust-tests
+- invariant: config-authoritative-on-start
+  kind: executable
+  check: rust-tests
+- invariant: idle-settings-and-safe-catalog-errors
+  kind: executable
+  check: rust-tests
+- invariant: safe-config-errors
+  kind: executable
+  check: rust-tests
+- invariant: immutable-boot-prompt-snapshot
+  kind: executable
+  check: rust-tests
+- invariant: stable-provider-session-identity
+  kind: executable
+  check: rust-tests
+- invariant: provider-specific-metadata-boundary
+  kind: executable
+  check: rust-tests
+invariants:
+- id: create-missing-config-once
+  statement: Lucy creates a missing XDG config once with safe parent-directory creation.
+- id: generated-config-excludes-prompt
+  statement: Generated config contains provider settings and omits system_prompt.
+- id: xdg-config-root-resolution
+  statement: Unset, empty, or relative XDG_CONFIG_HOME resolves to ~/.config, while a non-empty absolute value determines the config root.
+- id: non-destructive-legacy-config-migration
+  statement: When no XDG config exists, a regular non-symlink legacy config is migrated once byte-for-byte, and an existing XDG config always wins.
+- id: existing-config-not-replaced
+  statement: Existing config bytes are not replaced by defaults.
+- id: legacy-prompt-is-inert
+  statement: A valid legacy system_prompt is accepted, ignored, and preserved through unrelated settings writes.
+- id: serialized-api-key-confidentiality
+  statement: The active API key is absent from errors, JSONL output, and newly written sessions, and unsafe key values are rejected before output.
+- id: child-credential-boundary
+  statement: Context discovery retains the configured OpenRouter key environment, cmd children remove it, serialized output redacts it, and Codex tokens are never placed in child environments.
+- id: early-diagnostic-scrubbing
+  statement: Early fallback diagnostics scrub inherited environment values and missing-key diagnostics do not echo the configured variable name.
+- id: unsafe-resume-rejected
+  statement: A resumed session containing the current key is rejected rather than sent to a provider or exposed by listing.
+- id: secret-safe-settings-audit
+  statement: Session headers and provider-settings audit records reject provider settings containing the active key.
+- id: config-authoritative-on-start
+  statement: Model and effort are reloaded from config for every new or resumed session, while the session audit trail records those selections.
+- id: idle-settings-and-safe-catalog-errors
+  statement: The settings UI is available only while the TUI is idle and provider-catalog failures do not expose credentials.
+- id: safe-config-errors
+  statement: Config parse errors identify the setting or file without echoing secret values.
+- id: immutable-boot-prompt-snapshot
+  statement: New sessions snapshot the current built-in composed prompt and resumed sessions retain their historical boot_system_prompt.
+- id: stable-provider-session-identity
+  statement: Provider routing or cache identity equals the Lucy session ID and remains stable across resume, compaction, and settings changes.
+- id: provider-specific-metadata-boundary
+  statement: OpenRouter and Codex receive only their documented identity metadata, while generic compatible endpoints receive no provider-specific identity fields or headers.
 ---
 
 # Lucy-owned prompt and user-owned provider configuration
@@ -70,23 +131,23 @@ Boot guidance is part of Lucy's product behavior and must evolve with the binary
 
 ## Invariants
 
-- Missing XDG config is created once with safe parent-directory creation.
-- Generated config contains provider settings and does not contain `system_prompt`.
-- An unset, empty, or relative `XDG_CONFIG_HOME` resolves to `~/.config`; a non-empty absolute XDG home determines the configuration root.
-- When no XDG config exists, a regular non-symlink legacy `~/.lucy/config.toml` is migrated once without changing its bytes; an existing XDG config always wins.
+- Lucy creates a missing XDG config once with safe parent-directory creation.
+- Generated config contains provider settings and omits system_prompt.
+- Unset, empty, or relative XDG_CONFIG_HOME resolves to ~/.config, while a non-empty absolute value determines the config root.
+- When no XDG config exists, a regular non-symlink legacy config is migrated once byte-for-byte, and an existing XDG config always wins.
 - Existing config bytes are not replaced by defaults.
-- A valid legacy top-level `system_prompt` is accepted and ignored; its entry is preserved through compatibility handling and unrelated settings writes, and it never overrides the compiled built-in prompt.
-- The active API key never appears in error text, JSONL output, or newly written session JSONL; unsafe key values are rejected before output.
-- The configured OpenRouter API-key environment variable remains available to context-discovery helpers but is removed from `cmd` child environments before spawn; serialized output and persisted records still redact it. Codex subscription tokens are never placed in child environments.
-- Early fallback diagnostics scrub every non-empty inherited environment value, including short values; missing-key diagnostics do not echo the configured environment-variable name.
-- A resumed session whose current key is already present in its raw file is rejected rather than sent to the provider or exposed by listing.
-- The session header and every provider-settings audit record are secret-safe; an effort containing the active provider key is rejected like other provider-setting values.
-- Model and effort are reloaded from `config.toml` on every new or resumed session; the session audit trail records rather than overrides those selections.
-- `/settings` is available only when the TUI has no active turn, and provider catalog failures must not expose credentials.
-- Config parse errors identify the setting/file without echoing secret values.
-- A new session snapshots the current built-in composed prompt; a resumed session retains its historical `boot_system_prompt`.
-- Provider routing/cache identity equals the existing Lucy session ID, remains stable across resume and compaction, and is not persisted in a new field.
-- OpenRouter and Codex receive only their documented identity metadata; generic compatible endpoints remain free of provider-specific request fields and headers.
+- A valid legacy system_prompt is accepted, ignored, and preserved through unrelated settings writes.
+- The active API key is absent from errors, JSONL output, and newly written sessions, and unsafe key values are rejected before output.
+- Context discovery retains the configured OpenRouter key environment, cmd children remove it, serialized output redacts it, and Codex tokens are never placed in child environments.
+- Early fallback diagnostics scrub inherited environment values and missing-key diagnostics do not echo the configured variable name.
+- A resumed session containing the current key is rejected rather than sent to a provider or exposed by listing.
+- Session headers and provider-settings audit records reject provider settings containing the active key.
+- Model and effort are reloaded from config for every new or resumed session, while the session audit trail records those selections.
+- The settings UI is available only while the TUI is idle and provider-catalog failures do not expose credentials.
+- Config parse errors identify the setting or file without echoing secret values.
+- New sessions snapshot the current built-in composed prompt and resumed sessions retain their historical boot_system_prompt.
+- Provider routing or cache identity equals the Lucy session ID and remains stable across resume, compaction, and settings changes.
+- OpenRouter and Codex receive only their documented identity metadata, while generic compatible endpoints receive no provider-specific identity fields or headers.
 
 ## Alternatives and trade-offs
 

@@ -4,35 +4,85 @@ status: accepted
 scope: harness
 decision_type: boundary
 applies_to:
-  - "Cargo.toml"
-  - "src/**"
-  - "tests/**"
-  - "README.md"
+- Cargo.toml
+- src/**
+- tests/**
+- README.md
 summary: Lucy is a local macOS/Linux harness with TUI and JSONL interfaces while cmd remains its only model-facing tool.
 constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-08-04"
+last_reviewed: '2026-08-04'
 enforcement:
-  - id: cmd-only-tool-schema
-    path: src/provider/base.rs
-    must_contain:
-      - "fn normal_requests_expose_only_cmd()"
-      - '"name": "cmd"'
-    must_not_contain: []
-  - id: normalized-jsonl-tool-loop
-    path: tests/cli.rs
-    must_contain:
-      - "fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure()"
-    must_not_contain: []
-  - id: codex-cmd-tool-schema
-    path: src/codex_provider.rs
-    must_contain:
-      - "fn codex_request_uses_responses_shape()"
-      - '"background":{"type":"boolean","default":false}'
-    must_not_contain: []
-enforcement_exception: null
+- invariant: jsonl-record-framing
+  kind: executable
+  check: rust-tests
+- invariant: successful-turn-events
+  kind: executable
+  check: rust-tests
+- invariant: interruption-ordering
+  kind: executable
+  check: rust-tests
+- invariant: command-before-provider-continuation
+  kind: executable
+  check: rust-tests
+- invariant: unbounded-tool-round-count
+  kind: executable
+  check: rust-tests
+- invariant: sole-model-tool
+  kind: executable
+  check: rust-tests
+- invariant: caller-owned-session-orchestration
+  kind: executable
+  check: rust-tests
+- invariant: observable-session-cwd
+  kind: executable
+  check: rust-tests
+- invariant: stable-resume-context
+  kind: executable
+  check: rust-tests
+- invariant: skills-are-message-expansions
+  kind: executable
+  check: rust-tests
+- invariant: provider-key-confidentiality
+  kind: executable
+  check: rust-tests
+- invariant: excluded-product-surfaces
+  kind: manual
+  reason: Absence of broad product surfaces cannot be established completely by portable behavioral tests.
+  evidence:
+  - Cargo.toml
+  - src/app.rs
+  - src/provider.rs
+  - README.md#project-purpose
+  revisit_when:
+  - A repository architecture check can enumerate network listeners and privileged product surfaces.
+invariants:
+- id: jsonl-record-framing
+  statement: Machine input messages and output events are LF-delimited JSON records.
+- id: successful-turn-events
+  statement: A successful turn exposes assistant deltas, normalized cmd calls and results, and an explicit turn completion event.
+- id: interruption-ordering
+  statement: An interrupted turn exposes all safe events emitted before cancellation and one interruption event without claiming normal completion.
+- id: command-before-provider-continuation
+  statement: A model cmd call is executed by the harness before the next provider turn.
+- id: unbounded-tool-round-count
+  statement: Model tool loops have no fixed provider-round limit and stop only on completion or an existing cancellation or resource boundary.
+- id: sole-model-tool
+  statement: cmd is the only model-facing tool.
+- id: caller-owned-session-orchestration
+  statement: Lucy never creates, links, resumes, or delivers internal subagent sessions; callers own named session IDs and process orchestration.
+- id: observable-session-cwd
+  statement: The session event exposes saved and effective working directories and whether cwd fallback occurred.
+- id: stable-resume-context
+  statement: A resumed session reconstructs the same immutable boot context and append-only conversation state as the original process.
+- id: skills-are-message-expansions
+  statement: A skill invocation is a user-message expansion, not a tool call or public protocol event.
+- id: provider-key-confidentiality
+  statement: The active provider key is absent from protocol events, TUI output, diagnostics, and persisted records, and unsafe key values are rejected before output.
+- id: excluded-product-surfaces
+  statement: Lucy does not add a network listener, authentication layer, approval UI, sandbox, internal delegation scheduler, or cross-session relationship metadata.
 ---
 
 # Local interactive and JSONL harness boundary
@@ -61,16 +111,16 @@ The goal is a thin, embeddable harness rather than a full coding-agent product. 
 ## Invariants
 
 - Machine input messages and output events are LF-delimited JSON records.
-- A successful turn exposes assistant deltas, normalized `cmd` calls/results, and an explicit turn completion event.
-- An interrupted turn exposes all safe events emitted before cancellation and one interruption event; it does not claim normal completion.
-- A model `cmd` call is executed by the harness before the next provider turn.
-- Model tool loops may continue for an arbitrary number of provider rounds until the model completes or an existing cancellation/resource boundary stops them.
-- `cmd` is the only model-facing tool; Lucy never creates, links, resumes, or delivers internal subagent sessions.
-- Named persistent sessions remain independently addressable through `--session <id>`; the caller owns session IDs and process orchestration.
-- The session event exposes saved and effective working directories and a fallback flag.
-- A new process resuming a session reconstructs the same immutable boot context and append-only conversation state as the original process.
+- A successful turn exposes assistant deltas, normalized cmd calls and results, and an explicit turn completion event.
+- An interrupted turn exposes all safe events emitted before cancellation and one interruption event without claiming normal completion.
+- A model cmd call is executed by the harness before the next provider turn.
+- Model tool loops have no fixed provider-round limit and stop only on completion or an existing cancellation or resource boundary.
+- cmd is the only model-facing tool.
+- Lucy never creates, links, resumes, or delivers internal subagent sessions; callers own named session IDs and process orchestration.
+- The session event exposes saved and effective working directories and whether cwd fallback occurred.
+- A resumed session reconstructs the same immutable boot context and append-only conversation state as the original process.
 - A skill invocation is a user-message expansion, not a tool call or public protocol event.
-- The active provider key is not emitted in protocol events, TUI output, or diagnostics; key values that cannot be safely represented are rejected before output.
+- The active provider key is absent from protocol events, TUI output, diagnostics, and persisted records, and unsafe key values are rejected before output.
 - Lucy does not add a network listener, authentication layer, approval UI, sandbox, internal delegation scheduler, or cross-session relationship metadata.
 
 ## Alternatives and trade-offs

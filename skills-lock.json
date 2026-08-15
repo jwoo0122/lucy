@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "architect": {
+      "source": "jwoo0122/skills",
+      "sourceType": "github",
+      "skillPath": "skills/architect/SKILL.md",
+      "computedHash": "01c769ce9c8470e7b1e0009c323289570bab09a2354332947eda60d3eda048f5"
+    },
+    "maintain-architecture-decisions": {
+      "source": "jwoo0122/skills",
+      "sourceType": "github",
+      "skillPath": "skills/maintain-architecture-decisions/SKILL.md",
+      "computedHash": "c382dd19dfadbfcb56dce59022719e336f32f56005e72ab618f9131f989fa85f"
+    }
+  }
+}

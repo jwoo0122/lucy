@@ -30,8 +30,11 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Test
+      - name: Install ADR checker dependencies
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Test and check ADR conformance
         env:
           # Keep tests isolated from runner-level XDG configuration.
           XDG_CONFIG_HOME: ""
-        run: cargo test --locked
+        run: scripts/adr check

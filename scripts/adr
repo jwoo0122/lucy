@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$repository_root/.agents/skills/maintain-architecture-decisions/scripts/adr" \
+  "$@" --root "$repository_root"

@@ -26,7 +26,3 @@ Manual invariants are not mechanically verified. Source-string presence alone is
 Use `index.yaml` to select relevant records. Prefer revising the record that owns an existing question. Keep one logical writer during a change to avoid conflicting edits; this is a concurrency rule, not tool ownership.
 
 A conforming implementation validates structure and relationships, generates the index deterministically, checks complete invariant coverage, executes each referenced check once from the repository root without a shell, and reports manual invariants honestly. Repositories should expose their chosen implementation through a stable repository-level command for agents and CI.
-
-## Repository command
-
-Run `scripts/adr validate` for structural validation, `scripts/adr reindex` after record edits, and `scripts/adr check` for the global conformance gate used by CI.

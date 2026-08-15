@@ -1,5 +1,5 @@
+schema: semantic-living-adr-index
 version: 1
-generated_by: maintain-architecture-decisions
 decisions:
   - id: harness.agent-boundary-and-protocol
     status: accepted
@@ -19,24 +19,51 @@ decisions:
     superseded_by: []
     last_reviewed: '2026-08-04'
     enforcement:
-      - id: cmd-only-tool-schema
-        path: src/provider/base.rs
-        must_contain:
-          - fn normal_requests_expose_only_cmd()
-          - '"name": "cmd"'
-        must_not_contain: []
-      - id: normalized-jsonl-tool-loop
-        path: tests/cli.rs
-        must_contain:
-          - fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure()
-        must_not_contain: []
-      - id: codex-cmd-tool-schema
-        path: src/codex_provider.rs
-        must_contain:
-          - fn codex_request_uses_responses_shape()
-          - '"background":{"type":"boolean","default":false}'
-        must_not_contain: []
-    enforcement_exception: null
+      - invariant: jsonl-record-framing
+        kind: executable
+        check: rust-tests
+      - invariant: successful-turn-events
+        kind: executable
+        check: rust-tests
+      - invariant: interruption-ordering
+        kind: executable
+        check: rust-tests
+      - invariant: command-before-provider-continuation
+        kind: executable
+        check: rust-tests
+      - invariant: unbounded-tool-round-count
+        kind: executable
+        check: rust-tests
+      - invariant: sole-model-tool
+        kind: executable
+        check: rust-tests
+      - invariant: caller-owned-session-orchestration
+        kind: executable
+        check: rust-tests
+      - invariant: observable-session-cwd
+        kind: executable
+        check: rust-tests
+      - invariant: stable-resume-context
+        kind: executable
+        check: rust-tests
+      - invariant: skills-are-message-expansions
+        kind: executable
+        check: rust-tests
+      - invariant: provider-key-confidentiality
+        kind: executable
+        check: rust-tests
+      - invariant: excluded-product-surfaces
+        kind: manual
+        reason: Absence of broad product surfaces cannot be established completely
+          by portable behavioral tests.
+        evidence:
+          - Cargo.toml
+          - src/app.rs
+          - src/provider.rs
+          - README.md#project-purpose
+        revisit_when:
+          - A repository architecture check can enumerate network listeners and privileged
+            product surfaces.
   - id: harness.command-execution
     status: accepted
     scope: harness
@@ -56,51 +83,61 @@ decisions:
     superseded_by: []
     last_reviewed: '2026-08-04'
     enforcement:
-      - id: background-command-contract
-        path: tests/cli.rs
-        must_contain:
-          - fn background_cmd_completion_starts_an_automatic_turn_after_turn_end()
-          - fn background_cmd_completion_is_delivered_before_the_active_turn_ends()
-        must_not_contain: []
-      - id: background-completion-privilege
-        path: src/app.rs
-        must_contain:
-          - ChatMessage::observation(content)
-          - fn background_completion_delimiter_cannot_be_forged_by_command_output()
-        must_not_contain:
-          - ChatMessage::system(content)
-      - id: observation-message-privilege
-        path: src/model.rs
-        must_contain:
-          - 'pub const OBSERVATION_ROLE: &str = "observation";'
-          - fn observation_keeps_its_session_role_but_uses_the_openai_user_role()
-        must_not_contain: []
-      - id: codex-observation-privilege
-        path: src/codex_provider.rs
-        must_contain:
-          - fn codex_request_maps_observations_to_unprivileged_user_input()
-        must_not_contain: []
-      - id: bounded-command-execution
-        path: src/command.rs
-        must_contain:
-          - 'pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);'
-          - 'pub const COMMAND_OUTPUT_CAP: usize = 64 * 1024;'
-        must_not_contain: []
-      - id: command-environment-credential-boundary
-        path: src/command.rs
-        must_contain:
-          - process.env_remove(api_key_env);
-          - fn preserves_normal_inherited_environment_variable()
-          - fn removes_active_provider_credential_from_foreground_command()
-          - fn removes_active_provider_credential_from_background_command()
-        must_not_contain: []
-      - id: command-environment-integration
-        path: tests/cli.rs
-        must_contain:
-          - fn cmd_removes_provider_key_and_preserves_ordinary_environment()
-        must_not_contain:
-          - fn cmd_inherits_provider_key_but_redacts_captured_output()
-    enforcement_exception: null
+      - invariant: verbatim-shell-command
+        kind: executable
+        check: rust-tests
+      - invariant: configured-shell-with-fallback
+        kind: executable
+        check: rust-tests
+      - invariant: credential-stripped-environment
+        kind: executable
+        check: rust-tests
+      - invariant: shell-startup-outside-credential-boundary
+        kind: manual
+        reason: User shell startup behavior is external to the repository and cannot
+          be deterministically verified here.
+        evidence:
+          - src/command.rs
+          - adr/records/harness/command-execution.md#context-and-forces
+        revisit_when:
+          - Lucy stops invoking a user-configured login shell or adds an isolated
+            execution boundary.
+      - invariant: redacted-captured-output
+        kind: executable
+        check: rust-tests
+      - invariant: stable-command-cwd
+        kind: executable
+        check: rust-tests
+      - invariant: bounded-result-semantics
+        kind: executable
+        check: rust-tests
+      - invariant: bounded-process-group-shutdown
+        kind: executable
+        check: rust-tests
+      - invariant: escaped-descendants-outside-containment
+        kind: executable
+        check: rust-tests
+      - invariant: foreground-result-persistence
+        kind: executable
+        check: rust-tests
+      - invariant: unprivileged-background-observation
+        kind: executable
+        check: rust-tests
+      - invariant: provider-observation-downgrade
+        kind: executable
+        check: rust-tests
+      - invariant: legacy-background-downgrade
+        kind: executable
+        check: rust-tests
+      - invariant: earliest-background-delivery
+        kind: executable
+        check: rust-tests
+      - invariant: process-scoped-background-lifetime
+        kind: executable
+        check: rust-tests
+      - invariant: jsonl-eof-waits-for-background
+        kind: executable
+        check: rust-tests
   - id: harness.configuration-and-provider
     status: accepted
     scope: harness
@@ -120,31 +157,57 @@ decisions:
     superseded_by: []
     last_reviewed: '2026-08-04'
     enforcement:
-      - id: config-bootstrap-and-migration
-        path: src/config.rs
-        must_contain:
-          - fn bootstraps_config_without_overwriting_existing_bytes()
-          - fn migrates_a_legacy_config_once_without_overwriting_xdg_config()
-          - fn generated_config_omits_system_prompt()
-          - fn legacy_system_prompt_is_ignored_without_rewriting_config_bytes()
-          - fn settings_updates_preserve_legacy_system_prompt()
-          - '#[serde(skip)]'
-          - fn auth_provider_rejects_mixed_credentials()
-        must_not_contain: []
-      - id: openrouter-session-identity-and-attribution
-        path: src/provider/base.rs
-        must_contain:
-          - fn openrouter_requests_include_session_and_app_metadata()
-          - fn compatible_requests_omit_provider_specific_session_metadata()
-          - 'const APP_URL: &str = "https://lucyna.run";'
-        must_not_contain: []
-      - id: codex-session-identity
-        path: src/codex_provider.rs
-        must_contain:
-          - fn codex_request_uses_responses_shape()
-          - request["prompt_cache_key"] = json!(session_id);
-        must_not_contain: []
-    enforcement_exception: null
+      - invariant: create-missing-config-once
+        kind: executable
+        check: rust-tests
+      - invariant: generated-config-excludes-prompt
+        kind: executable
+        check: rust-tests
+      - invariant: xdg-config-root-resolution
+        kind: executable
+        check: rust-tests
+      - invariant: non-destructive-legacy-config-migration
+        kind: executable
+        check: rust-tests
+      - invariant: existing-config-not-replaced
+        kind: executable
+        check: rust-tests
+      - invariant: legacy-prompt-is-inert
+        kind: executable
+        check: rust-tests
+      - invariant: serialized-api-key-confidentiality
+        kind: executable
+        check: rust-tests
+      - invariant: child-credential-boundary
+        kind: executable
+        check: rust-tests
+      - invariant: early-diagnostic-scrubbing
+        kind: executable
+        check: rust-tests
+      - invariant: unsafe-resume-rejected
+        kind: executable
+        check: rust-tests
+      - invariant: secret-safe-settings-audit
+        kind: executable
+        check: rust-tests
+      - invariant: config-authoritative-on-start
+        kind: executable
+        check: rust-tests
+      - invariant: idle-settings-and-safe-catalog-errors
+        kind: executable
+        check: rust-tests
+      - invariant: safe-config-errors
+        kind: executable
+        check: rust-tests
+      - invariant: immutable-boot-prompt-snapshot
+        kind: executable
+        check: rust-tests
+      - invariant: stable-provider-session-identity
+        kind: executable
+        check: rust-tests
+      - invariant: provider-specific-metadata-boundary
+        kind: executable
+        check: rust-tests
   - id: harness.session-and-context-lifecycle
     status: accepted
     scope: harness
@@ -165,18 +228,42 @@ decisions:
     superseded_by: []
     last_reviewed: '2026-07-29'
     enforcement:
-      - id: session-resume-and-context
-        path: src/session/base.rs
-        must_contain:
-          - fn creates_appends_resumes_and_lists_jsonl_session()
-          - fn resume_retains_historical_boot_system_prompt()
-          - fn list_uses_latest_user_and_assistant_messages_and_ignores_tools()
-          - fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()
-          - fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()
-        must_not_contain: []
-      - id: symlinked-skill-discovery
-        path: src/context.rs
-        must_contain:
-          - fn context_follows_symlinked_skill_directories_and_files()
-        must_not_contain: []
-    enforcement_exception: null
+      - invariant: complete-session-records
+        kind: executable
+        check: rust-tests
+      - invariant: append-only-compaction-records
+        kind: executable
+        check: rust-tests
+      - invariant: latest-compaction-boundary
+        kind: executable
+        check: rust-tests
+      - invariant: ordered-interruption-records
+        kind: executable
+        check: rust-tests
+      - invariant: safe-incomplete-tool-recovery
+        kind: executable
+        check: rust-tests
+      - invariant: new-session-boot-snapshot
+        kind: executable
+        check: rust-tests
+      - invariant: historical-prompt-on-resume
+        kind: executable
+        check: rust-tests
+      - invariant: metadata-only-skill-catalog
+        kind: executable
+        check: rust-tests
+      - invariant: bounded-symlinked-skill-discovery
+        kind: executable
+        check: rust-tests
+      - invariant: immutable-skill-snapshot
+        kind: executable
+        check: rust-tests
+      - invariant: no-session-relationships
+        kind: executable
+        check: rust-tests
+      - invariant: immutable-cwd-with-observable-fallback
+        kind: executable
+        check: rust-tests
+      - invariant: conversational-session-previews
+        kind: executable
+        check: rust-tests

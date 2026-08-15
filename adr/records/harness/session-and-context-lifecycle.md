@@ -4,33 +4,84 @@ status: accepted
 scope: harness
 decision_type: lifecycle
 applies_to:
-  - "src/**"
-  - "tests/**"
-  - "README.md"
+- src/**
+- tests/**
+- README.md
 summary: Lucy persists named JSONL sessions, previews their latest conversational messages, resumes their saved working directory when available, and preserves interruption, compaction, and boot-context state.
 constrains: []
 depends_on:
-  - harness.agent-boundary-and-protocol
-  - harness.configuration-and-provider
+- harness.agent-boundary-and-protocol
+- harness.configuration-and-provider
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-07-29"
+last_reviewed: '2026-07-29'
 enforcement:
-  - id: session-resume-and-context
-    path: src/session/base.rs
-    must_contain:
-      - "fn creates_appends_resumes_and_lists_jsonl_session()"
-      - "fn resume_retains_historical_boot_system_prompt()"
-      - "fn list_uses_latest_user_and_assistant_messages_and_ignores_tools()"
-      - "fn compaction_appends_a_boundary_and_reconstructs_only_retained_messages()"
-      - "fn interruption_records_are_valid_and_resume_in_file_order_without_provider_fragments()"
-    must_not_contain: []
-  - id: symlinked-skill-discovery
-    path: src/context.rs
-    must_contain:
-      - "fn context_follows_symlinked_skill_directories_and_files()"
-    must_not_contain: []
-enforcement_exception: null
+- invariant: complete-session-records
+  kind: executable
+  check: rust-tests
+- invariant: append-only-compaction-records
+  kind: executable
+  check: rust-tests
+- invariant: latest-compaction-boundary
+  kind: executable
+  check: rust-tests
+- invariant: ordered-interruption-records
+  kind: executable
+  check: rust-tests
+- invariant: safe-incomplete-tool-recovery
+  kind: executable
+  check: rust-tests
+- invariant: new-session-boot-snapshot
+  kind: executable
+  check: rust-tests
+- invariant: historical-prompt-on-resume
+  kind: executable
+  check: rust-tests
+- invariant: metadata-only-skill-catalog
+  kind: executable
+  check: rust-tests
+- invariant: bounded-symlinked-skill-discovery
+  kind: executable
+  check: rust-tests
+- invariant: immutable-skill-snapshot
+  kind: executable
+  check: rust-tests
+- invariant: no-session-relationships
+  kind: executable
+  check: rust-tests
+- invariant: immutable-cwd-with-observable-fallback
+  kind: executable
+  check: rust-tests
+- invariant: conversational-session-previews
+  kind: executable
+  check: rust-tests
+invariants:
+- id: complete-session-records
+  statement: Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
+- id: append-only-compaction-records
+  statement: Compaction records are valid, append-only, secret-safe, complete-turn records that identify the summary, retained boundary, and token estimate without deleting history.
+- id: latest-compaction-boundary
+  statement: Resume and provider-message reconstruction apply only the latest compaction boundary and do not resend compacted-away raw messages.
+- id: ordered-interruption-records
+  statement: Interruption records are valid, append-only, secret-safe, ordered with surrounding messages, identify user cancellation, and replay in the TUI.
+- id: safe-incomplete-tool-recovery
+  statement: Incomplete tool-call fragments are never executed or sent to providers, and reconstructed cmd results close only a previously declared matching tool call.
+- id: new-session-boot-snapshot
+  statement: A new session records the current built-in composed prompt as boot_system_prompt.
+- id: historical-prompt-on-resume
+  statement: A resumed session sends its recorded boot_system_prompt even when the current binary would compose a different prompt.
+- id: metadata-only-skill-catalog
+  statement: A skill catalog entry does not claim to contain full skill instructions.
+- id: bounded-symlinked-skill-discovery
+  statement: Skill symlinks are followed only for expected target types, and cycles or duplicate resolved directories are not traversed repeatedly.
+- id: immutable-skill-snapshot
+  statement: Skill contents captured during discovery are persisted and used by explicit invocation, including when discovered through symlinks.
+- id: no-session-relationships
+  statement: Lucy does not infer or persist relationships between sessions.
+- id: immutable-cwd-with-observable-fallback
+  statement: The session header cwd remains immutable, while an unavailable saved cwd falls back for the invocation and is reported to interactive and machine clients.
+- id: conversational-session-previews
+  statement: Session-list previews use the latest user and assistant messages rather than trailing tool records.
 ---
 
 # Session and boot context lifecycle
@@ -63,19 +114,19 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 
 ## Invariants
 
-- Session records include the boot snapshot and all valid user, assistant, tool-call, and tool-result messages needed to reconstruct the active conversation.
-- Compaction records are valid JSONL, append-only, secret-safe, ordered at a complete turn boundary, and identify the summary, retained-message boundary, and token estimate. Historical messages remain available for replay even when they are omitted from the next provider context.
-- Resume and `provider_messages()` apply only the latest compaction boundary on the active session path; they do not send compacted-away raw messages in addition to the summary.
-- Interruption records are valid JSONL, append-only, secret-safe, ordered with surrounding messages, and explicitly identify user cancellation; they are replayed by the TUI.
-- Incomplete provider tool-call fragments are retained only as safe interruption observations and are never executed or included in provider message history; safe `cmd` result observations may only close a previously declared matching tool call.
-- A new session records the current built-in composed prompt as `boot_system_prompt`.
-- A resumed session sends its recorded historical `boot_system_prompt`, even when the current binary would compose a different prompt for a new session.
-- A skill catalog entry never claims to contain the full skill instructions.
-- Symlinked skill roots, directories, and files are followed only when their targets have the expected directory or regular-file type; directory cycles and duplicate resolved directories are not traversed repeatedly.
-- Skill contents captured during discovery, including through a symlink, are persisted in the session snapshot and used by explicit invocation.
+- Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
+- Compaction records are valid, append-only, secret-safe, complete-turn records that identify the summary, retained boundary, and token estimate without deleting history.
+- Resume and provider-message reconstruction apply only the latest compaction boundary and do not resend compacted-away raw messages.
+- Interruption records are valid, append-only, secret-safe, ordered with surrounding messages, identify user cancellation, and replay in the TUI.
+- Incomplete tool-call fragments are never executed or sent to providers, and reconstructed cmd results close only a previously declared matching tool call.
+- A new session records the current built-in composed prompt as boot_system_prompt.
+- A resumed session sends its recorded boot_system_prompt even when the current binary would compose a different prompt.
+- A skill catalog entry does not claim to contain full skill instructions.
+- Skill symlinks are followed only for expected target types, and cycles or duplicate resolved directories are not traversed repeatedly.
+- Skill contents captured during discovery are persisted and used by explicit invocation, including when discovered through symlinks.
 - Lucy does not infer or persist relationships between sessions.
-- The session header cwd remains immutable; an unavailable saved cwd falls back only for the current invocation and is reported to both interactive and machine clients.
-- Session-list previews use the latest user and latest assistant messages, not whichever persisted message happens to be last.
+- The session header cwd remains immutable, while an unavailable saved cwd falls back for the invocation and is reported to interactive and machine clients.
+- Session-list previews use the latest user and assistant messages rather than trailing tool records.
 
 ## Alternatives and trade-offs
 

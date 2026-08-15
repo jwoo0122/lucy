@@ -4,63 +4,104 @@ status: accepted
 scope: harness
 decision_type: execution
 applies_to:
-  - "src/**"
-  - "tests/**"
-  - "README.md"
+- src/**
+- tests/**
+- README.md
 summary: Lucy executes trusted shell commands locally with bounded time and output, including process-scoped background execution.
 constrains: []
 depends_on:
-  - harness.agent-boundary-and-protocol
-  - harness.session-and-context-lifecycle
+- harness.agent-boundary-and-protocol
+- harness.session-and-context-lifecycle
 supersedes: []
 superseded_by: []
-last_reviewed: "2026-08-04"
+last_reviewed: '2026-08-04'
 enforcement:
-  - id: background-command-contract
-    path: tests/cli.rs
-    must_contain:
-      - "fn background_cmd_completion_starts_an_automatic_turn_after_turn_end()"
-      - "fn background_cmd_completion_is_delivered_before_the_active_turn_ends()"
-    must_not_contain: []
-  - id: background-completion-privilege
-    path: src/app.rs
-    must_contain:
-      - "ChatMessage::observation(content)"
-      - "fn background_completion_delimiter_cannot_be_forged_by_command_output()"
-    must_not_contain:
-      - "ChatMessage::system(content)"
-  - id: observation-message-privilege
-    path: src/model.rs
-    must_contain:
-      - 'pub const OBSERVATION_ROLE: &str = "observation";'
-      - "fn observation_keeps_its_session_role_but_uses_the_openai_user_role()"
-    must_not_contain: []
-  - id: codex-observation-privilege
-    path: src/codex_provider.rs
-    must_contain:
-      - "fn codex_request_maps_observations_to_unprivileged_user_input()"
-    must_not_contain: []
-  - id: bounded-command-execution
-    path: src/command.rs
-    must_contain:
-      - "pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);"
-      - "pub const COMMAND_OUTPUT_CAP: usize = 64 * 1024;"
-    must_not_contain: []
-  - id: command-environment-credential-boundary
-    path: src/command.rs
-    must_contain:
-      - "process.env_remove(api_key_env);"
-      - "fn preserves_normal_inherited_environment_variable()"
-      - "fn removes_active_provider_credential_from_foreground_command()"
-      - "fn removes_active_provider_credential_from_background_command()"
-    must_not_contain: []
-  - id: command-environment-integration
-    path: tests/cli.rs
-    must_contain:
-      - "fn cmd_removes_provider_key_and_preserves_ordinary_environment()"
-    must_not_contain:
-      - "fn cmd_inherits_provider_key_but_redacts_captured_output()"
-enforcement_exception: null
+- invariant: verbatim-shell-command
+  kind: executable
+  check: rust-tests
+- invariant: configured-shell-with-fallback
+  kind: executable
+  check: rust-tests
+- invariant: credential-stripped-environment
+  kind: executable
+  check: rust-tests
+- invariant: shell-startup-outside-credential-boundary
+  kind: manual
+  reason: User shell startup behavior is external to the repository and cannot be deterministically verified here.
+  evidence:
+  - src/command.rs
+  - adr/records/harness/command-execution.md#context-and-forces
+  revisit_when:
+  - Lucy stops invoking a user-configured login shell or adds an isolated execution boundary.
+- invariant: redacted-captured-output
+  kind: executable
+  check: rust-tests
+- invariant: stable-command-cwd
+  kind: executable
+  check: rust-tests
+- invariant: bounded-result-semantics
+  kind: executable
+  check: rust-tests
+- invariant: bounded-process-group-shutdown
+  kind: executable
+  check: rust-tests
+- invariant: escaped-descendants-outside-containment
+  kind: executable
+  check: rust-tests
+- invariant: foreground-result-persistence
+  kind: executable
+  check: rust-tests
+- invariant: unprivileged-background-observation
+  kind: executable
+  check: rust-tests
+- invariant: provider-observation-downgrade
+  kind: executable
+  check: rust-tests
+- invariant: legacy-background-downgrade
+  kind: executable
+  check: rust-tests
+- invariant: earliest-background-delivery
+  kind: executable
+  check: rust-tests
+- invariant: process-scoped-background-lifetime
+  kind: executable
+  check: rust-tests
+- invariant: jsonl-eof-waits-for-background
+  kind: executable
+  check: rust-tests
+invariants:
+- id: verbatim-shell-command
+  statement: Lucy passes the shell command string without Lucy-side rewriting.
+- id: configured-shell-with-fallback
+  statement: Lucy uses SHELL when set and falls back to /bin/sh when SHELL is empty or unset.
+- id: credential-stripped-environment
+  statement: The configured provider API-key variable is removed from command children while the rest of the inherited environment is preserved.
+- id: shell-startup-outside-credential-boundary
+  statement: Lucy does not parse or sanitize shell startup behavior, which may independently reintroduce or retrieve credentials.
+- id: redacted-captured-output
+  statement: Captured command output is redacted before protocol or session serialization.
+- id: stable-command-cwd
+  statement: Command invocations retain the session cwd and shell-local cd does not mutate it.
+- id: bounded-result-semantics
+  statement: Timeout and output truncation produce a normalized tool result that the model can handle.
+- id: bounded-process-group-shutdown
+  statement: After timeout or cancellation, Lucy terminates the shell process group and stops waiting for capture after a bounded grace period.
+- id: escaped-descendants-outside-containment
+  statement: Descendants that escape the process group or session are outside the v1 containment boundary, and incomplete capture is marked truncated.
+- id: foreground-result-persistence
+  statement: Foreground command output and exit status are persisted as part of the originating conversation turn.
+- id: unprivileged-background-observation
+  statement: Background completion is persisted as a non-forgeable low-privilege observation and never as system or instruction context.
+- id: provider-observation-downgrade
+  statement: Each provider adapter maps observations to its lowest available user-input privilege.
+- id: legacy-background-downgrade
+  statement: Legacy background-completion system messages are downgraded during provider-message reconstruction without rewriting session files.
+- id: earliest-background-delivery
+  statement: A completed background command is delivered at the earliest provider-response boundary and starts an automatic turn if its originating turn already ended.
+- id: process-scoped-background-lifetime
+  statement: Background commands survive user-turn cancellation, stop when Lucy exits, and are not reconstructed on session resume.
+- id: jsonl-eof-waits-for-background
+  statement: JSONL one-shot mode remains alive after input EOF while registered background commands are running.
 ---
 
 # Trusted local command execution
@@ -81,22 +122,22 @@ The model is explicitly trusted and the harness is local-only, so v1 does not ad
 
 ## Invariants
 
-- The shell command string is passed without Lucy-side rewriting.
-- The shell executable is inherited from `SHELL` when set, with `/bin/sh` as the empty/unset fallback.
-- The configured provider API-key variable is removed from the command child environment before spawn; the rest of the inherited environment is preserved.
-- Shell startup files may independently reintroduce or retrieve credentials; Lucy does not parse or sanitize shell startup behavior.
+- Lucy passes the shell command string without Lucy-side rewriting.
+- Lucy uses SHELL when set and falls back to /bin/sh when SHELL is empty or unset.
+- The configured provider API-key variable is removed from command children while the rest of the inherited environment is preserved.
+- Lucy does not parse or sanitize shell startup behavior, which may independently reintroduce or retrieve credentials.
 - Captured command output is redacted before protocol or session serialization.
-- The command cwd is stable across invocations; shell-local `cd` does not mutate the session cwd.
-- Timeout and output truncation produce a tool result that the model can handle.
-- After timeout or cancellation, Lucy terminates the shell's process group and stops waiting for capture after a bounded grace period.
-- Descendants that deliberately escape the process group/session are outside the v1 containment boundary and may continue; any incomplete capture is marked truncated.
+- Command invocations retain the session cwd and shell-local cd does not mutate it.
+- Timeout and output truncation produce a normalized tool result that the model can handle.
+- After timeout or cancellation, Lucy terminates the shell process group and stops waiting for capture after a bounded grace period.
+- Descendants that escape the process group or session are outside the v1 containment boundary, and incomplete capture is marked truncated.
 - Foreground command output and exit status are persisted as part of the originating conversation turn.
-- Background completion is persisted as a Lucy-owned low-privilege observation message containing the background ID and normalized command result; it is never persisted or sent as system/instruction context, and its payload is framed as untrusted data inside a per-message randomly nonced delimiter that captured output cannot forge.
-- Each provider adapter maps an observation to the lowest available input privilege: the OpenAI-compatible adapter sends it as a `user` message and the Codex adapter sends it as a `user` input item, never as part of `instructions`.
-- Legacy sessions that recorded a background completion as a system message are downgraded to an observation when provider messages are reconstructed, without rewriting the session file.
-- A completed background command is delivered at the earliest provider-response boundary. If the originating user turn already ended, Lucy starts an automatic turn without waiting for another user message.
-- Active background commands are process-scoped: they continue across user-turn cancellation, are canceled when Lucy exits, and are not reconstructed when a session is resumed.
-- JSONL one-shot mode remains alive after input EOF while registered background commands are running so their completion can be delivered.
+- Background completion is persisted as a non-forgeable low-privilege observation and never as system or instruction context.
+- Each provider adapter maps observations to its lowest available user-input privilege.
+- Legacy background-completion system messages are downgraded during provider-message reconstruction without rewriting session files.
+- A completed background command is delivered at the earliest provider-response boundary and starts an automatic turn if its originating turn already ended.
+- Background commands survive user-turn cancellation, stop when Lucy exits, and are not reconstructed on session resume.
+- JSONL one-shot mode remains alive after input EOF while registered background commands are running.
 
 ## Alternatives and trade-offs
 
