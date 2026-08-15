@@ -43,7 +43,7 @@ impl AttentionLease {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
                 return Err("unable to acquire attention lock".to_owned());
             }
-            return Ok(Self { file });
+            Ok(Self { file })
         }
 
         #[cfg(not(unix))]
