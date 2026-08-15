@@ -4,6 +4,7 @@ use crate::journal::JournalEvent;
 use crate::model::ChatMessage;
 
 pub const MESSAGE_EVENT_KIND: &str = "message";
+pub const ATTENTION_RESET_KIND: &str = "attention_reset";
 
 /// Encode an exact provider/chat message as a factual journal event. Routing
 /// and causal provenance stay in JournalEvent's top-level fields rather than
@@ -14,17 +15,17 @@ pub fn message_event(message: ChatMessage) -> Result<JournalEvent, String> {
     JournalEvent::new(MESSAGE_EVENT_KIND, payload)
 }
 
-/// Add factual transport provenance to a message event. `source_id` is a
-/// routing key, not a memory namespace: callers may still recall any journal
-/// event regardless of source.
-pub fn source_message_event(
+/// Add factual transport provenance to a message event. `surface` and
+/// `source_id` describe where the event entered or should be routed; they do
+/// not select a separate memory or attention cursor.
+pub fn routed_message_event(
     message: ChatMessage,
     surface: &str,
     source_id: &str,
     parent_id: Option<&str>,
 ) -> Result<JournalEvent, String> {
     if surface.trim().is_empty() || source_id.trim().is_empty() {
-        return Err("attention source must not be empty".to_owned());
+        return Err("message routing provenance must not be empty".to_owned());
     }
     let mut event = message_event(message)?;
     event.surface = Some(surface.to_owned());
@@ -33,17 +34,29 @@ pub fn source_message_event(
     Ok(event)
 }
 
-/// Derive the durable attention head for one factual transport source from the
-/// journal itself. No second cursor store is required: the most recently
-/// committed event carrying the same `(surface, source_id)` is the source head.
-pub fn latest_source_head<'a>(
-    events: &'a [JournalEvent],
-    surface: &str,
-    source_id: &str,
-) -> Option<&'a JournalEvent> {
-    events.iter().rev().find(|event| {
-        event.surface.as_deref() == Some(surface) && event.source_id.as_deref() == Some(source_id)
-    })
+/// Build a global attention reset while preserving the transport that issued
+/// it as factual provenance. A reset is one new root in Lucy's single history,
+/// not a source-local session boundary.
+pub fn attention_reset_event(surface: &str, source_id: &str) -> Result<JournalEvent, String> {
+    if surface.trim().is_empty() || source_id.trim().is_empty() {
+        return Err("attention reset routing provenance must not be empty".to_owned());
+    }
+    let mut event = JournalEvent::new(ATTENTION_RESET_KIND, serde_json::json!({}))?;
+    event.surface = Some(surface.to_owned());
+    event.source_id = Some(source_id.to_owned());
+    event.parent_id = None;
+    Ok(event)
+}
+
+fn advances_attention(event: &JournalEvent) -> bool {
+    matches!(event.kind.as_str(), MESSAGE_EVENT_KIND | ATTENTION_RESET_KIND)
+}
+
+/// Derive Lucy's one durable attention head from the canonical journal. The
+/// latest committed message or explicit reset owns current attention regardless
+/// of which transport produced it. Provenance-only events do not move the head.
+pub fn latest_attention_head(events: &[JournalEvent]) -> Option<&JournalEvent> {
+    events.iter().rev().find(|event| advances_attention(event))
 }
 
 /// Follow one explicit causal head backwards through parent_id links, then
@@ -107,26 +120,26 @@ mod tests {
         event
     }
 
-    fn sourced_message(
+    fn routed_message(
         id: &str,
         surface: &str,
         source_id: &str,
         parent_id: Option<&str>,
         text: &str,
     ) -> JournalEvent {
-        let mut event = source_message_event(
+        let mut event = routed_message_event(
             ChatMessage::user(text.to_owned()),
             surface,
             source_id,
             parent_id,
         )
-        .expect("source message");
+        .expect("routed message");
         event.id = id.to_owned();
         event
     }
 
     #[test]
-    fn interleaved_global_history_does_not_mix_causal_attention() {
+    fn explicit_causal_branches_remain_isolated_when_selected_directly() {
         let a1 = linked_message("a1", None, "A one");
         let b1 = linked_message("b1", None, "B one");
         let a2 = linked_message("a2", Some("a1"), "A two");
@@ -151,31 +164,53 @@ mod tests {
     }
 
     #[test]
-    fn source_heads_are_derived_independently_from_interleaved_journal_order() {
-        let a1 = sourced_message("a1", "telegram", "100", None, "A one");
-        let b1 = sourced_message("b1", "telegram", "200", None, "B one");
-        let a2 = sourced_message("a2", "telegram", "100", Some("a1"), "A two");
-        let b2 = sourced_message("b2", "telegram", "200", Some("b1"), "B two");
-        let events = vec![a1, b1, a2, b2];
+    fn transport_switches_share_one_attention_head() {
+        let tui = routed_message("m1", "tui", "main", None, "one");
+        let telegram = routed_message("m2", "telegram", "100", Some("m1"), "two");
+        let tui_again = routed_message("m3", "tui", "main", Some("m2"), "three");
+        let events = vec![tui, telegram, tui_again];
 
+        let head = latest_attention_head(&events).expect("global head");
+        assert_eq!(head.id, "m3");
         assert_eq!(
-            latest_source_head(&events, "telegram", "100").map(|event| event.id.as_str()),
-            Some("a2")
-        );
-        assert_eq!(
-            latest_source_head(&events, "telegram", "200").map(|event| event.id.as_str()),
-            Some("b2")
+            causal_messages(&events, &head.id)
+                .expect("messages")
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three"]
         );
     }
 
     #[test]
-    fn new_root_resets_source_attention_without_deleting_old_branch() {
-        let old1 = sourced_message("old1", "tui", "main", None, "old one");
-        let old2 = sourced_message("old2", "tui", "main", Some("old1"), "old two");
-        let fresh = sourced_message("fresh", "tui", "main", None, "fresh root");
-        let events = vec![old1, old2, fresh];
+    fn routing_metadata_never_partitions_attention() {
+        let first = routed_message("m1", "telegram", "100", None, "first");
+        let second = routed_message("m2", "telegram", "200", Some("m1"), "second");
+        let events = vec![first, second];
 
-        let head = latest_source_head(&events, "tui", "main").expect("head");
+        let head = latest_attention_head(&events).expect("head");
+        assert_eq!(head.id, "m2");
+        assert_eq!(head.source_id.as_deref(), Some("200"));
+        assert_eq!(
+            causal_messages(&events, &head.id)
+                .expect("messages")
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn reset_is_global_even_when_issued_from_one_transport() {
+        let old1 = routed_message("old1", "tui", "main", None, "old one");
+        let old2 = routed_message("old2", "telegram", "100", Some("old1"), "old two");
+        let mut reset = attention_reset_event("tui", "main").expect("reset");
+        reset.id = "reset".to_owned();
+        let fresh = routed_message("fresh", "telegram", "100", Some("reset"), "fresh root");
+        let events = vec![old1, old2, reset, fresh];
+
+        let head = latest_attention_head(&events).expect("head");
         assert_eq!(head.id, "fresh");
         assert_eq!(
             causal_messages(&events, &head.id)
@@ -192,6 +227,22 @@ mod tests {
                 .filter_map(|message| message.content.as_deref())
                 .collect::<Vec<_>>(),
             vec!["old one", "old two"]
+        );
+    }
+
+    #[test]
+    fn provenance_only_events_do_not_steal_attention() {
+        let message = routed_message("m1", "tui", "main", None, "hello");
+        let mut delivery =
+            JournalEvent::new("transport_delivery", serde_json::json!({"update_id": 42}))
+                .expect("delivery");
+        delivery.id = "delivery".to_owned();
+        delivery.parent_id = Some("m1".to_owned());
+        let events = vec![message, delivery];
+
+        assert_eq!(
+            latest_attention_head(&events).map(|event| event.id.as_str()),
+            Some("m1")
         );
     }
 
