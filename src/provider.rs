@@ -129,7 +129,10 @@ impl Provider {
         self.projection_context_window.is_some()
     }
 
-    fn projected_messages(&self, messages: &[ChatMessage]) -> Result<Vec<ChatMessage>, ProviderError> {
+    pub(crate) fn project_messages(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<ChatMessage>, ProviderError> {
         let Some(context_window) = self.projection_context_window else {
             return Ok(messages.to_vec());
         };
@@ -143,7 +146,7 @@ impl Provider {
         messages: &[ChatMessage],
         on_delta: &mut dyn FnMut(&str) -> io::Result<()>,
     ) -> Result<ProviderTurn, ProviderError> {
-        let messages = self.projected_messages(messages)?;
+        let messages = self.project_messages(messages)?;
         self.inner.stream_chat(&messages, on_delta)
     }
 
@@ -154,7 +157,7 @@ impl Provider {
         cancellation: &CancellationToken,
         include_tools: bool,
     ) -> Result<ProviderTurn, ProviderError> {
-        let messages = self.projected_messages(messages)?;
+        let messages = self.project_messages(messages)?;
         self.inner.stream_chat_cancellable_with_options_and_events(
             &messages,
             on_event,
