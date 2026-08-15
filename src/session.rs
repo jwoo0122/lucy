@@ -203,6 +203,26 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn append_steering_message(
+        &mut self,
+        message: ChatMessage,
+    ) -> Result<(), SessionError> {
+        if message.role != "user" {
+            return Err(SessionError::new("steering input must be a user message"));
+        }
+        let Some(turn) = self
+            .latest_turn()
+            .map_err(SessionError::new)?
+            .filter(|turn| turn.status == TurnStatus::Active)
+        else {
+            return Err(SessionError::new("session has no active turn to steer"));
+        };
+        let _ = turn;
+        self.inner
+            .append_message(message)
+            .map_err(SessionError::from)
+    }
+
     pub fn append_interruption(
         &mut self,
         interruption: InterruptionRecord,
@@ -330,6 +350,39 @@ mod wrapper_tests {
             session.latest_turn().expect("state").expect("turn").status,
             TurnStatus::Active
         );
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn steering_message_appends_to_an_active_turn_without_starting_another() {
+        let (home, mut session) = session();
+        session
+            .append_message(ChatMessage::user("original".to_owned()))
+            .expect("original");
+        let turn_id = session.latest_turn().expect("state").expect("turn").turn_id;
+
+        session
+            .append_steering_message(ChatMessage::user("steer".to_owned()))
+            .expect("steering");
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[1].content.as_deref(), Some("steer"));
+        let turn = session.latest_turn().expect("state").expect("turn");
+        assert_eq!(turn.turn_id, turn_id);
+        assert_eq!(turn.status, TurnStatus::Active);
+        fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    #[test]
+    fn steering_message_requires_an_active_turn() {
+        let (home, mut session) = session();
+
+        let error = session
+            .append_steering_message(ChatMessage::user("too soon".to_owned()))
+            .expect_err("inactive steering");
+
+        assert_eq!(error.to_string(), "session has no active turn to steer");
+        assert!(session.messages.is_empty());
         fs::remove_dir_all(home).expect("cleanup");
     }
 

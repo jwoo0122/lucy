@@ -280,3 +280,6 @@ decisions:
       - invariant: conversational-session-previews
         kind: executable
         check: rust-tests
+      - invariant: active-turn-steering-order
+        kind: executable
+        check: rust-tests
