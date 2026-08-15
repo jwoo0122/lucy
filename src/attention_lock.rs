@@ -24,7 +24,8 @@ impl AttentionLease {
     pub(crate) fn acquire(home: &Path) -> Result<Self, String> {
         let root = state_root_for_home(home);
         ensure_not_symlink(&root).map_err(|_| "attention state root is unsafe".to_owned())?;
-        ensure_private_dir(&root).map_err(|_| "unable to secure attention state root".to_owned())?;
+        ensure_private_dir(&root)
+            .map_err(|_| "unable to secure attention state root".to_owned())?;
         let path = root.join(ATTENTION_LOCK_FILE);
         ensure_not_symlink(&path).map_err(|_| "attention lock is unsafe".to_owned())?;
 
@@ -37,7 +38,8 @@ impl AttentionLease {
             let file = options
                 .open(&path)
                 .map_err(|_| "unable to open attention lock".to_owned())?;
-            ensure_private_file(&path).map_err(|_| "unable to protect attention lock".to_owned())?;
+            ensure_private_file(&path)
+                .map_err(|_| "unable to protect attention lock".to_owned())?;
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
                 return Err("unable to acquire attention lock".to_owned());
             }
