@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::cancellation::CancellationToken;
@@ -27,12 +27,20 @@ struct CliOptions {
     tui: bool,
     version: bool,
     command: Option<CliCommand>,
+    exec: Option<ExecOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecOptions {
+    output: ExecOutput,
+    prompt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliCommand {
     CodexLogin,
     CodexLogout,
+    Skill,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,11 +54,28 @@ const USER_CANCEL_REASON: &str = "user_cancelled";
 const PROVIDER_PHASE: &str = "provider_stream";
 const COMMAND_PHASE: &str = "cmd";
 const COMPACTION_KEEP_RECENT_TOKENS: usize = 20_000;
+const EXTERNAL_HARNESS_SKILL: &[u8] = include_bytes!("../skills/lucy/SKILL.md");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendMode {
     Jsonl,
     Tui,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecOutput {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecResult<'a> {
+    status: &'static str,
+    session_id: &'a str,
+    cwd: String,
+    saved_cwd: String,
+    cwd_fallback: bool,
+    text: &'a str,
 }
 
 pub fn run_cli<R, W, E>(args: &[String], input: R, output: W, diagnostics: E) -> i32
@@ -77,6 +102,10 @@ where
             return 1;
         }
         return 0;
+    }
+    if matches!(options.command, Some(CliCommand::Skill)) {
+        let mut diagnostics = diagnostics;
+        return write_external_harness_skill(output, &mut diagnostics);
     }
 
     let home = match home_directory() {
@@ -160,7 +189,13 @@ where
         return 0;
     }
     if let Some(command) = options.command {
-        return run_codex_command(command, home, output, &mut diagnostics);
+        return match command {
+            CliCommand::Skill => write_external_harness_skill(output, &mut diagnostics),
+            command => run_codex_command(command, home, output, &mut diagnostics),
+        };
+    }
+    if let Some(exec) = options.exec.as_ref() {
+        return run_exec(&options, exec, input, output, &mut diagnostics, home, cwd);
     }
     let mode = match resolve_mode(args, stdin_is_tty, stdout_is_tty) {
         Ok(mode) => mode,
@@ -439,6 +474,227 @@ where
         }
     }
     0
+}
+
+fn run_exec<R, W, E>(
+    options: &CliOptions,
+    exec: &ExecOptions,
+    mut input: R,
+    mut output: W,
+    diagnostics: &mut E,
+    home: &Path,
+    cwd: &Path,
+) -> i32
+where
+    R: BufRead,
+    W: Write,
+    E: Write,
+{
+    let prompt = if exec.prompt == "-" {
+        let mut prompt = String::new();
+        if let Err(error) = input.read_to_string(&mut prompt) {
+            write_diagnostic(diagnostics, &format!("unable to read stdin: {error}"));
+            return 1;
+        }
+        prompt
+    } else {
+        exec.prompt.clone()
+    };
+
+    let (session, provider) = if let Some(id) = options.session.as_deref() {
+        let Some(pair) = resume_session(home, id, FrontendMode::Jsonl, diagnostics) else {
+            return 1;
+        };
+        pair
+    } else {
+        let Some(pair) = create_exec_session(home, cwd, diagnostics) else {
+            return 1;
+        };
+        pair
+    };
+
+    let mut harness = Harness {
+        provider: provider.with_session_id(&session.id),
+        home: home.to_path_buf(),
+        session,
+        context_window: None,
+        attached_agents: Vec::new(),
+        background_commands: crate::command::BackgroundCommands::default(),
+    };
+    let message_boundary = harness.session.messages.len();
+    let mut sink = ExecSink::default();
+    if let Err(error) = harness.handle_message(&prompt, &mut sink, None) {
+        write_diagnostic_safe(
+            diagnostics,
+            &error,
+            Some(harness.provider.api_key().as_str()),
+        );
+        return 1;
+    }
+    loop {
+        if harness.has_completed_background_commands() {
+            if let Err(error) = harness.handle_background_completions(&mut sink, None) {
+                write_diagnostic_safe(
+                    diagnostics,
+                    &error,
+                    Some(harness.provider.api_key().as_str()),
+                );
+                return 1;
+            }
+            continue;
+        }
+        if harness.has_active_background_commands() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            continue;
+        }
+        break;
+    }
+    if sink.interrupted {
+        write_diagnostic(diagnostics, "turn interrupted");
+        return 1;
+    }
+    let Some(message) = harness.session.messages[message_boundary..]
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.tool_calls.is_empty())
+    else {
+        write_diagnostic(diagnostics, "turn completed without an assistant message");
+        return 1;
+    };
+    let text = message.content.as_deref().unwrap_or_default();
+    let write_result = match exec.output {
+        ExecOutput::Text => writeln!(output, "{text}"),
+        ExecOutput::Json => serde_json::to_writer(
+            &mut output,
+            &ExecResult {
+                status: "completed",
+                session_id: &harness.session.id,
+                cwd: harness.session.cwd.display().to_string(),
+                saved_cwd: harness.session.saved_cwd.display().to_string(),
+                cwd_fallback: harness.session.cwd_fallback,
+                text,
+            },
+        )
+        .map_err(io::Error::other)
+        .and_then(|()| output.write_all(b"\n")),
+    };
+    if let Err(error) = write_result {
+        write_diagnostic_safe(
+            diagnostics,
+            &format!("unable to write exec output: {error}"),
+            Some(harness.provider.api_key().as_str()),
+        );
+        return 1;
+    }
+    0
+}
+
+fn create_exec_session<E: Write>(
+    home: &Path,
+    cwd: &Path,
+    diagnostics: &mut E,
+) -> Option<(Session, Provider)> {
+    let config = match Config::load_or_create(home) {
+        Ok(config) => config,
+        Err(error) => {
+            write_diagnostic(diagnostics, &error.to_string());
+            return None;
+        }
+    };
+    let auth = match config.resolved_auth() {
+        Ok(auth) => auth,
+        Err(error) => {
+            write_diagnostic(diagnostics, &error.to_string());
+            return None;
+        }
+    };
+    let configured_secret = configured_api_key(&config);
+    let api_key_env = auth.api_key_env.clone();
+    let mut llm = match config.resolved_llm() {
+        Ok(llm) => llm,
+        Err(error) => {
+            write_diagnostic_safe(
+                diagnostics,
+                &error.to_string(),
+                configured_secret.as_deref(),
+            );
+            return None;
+        }
+    };
+    apply_auth_to_settings(&mut llm, auth.provider);
+    let provider = match provider_for_settings(home, &llm) {
+        Ok(provider) => provider,
+        Err(error) => {
+            write_diagnostic_safe(
+                diagnostics,
+                &error.to_string(),
+                configured_secret.as_deref(),
+            );
+            return None;
+        }
+    };
+    let safe_cwd = match std::fs::canonicalize(cwd) {
+        Ok(cwd) if !cwd.display().to_string().contains(&provider.api_key()) => cwd,
+        Ok(_) => {
+            write_diagnostic_safe(
+                diagnostics,
+                "session header rejected",
+                Some(&provider.api_key()),
+            );
+            return None;
+        }
+        Err(_) => {
+            write_diagnostic_safe(
+                diagnostics,
+                "unable to resolve session cwd",
+                Some(&provider.api_key()),
+            );
+            return None;
+        }
+    };
+    let context =
+        match resolve_boot_context_with_api_key_env(home, &safe_cwd, api_key_env.as_deref()) {
+            Ok(context) => context,
+            Err(error) => {
+                write_diagnostic_safe(
+                    diagnostics,
+                    &error.to_string(),
+                    configured_secret.as_deref(),
+                );
+                return None;
+            }
+        };
+    let boot_system_prompt = redact_secret(&context.system_prompt, Some(&provider.api_key()));
+    let skills = redact_skills(context.skills, &provider.api_key());
+    let session = match Session::create_with_skills_and_secret(
+        home,
+        &safe_cwd,
+        boot_system_prompt,
+        llm,
+        skills,
+        Some(&provider.api_key()),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            write_diagnostic_safe(diagnostics, &error.to_string(), Some(&provider.api_key()));
+            return None;
+        }
+    };
+    Some((session, provider))
+}
+
+#[derive(Default)]
+struct ExecSink {
+    interrupted: bool,
+}
+
+impl EventSink for ExecSink {
+    fn emit_event(&mut self, event: &ProtocolEvent) -> io::Result<()> {
+        if matches!(event, ProtocolEvent::TurnInterrupted { .. }) {
+            self.interrupted = true;
+        }
+        Ok(())
+    }
 }
 
 pub fn resolve_mode(
@@ -1332,6 +1588,7 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
         tui: false,
         version: false,
         command: None,
+        exec: None,
     };
     if args.len() == 2 && args[0] == "codex" {
         options.command = Some(match args[1].as_str() {
@@ -1344,6 +1601,64 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     if args.first().is_some_and(|arg| arg == "codex") {
         return Err("usage: lucy codex <login|logout>".to_owned());
     }
+    if args == ["skill"] {
+        options.command = Some(CliCommand::Skill);
+        return Ok(options);
+    }
+    if args.first().is_some_and(|arg| arg == "skill") {
+        return Err("usage: lucy skill".to_owned());
+    }
+    if args.first().is_some_and(|arg| arg == "exec") {
+        let mut output = ExecOutput::Text;
+        let mut output_seen = false;
+        let mut prompt = None;
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--session" => {
+                    if options.session.is_some() {
+                        return Err("--session may only be specified once".to_owned());
+                    }
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return Err("--session requires an id".to_owned());
+                    };
+                    if value.is_empty() || value.starts_with('-') {
+                        return Err("--session requires an id".to_owned());
+                    }
+                    options.session = Some(value.clone());
+                }
+                "--output" => {
+                    if output_seen {
+                        return Err("--output may only be specified once".to_owned());
+                    }
+                    output_seen = true;
+                    index += 1;
+                    output = match args.get(index).map(String::as_str) {
+                        Some("text") => ExecOutput::Text,
+                        Some("json") => ExecOutput::Json,
+                        Some(_) => return Err("--output must be text or json".to_owned()),
+                        None => return Err("--output requires text or json".to_owned()),
+                    };
+                }
+                value if value == "-" || !value.starts_with('-') => {
+                    if prompt.replace(value.to_owned()).is_some() {
+                        return Err("lucy exec accepts exactly one prompt".to_owned());
+                    }
+                }
+                _ => return Err("unknown lucy exec argument".to_owned()),
+            }
+            index += 1;
+        }
+        let Some(prompt) = prompt else {
+            return Err(
+                "usage: lucy exec [--session <id>] [--output text|json] <prompt|->".to_owned(),
+            );
+        };
+        options.exec = Some(ExecOptions { output, prompt });
+        return Ok(options);
+    }
+
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1421,6 +1736,19 @@ fn configured_api_key(config: &Config) -> Option<String> {
         .filter(|secret| !secret.is_empty())
 }
 
+fn write_external_harness_skill<W: Write, E: Write>(mut output: W, diagnostics: &mut E) -> i32 {
+    match output.write_all(EXTERNAL_HARNESS_SKILL) {
+        Ok(()) => 0,
+        Err(error) => {
+            write_diagnostic(
+                diagnostics,
+                &format!("unable to write external harness skill: {error}"),
+            );
+            1
+        }
+    }
+}
+
 fn run_codex_command<W: Write, E: Write>(
     command: CliCommand,
     home: &Path,
@@ -1452,6 +1780,7 @@ fn run_codex_command<W: Write, E: Write>(
                 1
             }
         },
+        CliCommand::Skill => write_external_harness_skill(output, diagnostics),
     }
 }
 

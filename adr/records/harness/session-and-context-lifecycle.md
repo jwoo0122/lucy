@@ -7,16 +7,19 @@ applies_to:
 - src/**
 - tests/**
 - README.md
-summary: Lucy persists named JSONL sessions, previews their latest conversational messages, resumes their saved working directory when available, and preserves interruption, compaction, and boot-context state.
+summary: Lucy persists named JSONL sessions with a fail-fast OS-backed single-writer lease and preserves preview, cwd, interruption, compaction, and boot-context state.
 constrains: []
 depends_on:
 - harness.agent-boundary-and-protocol
 - harness.configuration-and-provider
 supersedes: []
 superseded_by: []
-last_reviewed: '2026-07-29'
+last_reviewed: '2026-08-15'
 enforcement:
 - invariant: complete-session-records
+  kind: executable
+  check: rust-tests
+- invariant: fail-fast-single-writer-lease
   kind: executable
   check: rust-tests
 - invariant: append-only-compaction-records
@@ -58,6 +61,8 @@ enforcement:
 invariants:
 - id: complete-session-records
   statement: Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
+- id: fail-fast-single-writer-lease
+  statement: A mutable session handle holds an OS-backed exclusive writer lease for its lifetime; a competing same-session mutable open fails without waiting and succeeds after release.
 - id: append-only-compaction-records
   statement: Compaction records are valid, append-only, secret-safe, complete-turn records that identify the summary, retained boundary, and token estimate without deleting history.
 - id: latest-compaction-boundary
@@ -96,6 +101,8 @@ Lucy MUST store sessions as append-only JSONL files under `~/.lucy/sessions/<ses
 
 Session metadata MUST expose the saved cwd and the latest user and assistant message summaries independently; tool messages MUST NOT replace those conversational previews. Resume MUST use the cwd saved in the immutable session header when it remains an accessible directory. If that cwd is unavailable, resume MUST use the invocation cwd, surface both saved and effective paths plus the fallback status, and MUST NOT rewrite the saved header cwd.
 
+A mutable session handle MUST hold a per-session OS-backed exclusive writer lease for its lifetime. While that lease is held, another mutable create or resume of the same session MUST fail without waiting; after the handle releases the lease, a later mutable open MUST succeed. This is the full concurrency guarantee enforced by repository tests. They do not establish lock fairness, waiting or queueing semantics, cross-host or network-filesystem exclusion, or crash-recovery behavior beyond the exercised release path.
+
 A session MAY contain valid JSONL interruption records. An interruption record MUST preserve the safe assistant output, tool-call/result observations, cancellation phase, and user-cancellation reason that were available at the nearest safe stopping point. Complete provider messages and completed/canceled tool results remain ordinary message records when their provider ordering is valid. If a canceled tool result could not be written as an ordinary message after its assistant tool call was persisted, a safe `cmd` interruption observation MAY be reconstructed as the matching provider tool message on the next request. Incomplete provider tool-call fragments MUST NOT be executed or sent as a malformed provider message. TUI replay MUST preserve the stored record order and show the interruption explicitly.
 
 At new-session boot, Lucy MUST compose and snapshot the current compiled built-in system prompt, discovered instruction files, and available-skill catalog as `boot_system_prompt`. Resume MUST restore the exact historical `boot_system_prompt` from the session rather than recomposing it from the current binary or rereading current files. Built-in prompt changes and instruction-file changes therefore apply only to new sessions unless an explicit reload feature is added later.
@@ -110,11 +117,12 @@ Skills MUST be discovered from the standard `.agents/skills/<name>/SKILL.md` loc
 
 ## Context and forces
 
-Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. Following skill symlinks supports centrally managed skill collections while cycle detection keeps recursive discovery bounded. Separate process invocations can resume the same session through the existing append-only file.
+Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. Following skill symlinks supports centrally managed skill collections while cycle detection keeps recursive discovery bounded. Separate process invocations can resume the same session through the existing append-only file. The OS-backed lease prevents the tested overlapping mutable access from silently appending concurrently and rejects that overlap immediately.
 
 ## Invariants
 
 - Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
+- A mutable session handle holds an OS-backed exclusive writer lease for its lifetime; a competing same-session mutable open fails without waiting and succeeds after release.
 - Compaction records are valid, append-only, secret-safe, complete-turn records that identify the summary, retained boundary, and token estimate without deleting history.
 - Resume and provider-message reconstruction apply only the latest compaction boundary and do not resend compacted-away raw messages.
 - Interruption records are valid, append-only, secret-safe, ordered with surrounding messages, identify user cancellation, and replay in the TUI.
@@ -134,12 +142,12 @@ Recomposing the prompt on resume would apply the latest binary guidance immediat
 
 ## Consequences
 
-Users must start a new session to pick up a newer built-in prompt or edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. Concurrent writers to one session are not coordinated. Session files remain the source of truth for independent process invocations. A moved or deleted workspace permits resume from the caller's invocation directory, but callers must inspect the reported cwd fallback before assuming project identity.
+Users must start a new session to pick up a newer built-in prompt or edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. A competing same-session mutable open fails immediately while the tested writer lease is held and succeeds after release. Callers that need waiting, fairness, cross-host exclusion, network-filesystem guarantees, or stronger crash recovery must provide those semantics themselves. Session files remain the source of truth for independent process invocations. A moved or deleted workspace permits resume from the caller's invocation directory, but callers must inspect the reported cwd fallback before assuming project identity.
 
 ## Enforcement
 
-Tests MUST create, persist, close, and resume a session in a separate process; verify saved-cwd restoration, observable fallback to the invocation cwd without header mutation, and latest user/assistant previews that ignore trailing tool records; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
+Tests MUST verify that direct lease acquisition fails without waiting while held, that a second mutable same-session handle is rejected, and that both paths succeed after release; create, persist, close, and resume a session in a separate process; verify saved-cwd restoration, observable fallback to the invocation cwd without header mutation, and latest user/assistant previews that ignore trailing tool records; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
 
 ## Revisit when
 
-Reconsider this decision if sessions need live built-in-prompt or instruction reload, branching/compaction, server-side conversation state, cross-process locking, or a dedicated event journal with stronger transactional guarantees.
+Reconsider this decision if sessions need live built-in-prompt or instruction reload, branching, server-side conversation state, waiting or fair lock acquisition, cross-host or network-filesystem coordination, stronger stale-lease recovery, or a dedicated event journal with stronger transactional guarantees.
