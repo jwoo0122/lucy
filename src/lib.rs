@@ -19,7 +19,7 @@ pub mod projection;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod redaction;
-#[allow(dead_code)]
+#[allow(dead_code, clippy::needless_return)]
 pub mod session;
 pub(crate) mod tool_pruning;
 pub mod tui;
