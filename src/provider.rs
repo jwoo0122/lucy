@@ -82,9 +82,16 @@ fn contains_context_overflow(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-/// Provider facade. Legacy semantic-compaction helpers remain temporarily for
-/// old session tests, while normal requests can opt into deterministic Lucy 2
-/// projection with an observed model context window.
+fn trusted_openrouter_metadata(settings: &LlmSettings) -> bool {
+    reqwest::Url::parse(&settings.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case("openrouter.ai"))
+}
+
+/// Provider facade. Normal OpenRouter and Codex requests use deterministic
+/// Lucy 2 projection when those providers expose a context window. Legacy
+/// semantic-compaction helpers remain temporarily for compatibility tests.
 pub struct Provider {
     inner: base::Provider,
     projection_context_window: Option<usize>,
@@ -100,16 +107,24 @@ impl Deref for Provider {
 
 impl Provider {
     pub fn new(settings: &LlmSettings) -> Result<Self, ProviderError> {
-        base::Provider::new(settings).map(|inner| Self {
+        let inner = base::Provider::new(settings)?;
+        let projection_context_window = if trusted_openrouter_metadata(settings) {
+            inner.context_window()
+        } else {
+            None
+        };
+        Ok(Self {
             inner,
-            projection_context_window: None,
+            projection_context_window,
         })
     }
 
     pub fn new_codex(home: &Path, settings: &LlmSettings) -> Result<Self, ProviderError> {
-        base::Provider::new_codex(home, settings).map(|inner| Self {
+        let inner = base::Provider::new_codex(home, settings)?;
+        let projection_context_window = inner.context_window();
+        Ok(Self {
             inner,
-            projection_context_window: None,
+            projection_context_window,
         })
     }
 
@@ -120,13 +135,12 @@ impl Provider {
         }
     }
 
-    pub(crate) fn with_projection_context(mut self, context_window: Option<usize>) -> Self {
-        self.projection_context_window = context_window.filter(|window| *window > 0);
-        self
-    }
-
-    pub(crate) fn uses_projection(&self) -> bool {
-        self.projection_context_window.is_some()
+    /// The legacy Harness field historically used this metadata to trigger an
+    /// LLM-authored compaction turn. Projection owns context pressure now, so
+    /// normal execution deliberately does not expose a compaction window here.
+    /// A projection-aware UI can surface the stored window independently later.
+    pub(crate) fn context_window(&self) -> Option<usize> {
+        None
     }
 
     pub(crate) fn project_messages(
@@ -218,5 +232,15 @@ mod tests {
             ProviderError::new("provider request failed (connection)").kind(),
             ProviderFailureKind::Transient
         );
+    }
+
+    #[test]
+    fn only_openrouter_gets_generic_provider_projection_metadata() {
+        let mut settings = LlmSettings::default();
+        settings.base_url = "https://openrouter.ai/api/v1".to_owned();
+        assert!(trusted_openrouter_metadata(&settings));
+
+        settings.base_url = "https://example.test/v1".to_owned();
+        assert!(!trusted_openrouter_metadata(&settings));
     }
 }
