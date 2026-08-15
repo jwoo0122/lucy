@@ -14,11 +14,8 @@ fn main() {
         std::process::exit(2);
     }
     if args.first().is_some_and(|arg| arg == "history") {
-        let exit_code = lucy::history::run_cli(
-            &args[1..],
-            io::stdout().lock(),
-            io::stderr().lock(),
-        );
+        let exit_code =
+            lucy::history::run_cli(&args[1..], io::stdout().lock(), io::stderr().lock());
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
