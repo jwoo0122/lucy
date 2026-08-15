@@ -165,6 +165,27 @@ mod tests {
     }
 
     #[test]
+    fn known_window_skips_oversized_attempts_before_provider_request() {
+        let attempts = summary_attempts(
+            planned(
+                (0..710)
+                    .map(|index| json!({"index": index, "content": "x".repeat(4_000)}))
+                    .collect(),
+            ),
+            Some(272_000),
+        )
+        .expect("attempts");
+        let usable = usable_context(272_000, COMPACTION_OUTPUT_RESERVE_TOKENS);
+
+        assert!(!attempts.is_empty());
+        assert!(attempts
+            .iter()
+            .all(|attempt| estimate_context_tokens(attempt) <= usable));
+        let first = attempts[0][2].content.as_deref().expect("payload");
+        assert!(first.contains("truncated for compaction fallback"));
+    }
+
+    #[test]
     fn uses_the_smallest_attempt_when_none_fit_preflight() {
         let attempts = summary_attempts(
             planned(vec![json!({"content": "x".repeat(8_000)})]),

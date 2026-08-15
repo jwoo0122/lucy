@@ -891,10 +891,11 @@ impl Harness {
             previous_boundary,
             plan,
         )?;
-        let summary = match self
-            .provider
-            .summarize_prepared(summary_messages, cancellation)
-        {
+        let summary = match self.provider.summarize_prepared(
+            summary_messages,
+            self.context_window,
+            cancellation,
+        ) {
             Ok(summary) => redact_secret(&summary, Some(self.provider.api_key().as_str())),
             Err(error) if cancellation.is_cancelled() || error.is_cancelled() => {
                 self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new())?;

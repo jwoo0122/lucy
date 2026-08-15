@@ -109,12 +109,10 @@ impl Provider {
     pub(crate) fn summarize_prepared(
         &self,
         planned: Vec<ChatMessage>,
+        context_window: Option<usize>,
         cancellation: &CancellationToken,
     ) -> Result<String, ProviderError> {
-        // Context-window metadata is resolved by the interactive harness. The
-        // provider facade deliberately avoids a second catalog request here;
-        // overflow responses still trigger progressively smaller attempts.
-        let attempts = crate::compaction_fallback::summary_attempts(planned, None)
+        let attempts = crate::compaction_fallback::summary_attempts(planned, context_window)
             .map_err(ProviderError::new)?;
         let mut attempts = attempts.into_iter().peekable();
         while let Some(attempt) = attempts.next() {
