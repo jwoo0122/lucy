@@ -1,5 +1,6 @@
 pub mod app;
 pub mod attention;
+pub(crate) mod attention_lock;
 pub mod auth;
 pub mod cancellation;
 pub(crate) mod codex_provider;
