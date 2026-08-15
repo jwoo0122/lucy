@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub(crate) mod context_budget;
 pub mod gateway;
+pub mod history;
 pub(crate) mod intra_turn;
 pub mod journal;
 pub mod model;
