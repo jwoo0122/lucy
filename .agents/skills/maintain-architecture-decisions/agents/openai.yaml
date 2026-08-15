@@ -1,0 +1,6 @@
+interface:
+  display_name: "Maintain Architecture Decisions"
+  short_description: "Internal semantic ADR oversight"
+  default_prompt: "Maintain the relevant living architecture decisions and invariant enforcement as an internal part of the active architect workflow."
+policy:
+  allow_implicit_invocation: false
