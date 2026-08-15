@@ -1,8 +1,8 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::{mpsc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -721,6 +721,52 @@ pub fn resolve_mode(
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct SteeringQueue {
+    pending: Arc<Mutex<Vec<(u64, String)>>>,
+}
+
+impl SteeringQueue {
+    pub(crate) fn push(&self, id: u64, text: String) -> Result<(), String> {
+        self.pending
+            .lock()
+            .map_err(|_| "steering queue is unavailable".to_owned())?
+            .push((id, text));
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&self, id: u64) -> Result<bool, String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "steering queue is unavailable".to_owned())?;
+        let Some(index) = pending.iter().position(|(pending_id, _)| *pending_id == id) else {
+            return Ok(false);
+        };
+        pending.remove(index);
+        Ok(true)
+    }
+
+    pub(crate) fn pop_front(&self) -> Result<Option<(u64, String)>, String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "steering queue is unavailable".to_owned())?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(pending.remove(0)))
+    }
+
+    fn take(&self) -> Result<Vec<(u64, String)>, String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "steering queue is unavailable".to_owned())?;
+        Ok(std::mem::take(&mut *pending))
+    }
+}
+
 pub(crate) struct Harness {
     pub(crate) home: PathBuf,
     pub(crate) session: Session,
@@ -871,6 +917,16 @@ impl Harness {
         sink: &mut S,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> Result<(), String> {
+        self.handle_message_with_steering(text, sink, cancellation, None)
+    }
+
+    pub(crate) fn handle_message_with_steering<S: EventSink>(
+        &mut self,
+        text: &str,
+        sink: &mut S,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+        steering: Option<&SteeringQueue>,
+    ) -> Result<(), String> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
         }
@@ -890,7 +946,7 @@ impl Harness {
                 .map_err(|error| format!("unable to emit skill attachment state: {error}"))?;
         }
 
-        self.continue_turn(sink, cancellation)
+        self.continue_turn(sink, cancellation, steering)
     }
 
     pub(crate) fn has_active_background_commands(&self) -> bool {
@@ -913,7 +969,7 @@ impl Harness {
         if !self.append_background_completions()? {
             return Ok(false);
         }
-        self.continue_turn(sink, cancellation)?;
+        self.continue_turn(sink, cancellation, None)?;
         Ok(true)
     }
 
@@ -936,10 +992,40 @@ impl Harness {
         Ok(true)
     }
 
+    fn apply_steering<S: EventSink>(
+        &mut self,
+        sink: &mut S,
+        steering: Option<&SteeringQueue>,
+    ) -> Result<bool, String> {
+        let Some(steering) = steering else {
+            return Ok(false);
+        };
+        let pending = steering.take()?;
+        let applied = !pending.is_empty();
+        for (id, text) in pending {
+            let secret = self.provider.api_key();
+            let expanded = expand_skill_invocation(&text, &self.session.skills)?;
+            self.session
+                .append_steering_message(ChatMessage::user(redact_secret(
+                    &expanded.text,
+                    Some(&secret),
+                )))
+                .map_err(|error| error.to_string())?;
+            sink.steering_applied(id, &text)
+                .map_err(|error| format!("unable to emit steering state: {error}"))?;
+            if let Some(name) = expanded.attached_skill.as_deref() {
+                sink.skill_instruction_attached(name)
+                    .map_err(|error| format!("unable to emit skill attachment state: {error}"))?;
+            }
+        }
+        Ok(applied)
+    }
+
     fn continue_turn<S: EventSink>(
         &mut self,
         sink: &mut S,
         cancellation: Option<&crate::cancellation::CancellationToken>,
+        steering: Option<&SteeringQueue>,
     ) -> Result<(), String> {
         let secret = self.provider.api_key();
         let mut last_compaction_boundary = None;
@@ -948,6 +1034,7 @@ impl Harness {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
             }
+            self.apply_steering(sink, steering)?;
             let mut messages = self.session.provider_messages();
             let tokens_before = estimate_context_tokens(&messages);
             if self.should_compact(&messages) {
@@ -1094,6 +1181,9 @@ impl Harness {
                     return self.interrupt(sink, PROVIDER_PHASE, "", &[], Vec::new());
                 }
                 if self.append_background_completions()? {
+                    continue;
+                }
+                if self.apply_steering(sink, steering)? {
                     continue;
                 }
                 if cancellation.is_some_and(|token| !token.try_complete()) {
@@ -1937,6 +2027,35 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn steering_queue_cancels_only_pending_messages() {
+        let queue = SteeringQueue::default();
+        queue.push(1, "first".to_owned()).expect("first");
+        queue.push(2, "second".to_owned()).expect("second");
+
+        assert!(queue.cancel(2).expect("cancel pending"));
+        assert!(!queue.cancel(9).expect("cancel absent"));
+        assert_eq!(
+            queue.pop_front().expect("pop"),
+            Some((1, "first".to_owned()))
+        );
+        assert_eq!(queue.pop_front().expect("pop empty"), None);
+        assert!(!queue.cancel(1).expect("cancel taken"));
+    }
+
+    #[test]
+    fn steering_queue_preserves_submission_order() {
+        let queue = SteeringQueue::default();
+        queue.push(4, "one".to_owned()).expect("one");
+        queue.push(5, "two".to_owned()).expect("two");
+
+        assert_eq!(
+            queue.take().expect("take"),
+            [(4, "one".to_owned()), (5, "two".to_owned())]
+        );
+        assert!(queue.take().expect("take empty").is_empty());
+    }
 
     #[test]
     fn codex_subcommands_parse_without_entering_a_session() {

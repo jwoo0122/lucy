@@ -58,6 +58,9 @@ enforcement:
 - invariant: conversational-session-previews
   kind: executable
   check: rust-tests
+- invariant: active-turn-steering-order
+  kind: executable
+  check: rust-tests
 invariants:
 - id: complete-session-records
   statement: Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
@@ -87,6 +90,8 @@ invariants:
   statement: The session header cwd remains immutable, while an unavailable saved cwd falls back for the invocation and is reported to interactive and machine clients.
 - id: conversational-session-previews
   statement: Session-list previews use the latest user and assistant messages rather than trailing tool records.
+- id: active-turn-steering-order
+  statement: User messages accepted while a TUI turn is active are appended to that active turn in submission order at the next safe provider boundary, and only messages still pending may be recalled for editing.
 ---
 
 # Session and boot context lifecycle
@@ -102,6 +107,8 @@ Lucy MUST store sessions as append-only JSONL files under `~/.lucy/sessions/<ses
 Session metadata MUST expose the saved cwd and the latest user and assistant message summaries independently; tool messages MUST NOT replace those conversational previews. Resume MUST use the cwd saved in the immutable session header when it remains an accessible directory. If that cwd is unavailable, resume MUST use the invocation cwd, surface both saved and effective paths plus the fallback status, and MUST NOT rewrite the saved header cwd.
 
 A mutable session handle MUST hold a per-session OS-backed exclusive writer lease for its lifetime. While that lease is held, another mutable create or resume of the same session MUST fail without waiting; after the handle releases the lease, a later mutable open MUST succeed. This is the full concurrency guarantee enforced by repository tests. They do not establish lock fairness, waiting or queueing semantics, cross-host or network-filesystem exclusion, or crash-recovery behavior beyond the exercised release path.
+
+While a TUI turn is active, additional user submissions MUST remain visibly pending until accepted at a safe provider boundary. Accepted steering messages MUST be appended to the same active turn in submission order and included in the next provider request; they MUST NOT open a second concurrent turn. The TUI MAY recall only a message that remains pending, and recall MUST remove it from delivery before restoring it to the input editor. A submission racing with turn completion MUST be delivered as steering when accepted before completion or as the next turn otherwise; it MUST NOT remain stranded in the visible queue.
 
 A session MAY contain valid JSONL interruption records. An interruption record MUST preserve the safe assistant output, tool-call/result observations, cancellation phase, and user-cancellation reason that were available at the nearest safe stopping point. Complete provider messages and completed/canceled tool results remain ordinary message records when their provider ordering is valid. If a canceled tool result could not be written as an ordinary message after its assistant tool call was persisted, a safe `cmd` interruption observation MAY be reconstructed as the matching provider tool message on the next request. Incomplete provider tool-call fragments MUST NOT be executed or sent as a malformed provider message. TUI replay MUST preserve the stored record order and show the interruption explicitly.
 
@@ -135,6 +142,7 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 - Lucy does not infer or persist relationships between sessions.
 - The session header cwd remains immutable, while an unavailable saved cwd falls back for the invocation and is reported to interactive and machine clients.
 - Session-list previews use the latest user and assistant messages rather than trailing tool records.
+- User messages accepted while a TUI turn is active are appended to that active turn in submission order at the next safe provider boundary, and only messages still pending may be recalled for editing.
 
 ## Alternatives and trade-offs
 

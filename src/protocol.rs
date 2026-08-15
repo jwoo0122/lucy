@@ -60,6 +60,12 @@ pub trait EventSink {
         Ok(())
     }
 
+    /// Notify interactive frontends when queued user input has been admitted
+    /// to the current turn. This is intentionally not a public protocol event.
+    fn steering_applied(&mut self, _id: u64, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Notify interactive frontends of the estimated prompt context size.
     /// This is intentionally not part of the public JSONL protocol.
     fn context_usage(&mut self, _tokens: usize) -> io::Result<()> {

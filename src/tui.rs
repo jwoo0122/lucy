@@ -32,7 +32,7 @@ use ratatui_image::{Image as TuiImage, Resize};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::Harness;
+use crate::app::{Harness, SteeringQueue};
 use crate::cancellation::CancellationToken;
 use crate::model::{estimate_context_tokens, ChatMessage};
 use crate::protocol::{EventSink, ProtocolEvent};
@@ -257,6 +257,7 @@ pub(crate) fn run<W: Write>(
     state.background_active_count = harness.background_active_count();
     let (request_tx, request_rx) = mpsc::channel::<WorkerRequest>();
     let (message_tx, message_rx) = mpsc::channel::<WorkerMessage>();
+    let steering = SteeringQueue::default();
 
     let stdout = stdout;
     enable_raw_mode().map_err(|error| format!("unable to enable terminal input: {error}"))?;
@@ -311,13 +312,23 @@ pub(crate) fn run<W: Write>(
     if in_tmux {
         terminal_guard.modify_other_keys = true;
     }
-    let worker = thread::spawn(move || worker_loop(&mut harness, request_rx, message_tx, resumed));
+    let worker_steering = steering.clone();
+    let worker = thread::spawn(move || {
+        worker_loop(
+            &mut harness,
+            request_rx,
+            message_tx,
+            resumed,
+            worker_steering,
+        )
+    });
 
     let result = event_loop(
         terminal_guard.terminal_mut(),
         &mut state,
         &request_tx,
         &message_rx,
+        &steering,
     );
 
     if let Some(token) = state.active_cancel.take() {
@@ -334,6 +345,7 @@ fn worker_loop(
     requests: Receiver<WorkerRequest>,
     messages: Sender<WorkerMessage>,
     resumed: bool,
+    steering: SteeringQueue,
 ) {
     let mut sink = ChannelSink {
         sender: messages.clone(),
@@ -352,6 +364,26 @@ fn worker_loop(
     }
 
     loop {
+        // A submission that races with the active turn's final queue drain
+        // becomes the next turn instead of remaining stranded in the UI.
+        if let Ok(Some((id, text))) = steering.pop_front() {
+            let cancel = CancellationToken::new();
+            let _ = messages.send(WorkerMessage::Started {
+                cancel: cancel.clone(),
+            });
+            let _ = sink.steering_applied(id, &text);
+            if let Err(error) = harness.handle_message_with_steering(
+                &text,
+                &mut sink,
+                Some(&cancel),
+                Some(&steering),
+            ) {
+                let message = redact_secret(&error, Some(harness.provider.api_key().as_str()));
+                let _ = sink.emit_event(&ProtocolEvent::Error { message });
+            }
+            let _ = messages.send(WorkerMessage::Finished);
+            continue;
+        }
         let request = match requests.recv_timeout(EVENT_POLL) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -359,7 +391,6 @@ fn worker_loop(
                     let cancel = CancellationToken::new();
                     let _ = messages.send(WorkerMessage::Started {
                         cancel: cancel.clone(),
-                        user_text: None,
                     });
                     if let Err(error) =
                         harness.handle_background_completions(&mut sink, Some(&cancel))
@@ -379,9 +410,13 @@ fn worker_loop(
                 let cancel = CancellationToken::new();
                 let _ = messages.send(WorkerMessage::Started {
                     cancel: cancel.clone(),
-                    user_text: Some(text.clone()),
                 });
-                if let Err(error) = harness.handle_message(&text, &mut sink, Some(&cancel)) {
+                if let Err(error) = harness.handle_message_with_steering(
+                    &text,
+                    &mut sink,
+                    Some(&cancel),
+                    Some(&steering),
+                ) {
                     let message = redact_secret(&error, Some(harness.provider.api_key().as_str()));
                     let _ = sink.emit_event(&ProtocolEvent::Error { message });
                 }
@@ -417,16 +452,14 @@ fn event_loop<W: Write>(
     state: &mut UiState,
     requests: &Sender<WorkerRequest>,
     messages: &Receiver<WorkerMessage>,
+    steering: &SteeringQueue,
 ) -> Result<TuiOutcome, String> {
     let mut quitting = false;
     loop {
         loop {
             match messages.try_recv() {
                 Ok(WorkerMessage::Event(event)) => state.apply_event(event),
-                Ok(WorkerMessage::Started { cancel, user_text }) => {
-                    if let Some(text) = user_text {
-                        state.start_queued_user(&text);
-                    }
+                Ok(WorkerMessage::Started { cancel }) => {
                     state.active_cancel = Some(cancel);
                     state.turn_start_transcript_len = state.transcript.len();
                     state.set_busy(true);
@@ -436,6 +469,9 @@ fn event_loop<W: Write>(
                 Ok(WorkerMessage::ReasoningCompleted) => state.complete_reasoning(),
                 Ok(WorkerMessage::SkillInstructionAttached) => {
                     state.mark_latest_user_skill_attached()
+                }
+                Ok(WorkerMessage::SteeringApplied { id, text }) => {
+                    state.start_queued_user(id, &text)
                 }
                 Ok(WorkerMessage::ContextUsage(tokens)) => state.context_tokens = tokens,
                 Ok(WorkerMessage::CompactionStarted) => state.set_status("compacting"),
@@ -610,12 +646,16 @@ fn event_loop<W: Write>(
                     }
                     state.auto_scroll = true;
                     state.scroll = 0;
-                    state.submit_user(&text);
+                    let queued_id = state.submit_user(&text);
                     state.set_busy(true);
                     state.set_status("working");
-                    requests
-                        .send(WorkerRequest::Turn { text })
-                        .map_err(|_| "TUI worker is unavailable".to_owned())?;
+                    if let Some(id) = queued_id {
+                        steering.push(id, text)?;
+                    } else {
+                        requests
+                            .send(WorkerRequest::Turn { text })
+                            .map_err(|_| "TUI worker is unavailable".to_owned())?;
+                    }
                 }
                 KeyCode::Tab => {
                     // Tab completes the focused skill while the slash picker
@@ -651,9 +691,20 @@ fn event_loop<W: Write>(
                         .map_err(|error| format!("unable to read terminal size: {error}"))?;
                     let area = tui_viewport(Rect::new(0, 0, size.width, size.height));
                     let input_width = ui_prompt_content_width(area).max(1) as usize;
-                    if !move_up_from_input(state, input_width) {
-                        let max_scroll = max_scroll_for_area(state, size);
-                        scroll_up(state, max_scroll);
+                    match input_up_action(state, input_width) {
+                        InputUpAction::Handled => {}
+                        InputUpAction::Recall(id) => {
+                            if steering.cancel(id)? {
+                                state.recall_queued_user();
+                                continue;
+                            }
+                            let max_scroll = max_scroll_for_area(state, size);
+                            scroll_up(state, max_scroll);
+                        }
+                        InputUpAction::Scroll => {
+                            let max_scroll = max_scroll_for_area(state, size);
+                            scroll_up(state, max_scroll);
+                        }
                     }
                 }
                 KeyCode::Down => {
@@ -943,11 +994,14 @@ enum WorkerMessage {
     Event(ProtocolEvent),
     Started {
         cancel: CancellationToken,
-        user_text: Option<String>,
     },
     Thinking,
     ReasoningCompleted,
     SkillInstructionAttached,
+    SteeringApplied {
+        id: u64,
+        text: String,
+    },
     ContextUsage(usize),
     CompactionStarted,
     CompactionFinished {
@@ -989,6 +1043,15 @@ impl EventSink for ChannelSink {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI closed"))
     }
 
+    fn steering_applied(&mut self, id: u64, text: &str) -> io::Result<()> {
+        self.sender
+            .send(WorkerMessage::SteeringApplied {
+                id,
+                text: text.to_owned(),
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "TUI closed"))
+    }
+
     fn context_usage(&mut self, tokens: usize) -> io::Result<()> {
         self.sender
             .send(WorkerMessage::ContextUsage(tokens))
@@ -1016,6 +1079,12 @@ struct ActivityTransition {
     started_at: Instant,
     from_levels: [usize; PULSE_BAR_PERIODS.len()],
     to_levels: [usize; PULSE_BAR_PERIODS.len()],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedMessage {
+    id: u64,
+    text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1064,7 +1133,8 @@ struct UiState {
     secret: String,
     transcript: Vec<TranscriptItem>,
     turn_start_transcript_len: usize,
-    queued_messages: Vec<String>,
+    queued_messages: Vec<QueuedMessage>,
+    next_queued_message_id: u64,
     input: String,
     cursor: usize,
     status: String,
@@ -1112,6 +1182,7 @@ impl UiState {
             transcript: Vec::new(),
             turn_start_transcript_len: 0,
             queued_messages: Vec::new(),
+            next_queued_message_id: 0,
             input: String::new(),
             cursor: 0,
             status: "ready".to_owned(),
@@ -1584,37 +1655,43 @@ impl UiState {
 
     /// Show an idle submission in the transcript immediately. Only a turn
     /// submitted while another turn is active needs the visible queue.
-    fn submit_user(&mut self, text: &str) {
+    fn submit_user(&mut self, text: &str) -> Option<u64> {
         if self.busy {
-            self.queue_user(text);
+            Some(self.queue_user(text))
         } else {
             self.add_user(text, &self.secret.clone());
+            None
         }
     }
 
-    fn queue_user(&mut self, text: &str) {
-        self.queued_messages
-            .push(redact_secret(text, Some(&self.secret)));
+    fn queue_user(&mut self, text: &str) -> u64 {
+        let id = self.next_queued_message_id;
+        self.next_queued_message_id = self.next_queued_message_id.wrapping_add(1);
+        self.queued_messages.push(QueuedMessage {
+            id,
+            text: redact_secret(text, Some(&self.secret)),
+        });
+        id
     }
 
-    fn start_queued_user(&mut self, text: &str) {
-        let safe = redact_secret(text, Some(&self.secret));
-        let queued = if self.queued_messages.first() == Some(&safe) {
-            self.queued_messages.remove(0);
-            true
-        } else if let Some(index) = self
+    fn start_queued_user(&mut self, id: u64, text: &str) {
+        let Some(index) = self
             .queued_messages
             .iter()
-            .position(|queued| queued == &safe)
-        {
-            self.queued_messages.remove(index);
-            true
-        } else {
-            false
+            .position(|queued| queued.id == id)
+        else {
+            return;
         };
-        if queued {
-            self.add_user(text, &self.secret.clone());
-        }
+        self.queued_messages.remove(index);
+        self.add_user(text, &self.secret.clone());
+    }
+
+    fn recall_queued_user(&mut self) -> Option<QueuedMessage> {
+        let queued = self.queued_messages.pop()?;
+        self.input = queued.text.clone();
+        self.cursor = self.input.chars().count();
+        self.input_changed();
+        Some(queued)
     }
 
     fn add_user(&mut self, text: &str, secret: &str) {
@@ -2241,6 +2318,28 @@ fn cursor_row(input: &str, cursor: usize, width: usize) -> u16 {
     input_cursor_row(input, cursor, width).min(u16::MAX as usize) as u16
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputUpAction {
+    Handled,
+    Recall(u64),
+    Scroll,
+}
+
+fn input_up_action(state: &mut UiState, width: usize) -> InputUpAction {
+    if move_up_from_input(state, width) {
+        InputUpAction::Handled
+    } else if !state.skill_picker_visible() {
+        state
+            .queued_messages
+            .last()
+            .map_or(InputUpAction::Scroll, |queued| {
+                InputUpAction::Recall(queued.id)
+            })
+    } else {
+        InputUpAction::Scroll
+    }
+}
+
 fn move_up_from_input(state: &mut UiState, width: usize) -> bool {
     state.move_skill_picker(false) || move_input_cursor_vertical(state, width, false)
 }
@@ -2595,7 +2694,7 @@ fn draw_message_queue(frame: &mut Frame<'_>, state: &UiState, area: Rect) {
                 Line::from(vec![
                     Span::styled("│ ", chrome),
                     Span::styled(
-                        format!("{}) {}", index + 1, single_line_preview(queued)),
+                        format!("{}) {}", index + 1, single_line_preview(&queued.text)),
                         message,
                     ),
                 ])
@@ -4765,9 +4864,8 @@ mod tests {
             TranscriptItem::User { text, .. } if text == "send now"
         ));
 
-        // The worker's Started notification still arrives asynchronously, but
-        // must not promote an already visible direct submission a second time.
-        state.start_queued_user("send now");
+        // A steering notification for a non-queued id must not add a duplicate.
+        state.start_queued_user(99, "send now");
         assert_eq!(state.transcript.len(), 1);
     }
 
@@ -4777,17 +4875,63 @@ mod tests {
             UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.busy = true;
 
-        state.submit_user("send later");
+        let id = state.submit_user("send later").expect("queued id");
 
-        assert_eq!(state.queued_messages, ["send later"]);
+        assert_eq!(state.queued_messages.len(), 1);
+        assert_eq!(state.queued_messages[0].text, "send later");
         assert!(state.transcript.is_empty());
 
-        state.start_queued_user("send later");
+        state.start_queued_user(id, "send later");
         assert!(state.queued_messages.is_empty());
         assert!(matches!(
             &state.transcript[..],
             [TranscriptItem::User { text, .. }] if text == "send later"
         ));
+    }
+
+    #[test]
+    fn queued_submission_can_be_recalled_to_input() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.busy = true;
+        let id = state.submit_user("edit me").expect("queued id");
+
+        let recalled = state.recall_queued_user().expect("queued message");
+
+        assert_eq!(recalled.id, id);
+        assert_eq!(state.input, "edit me");
+        assert_eq!(state.cursor, 7);
+        assert!(state.queued_messages.is_empty());
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn up_moves_within_multiline_input_before_recalling_a_queued_message() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.busy = true;
+        state.submit_user("queued").expect("queued id");
+        state.input = "first\nsecond".to_owned();
+        state.cursor = state.input.chars().count();
+
+        assert_eq!(input_up_action(&mut state, 20), InputUpAction::Handled);
+        assert_eq!(state.cursor, 5);
+        assert_eq!(state.input, "first\nsecond");
+        assert_eq!(state.queued_messages.len(), 1);
+    }
+
+    #[test]
+    fn up_off_the_first_input_row_selects_the_latest_queue_candidate() {
+        let mut state =
+            UiState::from_history(&[], "current-session", "secret", "model", None, false);
+        state.busy = true;
+        let id = state.submit_user("queued").expect("queued id");
+        state.input = "first\nsecond".to_owned();
+        state.cursor = 2;
+
+        assert_eq!(input_up_action(&mut state, 20), InputUpAction::Recall(id));
+        assert_eq!(state.input, "first\nsecond");
+        assert_eq!(state.queued_messages.len(), 1);
     }
 
     #[test]
