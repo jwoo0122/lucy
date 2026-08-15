@@ -12,6 +12,7 @@ pub mod history;
 pub(crate) mod intra_turn;
 pub mod journal;
 pub mod model;
+pub mod projection;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod redaction;
