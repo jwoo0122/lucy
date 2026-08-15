@@ -99,11 +99,22 @@ lucy --session <session-id>
 lucy --list-sessions
 ```
 
+### Telegram gateway
+
+Lucy can expose the same turn engine through a Telegram bot using long polling:
+
+```sh
+export TELEGRAM_BOT_TOKEN="..."
+lucy gateway telegram
+```
+
+The gateway reads `TELEGRAM_BOT_TOKEN` once and removes it from the process environment before any Lucy turn starts, so model-executed `cmd` children do not inherit the Telegram credential. Per-chat routing state is stored privately under `~/.lucy/gateways/telegram.json`. The current implementation maps each Telegram chat to a legacy Lucy session internally; that mapping is a transport compatibility detail rather than a model-facing tool or orchestration surface.
+
 In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc to cancel the active turn. Enter or Tab selects a focused skill in the slash picker; then enter `/<name> [args]` to attach the saved `SKILL.md` snapshot for that skill to the next model request. The same slash picker includes the Lucy-owned `/settings [ignored args]`, `/session`, and `/exit` commands.
 
 ## Features
 
-- **TUI and JSONL:** Supports terminal chat and line-delimited JSON automation.
+- **TUI, JSONL, and Telegram:** Supports terminal chat, line-delimited JSON automation, and a long-polling Telegram transport over the same Lucy turn engine.
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
 - **Tool activity UI:** Renders `cmd` as a compact one-line card. The main-agent ready/working indicator appears in the bottom status line, and the prompt border uses a left-to-right teal-to-green gradient.
 - **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification with the final agent message, or a fixed cancellation/error status, when the terminal supports it; JSONL output is unchanged.
@@ -112,4 +123,4 @@ In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc
 - **Persistent sessions:** Stores conversation history, provider settings, boot context, and skill snapshots as JSONL in `~/.lucy/sessions/` and supports resuming them.
 - **Context and skills:** Composes built-in guidance with the working directory, README files, global `$XDG_CONFIG_HOME/lucy/AGENTS.md` (or `~/.config/lucy/AGENTS.md`), project `AGENTS.md`/`CLAUDE.md`, and Agent Skills for new sessions. The model sees only skill metadata; explicit slash-prefixed skill-name invocations use the saved snapshot.
 - **Automatic context compaction:** At 95% estimated context usage, safely summarizes older complete turns with the configured model, retains recent context, and resumes the active turn without rewriting session history.
-- **Credential protection:** OpenRouter API keys are read only from environment variables and are not written to configuration, sessions, the public protocol, or diagnostics. Codex subscription tokens are stored in Lucy's private credential store and are never exposed to model tools or persisted sessions. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; shell startup files may still reintroduce credentials independently.
+- **Credential protection:** OpenRouter API keys are read only from environment variables and are not written to configuration, sessions, the public protocol, or diagnostics. Codex subscription tokens are stored in Lucy's private credential store and are never exposed to model tools or persisted sessions. The active provider credential is removed from the command child environment so model-executed commands do not directly inherit it; shell startup files may still reintroduce credentials independently. Telegram bot tokens are removed from the gateway process environment before model turns begin.
