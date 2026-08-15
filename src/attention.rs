@@ -14,6 +14,38 @@ pub fn message_event(message: ChatMessage) -> Result<JournalEvent, String> {
     JournalEvent::new(MESSAGE_EVENT_KIND, payload)
 }
 
+/// Add factual transport provenance to a message event. `source_id` is a
+/// routing key, not a memory namespace: callers may still recall any journal
+/// event regardless of source.
+pub fn source_message_event(
+    message: ChatMessage,
+    surface: &str,
+    source_id: &str,
+    parent_id: Option<&str>,
+) -> Result<JournalEvent, String> {
+    if surface.trim().is_empty() || source_id.trim().is_empty() {
+        return Err("attention source must not be empty".to_owned());
+    }
+    let mut event = message_event(message)?;
+    event.surface = Some(surface.to_owned());
+    event.source_id = Some(source_id.to_owned());
+    event.parent_id = parent_id.map(str::to_owned);
+    Ok(event)
+}
+
+/// Derive the durable attention head for one factual transport source from the
+/// journal itself. No second cursor store is required: the most recently
+/// committed event carrying the same `(surface, source_id)` is the source head.
+pub fn latest_source_head<'a>(
+    events: &'a [JournalEvent],
+    surface: &str,
+    source_id: &str,
+) -> Option<&'a JournalEvent> {
+    events.iter().rev().find(|event| {
+        event.surface.as_deref() == Some(surface) && event.source_id.as_deref() == Some(source_id)
+    })
+}
+
 /// Follow one explicit causal head backwards through parent_id links, then
 /// return the chain in chronological causal order. Global append order is not
 /// used to infer topical/thread relationships.
@@ -75,6 +107,24 @@ mod tests {
         event
     }
 
+    fn sourced_message(
+        id: &str,
+        surface: &str,
+        source_id: &str,
+        parent_id: Option<&str>,
+        text: &str,
+    ) -> JournalEvent {
+        let mut event = source_message_event(
+            ChatMessage::user(text.to_owned()),
+            surface,
+            source_id,
+            parent_id,
+        )
+        .expect("source message");
+        event.id = id.to_owned();
+        event
+    }
+
     #[test]
     fn interleaved_global_history_does_not_mix_causal_attention() {
         let a1 = linked_message("a1", None, "A one");
@@ -97,6 +147,51 @@ mod tests {
                 .filter_map(|message| message.content.as_deref())
                 .collect::<Vec<_>>(),
             vec!["B one", "B two"]
+        );
+    }
+
+    #[test]
+    fn source_heads_are_derived_independently_from_interleaved_journal_order() {
+        let a1 = sourced_message("a1", "telegram", "100", None, "A one");
+        let b1 = sourced_message("b1", "telegram", "200", None, "B one");
+        let a2 = sourced_message("a2", "telegram", "100", Some("a1"), "A two");
+        let b2 = sourced_message("b2", "telegram", "200", Some("b1"), "B two");
+        let events = vec![a1, b1, a2, b2];
+
+        assert_eq!(
+            latest_source_head(&events, "telegram", "100").map(|event| event.id.as_str()),
+            Some("a2")
+        );
+        assert_eq!(
+            latest_source_head(&events, "telegram", "200").map(|event| event.id.as_str()),
+            Some("b2")
+        );
+    }
+
+    #[test]
+    fn new_root_resets_source_attention_without_deleting_old_branch() {
+        let old1 = sourced_message("old1", "tui", "main", None, "old one");
+        let old2 = sourced_message("old2", "tui", "main", Some("old1"), "old two");
+        let fresh = sourced_message("fresh", "tui", "main", None, "fresh root");
+        let events = vec![old1, old2, fresh];
+
+        let head = latest_source_head(&events, "tui", "main").expect("head");
+        assert_eq!(head.id, "fresh");
+        assert_eq!(
+            causal_messages(&events, &head.id)
+                .expect("fresh attention")
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["fresh root"]
+        );
+        assert_eq!(
+            causal_messages(&events, "old2")
+                .expect("old branch remains")
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["old one", "old two"]
         );
     }
 
