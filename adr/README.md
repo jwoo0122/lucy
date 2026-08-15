@@ -1,16 +1,32 @@
 # Architecture decisions
 
-This directory is a living map of architectural intent, not a chronological decision log.
+This directory is repository-owned architecture data. It is not owned by a particular model, skill, or checker. Any model or tool may maintain it if the resulting repository preserves this contract. The tool that initialized the directory is only a reference client.
 
-- Read `index.yaml` first and load only relevant records.
-- Preserve `.adr-system.yaml`; it identifies the owning schema and version.
-- Name records by stable decision question: `records/<scope>/<question>.md`.
-- Improve or revise an existing record when its question is unchanged.
-- Create a record only for a new architectural question.
-- Treat accepted decisions as current but revisable intent.
-- Keep supersession links bidirectional.
-- Declare deterministic source checks in each accepted record under `enforcement`, or document an explicit `enforcement_exception` with status, reason, evidence, and revisit conditions.
-- Run `skills/maintain-architecture-decisions/scripts/adr check` after `validate`; it reads the declared repository files and exits non-zero on a mismatch or undocumented exception.
-- Rebuild and validate the index with `skills/maintain-architecture-decisions/scripts/adr` after edits. The launcher selects a Python interpreter that can import PyYAML and does not install packages.
+## Data model
 
-Records capture intent that code alone does not reliably reveal. Local implementation details and routine changes do not belong here.
+- `.adr-system.yaml` identifies the `semantic-living-adr` protocol version and registers executable checks as argv arrays.
+- `index.yaml` is a deterministic generated routing map; records are authoritative when it is stale.
+- `records/<scope>/<stable-question>.md` owns one stable design question.
+- `_template.md` defines record frontmatter and required prose sections.
+- Records are revised as current intent changes rather than appended as chronology.
+- Decision relationships refer to semantic record IDs, and supersession is bidirectional.
+- Record IDs use `<scope>.<stable-question>` with lowercase letters, digits, dots, and hyphens; the file path is `records/<id with dots as slashes>.md`.
+- Status is `proposed`, `accepted`, `superseded`, or `retired`. Only accepted records impose current constraints.
+- Required frontmatter fields are listed in `_template.md`.
+
+## Accepted-record contract
+
+Every accepted record declares stable invariants and maps each exactly once to:
+
+- `executable`: a deterministic registered check; or
+- `manual`: a reason, inspectable evidence, and a condition for reconsidering automation.
+
+Manual invariants are not mechanically verified. Source-string presence alone is not proof of architectural conformance.
+
+Use `index.yaml` to select relevant records. Prefer revising the record that owns an existing question. Keep one logical writer during a change to avoid conflicting edits; this is a concurrency rule, not tool ownership.
+
+A conforming implementation validates structure and relationships, generates the index deterministically, checks complete invariant coverage, executes each referenced check once from the repository root without a shell, and reports manual invariants honestly. Repositories should expose their chosen implementation through a stable repository-level command for agents and CI.
+
+## Repository command
+
+Run `scripts/adr validate` for structural validation, `scripts/adr reindex` after record edits, and `scripts/adr check` for the global conformance gate used by CI.

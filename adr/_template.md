@@ -1,50 +1,63 @@
 ---
-template: true
-id: scope.stable-question
+id: <scope>.<stable-question>
 status: proposed
-scope: scope
-decision_type: boundary
-applies_to: []
-summary: Concise statement of the current intent.
+scope: <scope>
+decision_type: <type>
+applies_to:
+  - path/**
+summary: "One-sentence current decision"
 constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
 last_reviewed: "YYYY-MM-DD"
-enforcement: []
-enforcement_exception: null
+invariants:
+  - id: stable-invariant-id
+    statement: "A durable property this decision requires."
+enforcement:
+  - invariant: stable-invariant-id
+    kind: executable
+    check: registered-check-id
+# Or, when deterministic verification is genuinely unavailable:
+# - invariant: contextual-invariant
+#   kind: manual
+#   reason: "Why this cannot be checked portably and deterministically."
+#   evidence:
+#     - path/to/inspectable-evidence
+#   revisit_when:
+#     - "A condition that should trigger automation."
 ---
 
-# Stable question
+# Decision title
 
 ## Decision question
 
-What durable architectural question does this record answer?
+What stable architectural question does this record own?
 
 ## Current decision
 
-State the current answer with normative MUST or MUST NOT language.
+State the current answer and normative boundaries.
 
 ## Context and forces
 
-Explain the requirements and constraints that make the decision necessary.
+Explain why the decision exists and which trade-offs matter.
 
 ## Invariants
 
-List rules that implementation and review can verify.
+- `stable-invariant-id`: Repeat each frontmatter invariant with enough context for readers.
 
 ## Alternatives and trade-offs
 
-Record only alternatives likely to be reconsidered.
+Record the viable alternatives and why the current answer wins.
 
 ## Consequences
 
-Record intended benefits, costs, and operational effects.
+State operational and evolutionary effects.
 
 ## Enforcement
 
-Name tests, lint rules, schemas, or review points that enforce the decision.
+Explain what the registered checks observe and which claims remain manual.
 
 ## Revisit when
 
-List observable conditions that justify reopening the decision.
+List concrete triggers for review.
