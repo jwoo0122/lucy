@@ -1,5 +1,6 @@
 pub mod app;
 pub mod attention;
+pub(crate) mod attention_lock;
 pub mod auth;
 pub mod cancellation;
 pub(crate) mod codex_provider;
@@ -18,6 +19,7 @@ pub mod projection;
 pub mod protocol;
 pub mod provider;
 pub(crate) mod redaction;
+#[allow(dead_code, clippy::needless_return)]
 pub mod session;
 pub(crate) mod tool_pruning;
 pub mod tui;

@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::path::Path;
 
+use crate::attention::attention_reset_event;
+use crate::attention_lock::AttentionLease;
 use crate::journal::{Journal, JournalEvent};
 
 const DEFAULT_RECENT: usize = 20;
@@ -24,7 +26,12 @@ pub fn run_cli_at_home<W: Write, E: Write>(
     home: &Path,
 ) -> i32 {
     let journal = Journal::for_home(home);
-    match run_command(args, &journal) {
+    let result = if args.first().is_some_and(|command| command == "reset") {
+        AttentionLease::acquire(home).and_then(|_lease| reset(args, &journal))
+    } else {
+        run_command(args, &journal)
+    };
+    match result {
         Ok(events) => match write_events(output, &events) {
             Ok(()) => 0,
             Err(message) => {
@@ -51,8 +58,18 @@ fn run_command(args: &[String], journal: &Journal) -> Result<Vec<JournalEvent>, 
         "recent" => recent(args, journal),
         "show" => show(args, journal),
         "search" => search(args, journal),
+        "reset" => reset(args, journal),
         _ => Err(usage()),
     }
+}
+
+fn reset(args: &[String], journal: &Journal) -> Result<Vec<JournalEvent>, String> {
+    if args.len() != 1 {
+        return Err(usage());
+    }
+    let event = attention_reset_event("cli", "history")?;
+    journal.append(&event)?;
+    Ok(vec![event])
 }
 
 fn recent(args: &[String], journal: &Journal) -> Result<Vec<JournalEvent>, String> {
@@ -176,13 +193,15 @@ fn parse_u64(value: &str, name: &str) -> Result<u64, String> {
 }
 
 fn usage() -> String {
-    "usage: lucy history recent [count] | show <event-id> [--around count] | search <query> [--cwd path] [--since-ms timestamp] [--limit count]".to_owned()
+    "usage: lucy history recent [count] | show <event-id> [--around count] | search <query> [--cwd path] [--since-ms timestamp] [--limit count] | reset".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attention::{causal_messages, latest_attention_head};
     use crate::journal::JournalEvent;
+    use crate::model::ChatMessage;
     use serde_json::json;
 
     fn root() -> std::path::PathBuf {
@@ -256,6 +275,29 @@ mod tests {
         )
         .expect("search");
         assert_eq!(result, vec![wanted]);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reset_changes_global_attention_without_deleting_old_history() {
+        let root = root();
+        let journal = Journal::at_root(root.clone());
+        let mut first = crate::attention::message_event(ChatMessage::user("old".to_owned()))
+            .expect("old message");
+        first.id = "old".to_owned();
+        journal.append(&first).expect("old append");
+
+        let reset_event = reset(&["reset".to_owned()], &journal)
+            .expect("reset")
+            .pop()
+            .expect("reset event");
+        let events = journal.read_all().expect("events");
+        assert_eq!(
+            latest_attention_head(&events).map(|event| event.id.as_str()),
+            Some(reset_event.id.as_str())
+        );
+        assert!(causal_messages(&events, "old").is_ok());
+        assert_eq!(events.len(), 2);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

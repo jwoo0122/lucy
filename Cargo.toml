@@ -15,6 +15,19 @@ path = "src/main.rs"
 name = "lucy"
 path = "src/lib.rs"
 
+# The old end-to-end CLI suite encodes named-session files, immutable session
+# boot snapshots, and resume semantics that Lucy 2 intentionally removes. Keep
+# it available as an explicit migration reference without making those retired
+# contracts the default preview test oracle.
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["legacy-session-tests"]
+
+[features]
+default = []
+legacy-session-tests = []
+
 [package.metadata.dist]
 formula = "lucy"
 
