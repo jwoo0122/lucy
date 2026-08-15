@@ -97,7 +97,8 @@ impl Journal {
             .open(&path)
             .map_err(|_| "unable to open journal".to_owned())?;
         ensure_private_regular_file(&file)?;
-        let encoded = serde_json::to_vec(event).map_err(|_| "unable to encode journal event".to_owned())?;
+        let encoded =
+            serde_json::to_vec(event).map_err(|_| "unable to encode journal event".to_owned())?;
         file.write_all(&encoded)
             .and_then(|()| file.write_all(b"\n"))
             .and_then(|()| file.flush())
@@ -295,7 +296,10 @@ mod tests {
     fn temporary_root(name: &str) -> PathBuf {
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).expect("random root");
-        let suffix = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let suffix = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         std::env::temp_dir().join(format!("lucy-journal-{name}-{suffix}"))
     }
 
@@ -319,13 +323,23 @@ mod tests {
 
     #[test]
     fn journal_schema_contains_facts_without_semantic_memory_fields() {
-        let event = JournalEvent::new("tool_result", serde_json::json!({"status": 0}))
-            .expect("event");
+        let event =
+            JournalEvent::new("tool_result", serde_json::json!({"status": 0})).expect("event");
         let value = serde_json::to_value(event).expect("value");
         let object = value.as_object().expect("object");
 
-        for forbidden in ["summary", "topic", "importance", "lesson", "persona", "memory"] {
-            assert!(!object.contains_key(forbidden), "unexpected semantic field: {forbidden}");
+        for forbidden in [
+            "summary",
+            "topic",
+            "importance",
+            "lesson",
+            "persona",
+            "memory",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "unexpected semantic field: {forbidden}"
+            );
         }
         assert!(object.contains_key("id"));
         assert!(object.contains_key("timestamp_ms"));
@@ -368,7 +382,10 @@ mod tests {
             journal.recover_incomplete_tail().expect_err("must refuse"),
             "journal contains an invalid committed record"
         );
-        assert_eq!(fs::read(journal.path()).expect("unchanged"), b"not-json\npartial");
+        assert_eq!(
+            fs::read(journal.path()).expect("unchanged"),
+            b"not-json\npartial"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
