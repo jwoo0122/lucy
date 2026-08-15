@@ -7,7 +7,7 @@ applies_to:
 - src/**
 - tests/**
 - README.md
-summary: Lucy persists named JSONL sessions with a fail-fast OS-backed single-writer lease and preserves preview, cwd, interruption, compaction, and boot-context state.
+summary: Lucy persists named JSONL sessions with a fail-fast OS-backed single-writer lease, while normal provider context pressure is handled by deterministic projection and legacy compaction records remain readable compatibility state.
 constrains: []
 depends_on:
 - harness.agent-boundary-and-protocol
@@ -22,10 +22,10 @@ enforcement:
 - invariant: fail-fast-single-writer-lease
   kind: executable
   check: rust-tests
-- invariant: append-only-compaction-records
+- invariant: deterministic-provider-projection
   kind: executable
   check: rust-tests
-- invariant: latest-compaction-boundary
+- invariant: legacy-compaction-read-compatibility
   kind: executable
   check: rust-tests
 - invariant: ordered-interruption-records
@@ -63,13 +63,13 @@ enforcement:
   check: rust-tests
 invariants:
 - id: complete-session-records
-  statement: Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
+  statement: Session records preserve the boot snapshot and all valid messages needed to reconstruct the stored conversation without rewriting raw history for context pressure.
 - id: fail-fast-single-writer-lease
   statement: A mutable session handle holds an OS-backed exclusive writer lease for its lifetime; a competing same-session mutable open fails without waiting and succeeds after release.
-- id: append-only-compaction-records
-  statement: Compaction records are valid, append-only, secret-safe, complete-turn records that identify the summary, retained boundary, and token estimate without deleting history.
-- id: latest-compaction-boundary
-  statement: Resume and provider-message reconstruction apply only the latest compaction boundary and do not resend compacted-away raw messages.
+- id: deterministic-provider-projection
+  statement: When Lucy has trusted context-window metadata, normal provider requests derive a bounded deterministic view from stored messages without an LLM-authored memory summary, preserve the current request, retain a structurally valid recent suffix, and leave persisted history unchanged.
+- id: legacy-compaction-read-compatibility
+  statement: Existing persisted compaction records remain append-only compatibility input and resume applies only the latest valid boundary, but normal frontend execution does not create new semantic compaction records as its context-pressure policy.
 - id: ordered-interruption-records
   statement: Interruption records are valid, append-only, secret-safe, ordered with surrounding messages, identify user cancellation, and replay in the TUI.
 - id: safe-incomplete-tool-recovery
@@ -98,7 +98,7 @@ invariants:
 
 ## Decision question
 
-How should Lucy preserve chat history, interrupted turns, and ambient instructions across process restarts?
+How should Lucy preserve chat history, interrupted turns, and ambient instructions across process restarts while keeping provider context bounded?
 
 ## Current decision
 
@@ -114,7 +114,11 @@ A session MAY contain valid JSONL interruption records. An interruption record M
 
 At new-session boot, Lucy MUST compose and snapshot the current compiled built-in system prompt, discovered instruction files, and available-skill catalog as `boot_system_prompt`. Resume MUST restore the exact historical `boot_system_prompt` from the session rather than recomposing it from the current binary or rereading current files. Built-in prompt changes and instruction-file changes therefore apply only to new sessions unless an explicit reload feature is added later.
 
-Lucy MUST support append-only automatic compaction records without rewriting or deleting the earlier session history. When estimated context reaches at least 95% of the model window at a safe provider/cmd boundary, Lucy MUST use the configured model in a no-tools summary request, retain the most recent complete turns up to approximately 20,000 estimated tokens, and append a compaction record containing the summary, the retained-message boundary, and the pre-compaction token estimate. The active provider context after that boundary MUST be reconstructed as the boot system prompt, the compaction summary, and all retained/subsequent complete messages. Resume MUST apply the same latest compaction boundary. If summary generation or persistence fails, no compaction record or replacement boundary is appended; an ordinary user cancellation may still append the existing interruption record.
+Normal execution MUST NOT use an LLM-authored semantic summary as its default response to context pressure. When Lucy has trusted context-window metadata for the configured provider, the provider-facing message list MUST be derived deterministically from the stored conversation. Projection MUST preserve the system message, MUST preserve the current user or observation request as an anchor, MUST keep the earliest structurally safe recent suffix that fits the usable token budget, and MUST NOT emit an orphan tool result or a declared tool call without its result. Lucy MAY first replace sufficiently old large tool outputs with deterministic bounded placeholders whose exact source remains in persisted history. When earlier messages are omitted from the active provider view, any breadcrumb MUST state only factual omission information and MUST NOT synthesize topics, lessons, importance, intent, or narrative memory. Projection MUST NOT rewrite or delete session history.
+
+Lucy MUST NOT invent a context size for an arbitrary OpenAI-compatible endpoint. Automatic projection metadata MAY be obtained only from provider surfaces Lucy explicitly trusts for this purpose, currently Codex-owned metadata and OpenRouter's model catalog. If trusted metadata is unavailable, Lucy sends the structurally valid stored conversation without proactive size projection and lets the provider report any context limit rather than guessing one.
+
+A session MAY contain compaction records written by older Lucy versions. Such records remain valid append-only compatibility state: resume and provider-message reconstruction MAY apply the latest valid compaction boundary so an existing historical session remains replayable according to the representation it already stored. Normal frontend execution MUST NOT create new semantic compaction records as its context-pressure mechanism. Compatibility parsing of old records does not make their summaries the memory model for newly projected execution.
 
 Session identity is caller-owned. Lucy MUST keep sessions independently replayable and MUST NOT persist parent-session links, child-session kinds, worker lifecycle state, or synthetic cross-session result delivery. A caller MAY launch several Lucy processes and send messages to each named session independently.
 
@@ -124,14 +128,17 @@ Skills MUST be discovered from the standard `.agents/skills/<name>/SKILL.md` loc
 
 ## Context and forces
 
-Chat usability requires state beyond one request. Reproducible resume requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. Following skill symlinks supports centrally managed skill collections while cycle detection keeps recursive discovery bounded. Separate process invocations can resume the same session through the existing append-only file. The OS-backed lease prevents the tested overlapping mutable access from silently appending concurrently and rejects that overlap immediately.
+Chat usability requires state beyond one request. Reproducible resume currently requires preserving the model-visible boot context, while rereading mutable files on resume would silently change the meaning of an old conversation. At the same time, an LLM-authored compaction summary makes a past model or harness interpretation part of future attention and can irreversibly suppress details that a stronger future model would have used differently. Deterministic projection keeps the stored record intact and treats the provider window as disposable attention rather than canonical memory.
+
+Standard AGENTS/CLAUDE and Agent Skills locations provide interoperability without Lucy-specific resource trees. Following skill symlinks supports centrally managed skill collections while cycle detection keeps recursive discovery bounded. Separate process invocations can resume the same session through the existing append-only file. The OS-backed lease prevents the tested overlapping mutable access from silently appending concurrently and rejects that overlap immediately.
 
 ## Invariants
 
-- Session records preserve the boot snapshot and all valid messages needed to reconstruct the active conversation.
+- Session records preserve the boot snapshot and all valid messages needed to reconstruct the stored conversation without rewriting raw history for context pressure.
 - A mutable session handle holds an OS-backed exclusive writer lease for its lifetime; a competing same-session mutable open fails without waiting and succeeds after release.
-- Compaction records are valid, append-only, secret-safe, complete-turn records that identify the summary, retained boundary, and token estimate without deleting history.
-- Resume and provider-message reconstruction apply only the latest compaction boundary and do not resend compacted-away raw messages.
+- When trusted context metadata exists, normal provider requests use a deterministic bounded projection rather than an LLM-authored semantic compaction summary.
+- Projection preserves the current request, retains a structurally valid recent suffix, leaves persisted history unchanged, and uses only factual breadcrumbs for omitted ranges.
+- Existing persisted compaction records remain readable append-only compatibility input and only the latest valid boundary is applied on historical resume.
 - Interruption records are valid, append-only, secret-safe, ordered with surrounding messages, identify user cancellation, and replay in the TUI.
 - Incomplete tool-call fragments are never executed or sent to providers, and reconstructed cmd results close only a previously declared matching tool call.
 - A new session records the current built-in composed prompt as boot_system_prompt.
@@ -146,16 +153,28 @@ Chat usability requires state beyond one request. Reproducible resume requires p
 
 ## Alternatives and trade-offs
 
-Recomposing the prompt on resume would apply the latest binary guidance immediately but break prompt stability and resume reproducibility. Embedding every skill body in the boot prompt would waste context and diverge from progressive disclosure conventions. Ignoring skill symlinks would reduce traversal complexity but prevent standard skill locations from referencing centrally managed files. Lucy chooses metadata-only boot context plus immutable skill-content snapshots, including symlink targets. Keeping session identity outside Lucy's relationship model lets callers orchestrate independent agents without adding a worker journal or scheduler.
+LLM-authored rolling summaries keep more interpreted history resident in the prompt, but they require a past model to predict what a future model will need and make a lossy semantic representation part of continuing context. Lucy chooses deterministic omission plus exact recoverability instead. Embeddings, topic maps, importance scores, and narrative memories may improve retrieval in some workloads, but making them required harness state would encode another semantic prior into the memory substrate; they are therefore outside this decision.
+
+Inventing a conservative context window for unknown compatible providers would permit proactive projection everywhere but creates provider knowledge Lucy does not actually possess. Lucy instead projects automatically only when the provider exposes a trusted size and accepts provider-side overflow as the honest failure mode otherwise.
+
+Recomposing the prompt on resume would apply the latest binary guidance immediately but break prompt stability and resume reproducibility. Embedding every skill body in the boot prompt would waste context and diverge from progressive disclosure conventions. Ignoring skill symlinks would reduce traversal complexity but prevent standard skill locations from referencing centrally managed files. Lucy chooses metadata-only boot context plus immutable skill-content snapshots, including symlink targets, while sessions remain the persistence authority.
 
 ## Consequences
 
-Users must start a new session to pick up a newer built-in prompt or edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. A competing same-session mutable open fails immediately while the tested writer lease is held and succeeds after release. Callers that need waiting, fairness, cross-host exclusion, network-filesystem guarantees, or stronger crash recovery must provide those semantics themselves. Session files remain the source of truth for independent process invocations. A moved or deleted workspace permits resume from the caller's invocation directory, but callers must inspect the reported cwd fallback before assuming project identity.
+Users must start a new session to pick up a newer built-in prompt or edited ambient instructions. A resumed session can report stale skill paths if the workspace moved or files were deleted; the resulting command error remains visible to the model. Historical sessions that already contain compaction records may still resume through their saved summary boundary, while newly projected execution does not create another semantic summary solely because context is full.
+
+The provider facade consumes trusted context-window metadata internally for projection and does not feed that value through the legacy compaction-control field. Until the interactive status surface becomes projection-aware, the TUI may omit a context-window denominator rather than display a value that also re-enables semantic compaction.
+
+A competing same-session mutable open fails immediately while the tested writer lease is held and succeeds after release. Callers that need waiting, fairness, cross-host exclusion, network-filesystem guarantees, or stronger crash recovery must provide those semantics themselves. Session files remain the source of truth for independent process invocations in this decision. A moved or deleted workspace permits resume from the caller's invocation directory, but callers must inspect the reported cwd fallback before assuming project identity.
 
 ## Enforcement
 
-Tests MUST verify that direct lease acquisition fails without waiting while held, that a second mutable same-session handle is rejected, and that both paths succeed after release; create, persist, close, and resume a session in a separate process; verify saved-cwd restoration, observable fallback to the invocation cwd without header mutation, and latest user/assistant previews that ignore trailing tool records; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay. Compaction tests MUST verify append-only persistence, latest-boundary reconstruction, complete-turn retention, summary redaction, resume equivalence, and unchanged session state when compaction fails or is canceled. Tests MUST verify that no child-session or background-result records are created.
+Tests MUST verify that direct lease acquisition fails without waiting while held, that a second mutable same-session handle is rejected, and that both paths succeed after release; create, persist, close, and resume a session in a separate process; verify saved-cwd restoration, observable fallback to the invocation cwd without header mutation, and latest user/assistant previews that ignore trailing tool records; assert that new sessions snapshot the current built-in composed prompt and that resume retains a deliberately different historical `boot_system_prompt`; assert that the original boot snapshot is used after source-file edits; verify AGENTS/CLAUDE precedence, final instruction-file symlinks, intermediate-directory exclusion, ordinary and symlinked skill catalog discovery, and skill-directory cycle termination; and verify interruption records, safe partial output, ordering, and resume replay.
+
+Projection tests MUST verify identity behavior when context fits, deterministic recent-history selection when it does not, current-request anchoring, factual omission counts, and tool-call/result validity at retained boundaries. Provider tests MUST verify that automatic generic-provider metadata lookup is restricted to the explicitly trusted provider surface. Existing compaction tests MAY remain to verify historical record parsing, latest-boundary reconstruction, summary redaction, and resume compatibility, but those tests MUST NOT be interpreted as the normal context-pressure policy.
+
+Tests MUST verify that no child-session or background-result records are created.
 
 ## Revisit when
 
-Reconsider this decision if sessions need live built-in-prompt or instruction reload, branching, server-side conversation state, waiting or fair lock acquisition, cross-host or network-filesystem coordination, stronger stale-lease recovery, or a dedicated event journal with stronger transactional guarantees.
+Reconsider this decision when the append-only Lucy journal becomes the persistence authority instead of named sessions, or if sessions need live built-in-prompt or instruction reload, branching, server-side conversation state, waiting or fair lock acquisition, cross-host or network-filesystem coordination, or stronger stale-lease recovery.
