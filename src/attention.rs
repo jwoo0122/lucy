@@ -165,7 +165,7 @@ mod tests {
 
         assert_eq!(event.kind, MESSAGE_EVENT_KIND);
         assert_eq!(
-            causal_messages(&[event.clone()], &event.id).expect("decode"),
+            causal_messages(std::slice::from_ref(&event), &event.id).expect("decode"),
             vec![original]
         );
     }
