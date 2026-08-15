@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.15.1](https://github.com/jwoo0122/lucy/compare/v1.15.0...v1.15.1) - 2026-08-15
+
+### Fixed
+
+- steer queued TUI messages into active turns ([#93](https://github.com/jwoo0122/lucy/pull/93))
+
 ## [1.15.0](https://github.com/jwoo0122/lucy/compare/v1.14.10...v1.15.0) - 2026-08-15
 
 ### Added
