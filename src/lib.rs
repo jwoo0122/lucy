@@ -7,6 +7,7 @@ pub(crate) mod compaction_fallback;
 pub mod config;
 pub mod context;
 pub(crate) mod context_budget;
+pub mod gateway;
 pub(crate) mod intra_turn;
 pub mod model;
 pub mod protocol;
