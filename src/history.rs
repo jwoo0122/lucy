@@ -134,7 +134,10 @@ fn search(args: &[String], journal: &Journal) -> Result<Vec<JournalEvent>, Strin
     let mut matches = events
         .into_iter()
         .filter(|event| since_ms.is_none_or(|since| event.timestamp_ms >= since))
-        .filter(|event| cwd.as_ref().is_none_or(|cwd| event.cwd.as_ref() == Some(cwd)))
+        .filter(|event| {
+            cwd.as_ref()
+                .is_none_or(|cwd| event.cwd.as_ref() == Some(cwd))
+        })
         .filter(|event| lexical_text(event).contains(&query))
         .collect::<Vec<_>>();
     if matches.len() > limit {
@@ -192,12 +195,7 @@ mod tests {
         std::env::temp_dir().join(format!("lucy-history-{suffix}"))
     }
 
-    fn append(
-        journal: &Journal,
-        kind: &str,
-        text: &str,
-        cwd: Option<&str>,
-    ) -> JournalEvent {
+    fn append(journal: &Journal, kind: &str, text: &str, cwd: Option<&str>) -> JournalEvent {
         let mut event = JournalEvent::new(kind, json!({"text": text})).expect("event");
         event.cwd = cwd.map(str::to_owned);
         journal.append(&event).expect("append");
