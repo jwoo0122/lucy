@@ -64,21 +64,19 @@ pub fn project_context(
         .last()
         .copied()
         .unwrap_or(body_start.min(pruned.len()));
-    let anchor = pruned.get(active_start).cloned();
+    let anchor = pruned.get(active_start).map(|message| (active_start, message));
     let suffix_candidates = active_start.saturating_add(1)..pruned.len();
     for start in suffix_candidates {
         if !is_safe_suffix_start(&pruned[start]) {
             continue;
         }
-        if let Some(projected) =
-            build_projection(&pruned, system.as_ref(), start, anchor.as_ref(), target)
-        {
+        if let Some(projected) = build_projection(&pruned, system.as_ref(), start, anchor, target) {
             return Ok(projected);
         }
     }
 
-    if let Some(anchor) = anchor {
-        let minimal = [system.as_ref(), Some(&anchor)]
+    if let Some((_, anchor)) = anchor {
+        let minimal = [system.as_ref(), Some(anchor)]
             .into_iter()
             .flatten()
             .cloned()
@@ -95,34 +93,39 @@ fn build_projection(
     messages: &[ChatMessage],
     system: Option<&ChatMessage>,
     start: usize,
-    anchor: Option<&ChatMessage>,
+    anchor: Option<(usize, &ChatMessage)>,
     target: usize,
 ) -> Option<ContextProjection> {
     if start >= messages.len() || !suffix_is_tool_valid(&messages[start..]) {
         return None;
     }
 
-    let omitted_messages = start.saturating_sub(usize::from(system.is_some()));
+    let body_start = usize::from(system.is_some());
+    let anchor_before_start = anchor.is_some_and(|(index, _)| index < start);
+    let omitted_messages = start
+        .saturating_sub(body_start)
+        .saturating_sub(usize::from(anchor_before_start));
+    let first_kept_message = anchor.map_or(start, |(index, _)| index.min(start));
     let mut projected = Vec::new();
     if let Some(system) = system {
         projected.push(system.clone());
-    }
-    if let Some(anchor) = anchor {
-        if start == 0 || messages.get(start) != Some(anchor) {
-            projected.push(anchor.clone());
-        }
     }
     if omitted_messages > 0 {
         projected.push(ChatMessage::observation(format!(
             "{PROJECTION_BREADCRUMB_PREFIX} {omitted_messages} earlier messages omitted from active context; canonical history is unchanged.]"
         )));
     }
+    if let Some((index, anchor)) = anchor {
+        if index < start {
+            projected.push(anchor.clone());
+        }
+    }
     projected.extend_from_slice(&messages[start..]);
 
     (estimate_context_tokens(&projected) <= target).then_some(ContextProjection {
         messages: projected,
         omitted_messages,
-        first_kept_message: start,
+        first_kept_message,
     })
 }
 
@@ -253,6 +256,36 @@ mod tests {
                 .map(|message| message.role.as_str()),
             Some("tool")
         );
+    }
+
+    #[test]
+    fn anchor_fallback_counts_only_records_actually_omitted() {
+        let messages = vec![
+            ChatMessage::system("system".to_owned()),
+            ChatMessage::user("old request".to_owned()),
+            ChatMessage::assistant("old answer".to_owned(), Vec::new()),
+            ChatMessage::user("active request".to_owned()),
+            ChatMessage::assistant("intermediate".to_owned(), Vec::new()),
+            ChatMessage::assistant("kept suffix".to_owned(), Vec::new()),
+        ];
+        let target = 128_000;
+        let projection = build_projection(
+            &messages,
+            Some(&messages[0]),
+            5,
+            Some((3, &messages[3])),
+            target,
+        )
+        .expect("projection");
+
+        assert_eq!(projection.first_kept_message, 3);
+        assert_eq!(projection.omitted_messages, 3);
+        assert_eq!(projection.messages[1].role, OBSERVATION_ROLE);
+        assert_eq!(projection.messages[2], messages[3]);
+        assert!(projection.messages[1]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("3 earlier messages omitted")));
     }
 
     #[test]
