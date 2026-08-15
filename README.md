@@ -110,11 +110,26 @@ lucy gateway telegram
 
 The gateway reads `TELEGRAM_BOT_TOKEN` once and removes it from the process environment before any Lucy turn starts, so model-executed `cmd` children do not inherit the Telegram credential. Per-chat routing state is stored privately under `~/.lucy/gateways/telegram.json`. The current implementation maps each Telegram chat to a legacy Lucy session internally; that mapping is a transport compatibility detail rather than a model-facing tool or orchestration surface.
 
+### Journal history recall
+
+Lucy 2 is introducing an append-only factual journal under `$XDG_STATE_HOME/lucy/journal.jsonl` (falling back to `~/.local/state/lucy/journal.jsonl`). Raw journal events can be recalled without a dedicated model-facing memory tool:
+
+```sh
+lucy history recent
+lucy history recent 50
+lucy history show <event-id> --around 20
+lucy history search gateway
+lucy history search gateway --cwd /absolute/project/path --since-ms 1780000000000 --limit 20
+```
+
+History output is exact journal-event JSONL. Search is deterministic case-insensitive lexical matching plus factual filters; it does not use embeddings, topic labels, importance scores, lessons, or LLM summaries. During the Lucy 2 migration, legacy session history is not automatically imported into this journal yet, so these commands only show events already written to the new journal substrate.
+
 In the TUI, press Enter to send, Shift/Alt+Enter to insert a line break, and Esc to cancel the active turn. Enter or Tab selects a focused skill in the slash picker; then enter `/<name> [args]` to attach the saved `SKILL.md` snapshot for that skill to the next model request. The same slash picker includes the Lucy-owned `/settings [ignored args]`, `/session`, and `/exit` commands.
 
 ## Features
 
 - **TUI, JSONL, and Telegram:** Supports terminal chat, line-delimited JSON automation, and a long-polling Telegram transport over the same Lucy turn engine.
+- **Deterministic history recall:** Reads exact Lucy 2 journal events through ordinary `lucy history` CLI commands usable by humans or through the existing model-facing `cmd` tool.
 - **Streaming activity:** Shows model output, reasoning wait states, tool calls/results, and cancellation status in the TUI.
 - **Tool activity UI:** Renders `cmd` as a compact one-line card. The main-agent ready/working indicator appears in the bottom status line, and the prompt border uses a left-to-right teal-to-green gradient.
 - **Completion notifications:** When a TUI turn becomes idle, Lucy sends a terminal-native OSC 777 desktop notification with the final agent message, or a fixed cancellation/error status, when the terminal supports it; JSONL output is unchanged.
