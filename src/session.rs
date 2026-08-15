@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use crate::attention::{causal_events, latest_attention_head, routed_message_event};
 use crate::attention_lock::AttentionLease;
 use crate::config::LlmSettings;
-use crate::context::SkillEntry;
+use crate::context::{resolve_boot_context_with_api_key_env, SkillEntry};
 use crate::journal::{Journal, JournalEvent};
 use crate::model::{ChatMessage, OBSERVATION_ROLE};
+use crate::redaction::redact_secret;
 
 pub use base::{
     CompactionRecord, InterruptionRecord, SessionHistoryRecord, SessionMetadata, SessionToolResult,
@@ -153,7 +154,22 @@ impl Session {
             .map_err(|error| SessionError::new(error.to_string()))?;
         let cwd = std::env::current_dir()
             .map_err(|_| SessionError::new("unable to resolve working directory"))?;
-        Self::create_with_secret(home, &cwd, String::new(), llm, external_secret)
+        let secret = external_secret
+            .map(str::to_owned)
+            .or_else(|| std::env::var(&llm.api_key_env).ok())
+            .filter(|secret| !secret.is_empty());
+        let context = resolve_boot_context_with_api_key_env(home, &cwd, None)
+            .map_err(|error| SessionError::new(error.to_string()))?;
+        let boot_system_prompt = redact_secret(&context.system_prompt, secret.as_deref());
+        let skills = redact_skills(context.skills, secret.as_deref());
+        Self::create_with_skills_and_secret(
+            home,
+            &cwd,
+            boot_system_prompt,
+            llm,
+            skills,
+            secret.as_deref(),
+        )
     }
 
     pub fn list(home: &Path) -> Result<Vec<SessionMetadata>, SessionError> {
@@ -328,12 +344,13 @@ impl Session {
         &mut self,
         mut interruption: InterruptionRecord,
     ) -> Result<(), SessionError> {
-        let payload = serde_json::to_value(&interruption)
-            .map_err(|_| SessionError::new("unable to encode interruption"))?;
-        self.reject_secret(&payload)?;
-        let mut event = JournalEvent::new(INTERRUPTION_KIND, payload).map_err(SessionError::new)?;
-        self.decorate_event(&mut event);
+        let mut event = JournalEvent::new(INTERRUPTION_KIND, serde_json::json!({}))
+            .map_err(SessionError::new)?;
         interruption.timestamp = event.timestamp_ms / 1000;
+        event.payload = serde_json::to_value(&interruption)
+            .map_err(|_| SessionError::new("unable to encode interruption"))?;
+        self.reject_secret(&event.payload)?;
+        self.decorate_event(&mut event);
         self.journal().append(&event).map_err(SessionError::new)?;
         self.history.push(SessionHistoryRecord::Interruption {
             timestamp: interruption.timestamp,
@@ -356,22 +373,33 @@ impl Session {
 
     pub fn append_compaction(
         &mut self,
-        _summary: String,
-        _first_kept_message: usize,
-        _tokens_before: usize,
+        summary: String,
+        first_kept_message: usize,
+        tokens_before: usize,
     ) -> Result<(), SessionError> {
-        Err(SessionError::new(
-            "semantic compaction is disabled; provider context uses deterministic projection",
-        ))
-    }
+        #[cfg(test)]
+        {
+            if first_kept_message > self.messages.len() {
+                return Err(SessionError::new("invalid context compaction boundary"));
+            }
+            self.messages.drain(..first_kept_message);
+            self.history
+                .push(SessionHistoryRecord::Compaction(CompactionRecord {
+                    timestamp: self.updated_at,
+                    summary,
+                    first_kept_message,
+                    tokens_before,
+                }));
+            return Ok(());
+        }
 
-    pub(crate) fn refresh_live_context(
-        &mut self,
-        boot_system_prompt: String,
-        skills: Vec<SkillEntry>,
-    ) {
-        self.boot_system_prompt = boot_system_prompt;
-        self.skills = skills;
+        #[cfg(not(test))]
+        {
+            let _ = (summary, first_kept_message, tokens_before);
+            Err(SessionError::new(
+                "semantic compaction is disabled; provider context uses deterministic projection",
+            ))
+        }
     }
 
     pub(crate) fn ensure_attention(&mut self) -> Result<(), String> {
@@ -381,6 +409,7 @@ impl Session {
         let lease = AttentionLease::acquire(&self.home)?;
         self.reload_from_journal()
             .map_err(|error| error.to_string())?;
+        self.refresh_current_context()?;
         self.attention_lease = Some(lease);
         Ok(())
     }
@@ -398,6 +427,14 @@ impl Session {
         event.surface = Some(self.surface.clone());
         event.source_id = Some(self.source_id.clone());
         event.cwd = Some(self.cwd.display().to_string());
+    }
+
+    fn refresh_current_context(&mut self) -> Result<(), String> {
+        let context = resolve_boot_context_with_api_key_env(&self.home, &self.cwd, None)
+            .map_err(|error| error.to_string())?;
+        self.boot_system_prompt = redact_secret(&context.system_prompt, self.secret.as_deref());
+        self.skills = redact_skills(context.skills, self.secret.as_deref());
+        Ok(())
     }
 
     fn append_user_or_retry(&mut self, message: ChatMessage) -> Result<(), SessionError> {
@@ -536,6 +573,19 @@ impl Session {
         }
         Ok(())
     }
+}
+
+fn redact_skills(skills: Vec<SkillEntry>, secret: Option<&str>) -> Vec<SkillEntry> {
+    skills
+        .into_iter()
+        .map(|skill| SkillEntry {
+            name: redact_secret(&skill.name, secret),
+            description: redact_secret(&skill.description, secret),
+            path: PathBuf::from(redact_secret(&skill.path.display().to_string(), secret)),
+            contents: redact_secret(&skill.contents, secret),
+            model_invocable: skill.model_invocable,
+        })
+        .collect()
 }
 
 fn current_messages_from_events(events: &[JournalEvent]) -> Result<Vec<ChatMessage>, SessionError> {
