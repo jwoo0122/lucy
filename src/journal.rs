@@ -268,7 +268,7 @@ impl JournalAppendLock {
             }
             ensure_private_file(&path)
                 .map_err(|_| "unable to protect journal append lock".to_owned())?;
-            return Ok(Self { file });
+            Ok(Self { file })
         }
 
         #[cfg(not(unix))]
