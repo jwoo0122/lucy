@@ -64,7 +64,9 @@ pub fn project_context(
         .last()
         .copied()
         .unwrap_or(body_start.min(pruned.len()));
-    let anchor = pruned.get(active_start).map(|message| (active_start, message));
+    let anchor = pruned
+        .get(active_start)
+        .map(|message| (active_start, message));
     let suffix_candidates = active_start.saturating_add(1)..pruned.len();
     for start in suffix_candidates {
         if !is_safe_suffix_start(&pruned[start]) {
