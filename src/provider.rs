@@ -236,8 +236,12 @@ mod tests {
 
     #[test]
     fn only_openrouter_gets_generic_provider_projection_metadata() {
-        let mut settings = LlmSettings::default();
-        settings.base_url = "https://openrouter.ai/api/v1".to_owned();
+        let mut settings = LlmSettings {
+            base_url: "https://openrouter.ai/api/v1".to_owned(),
+            model: "test-model".to_owned(),
+            api_key_env: "OPENROUTER_API_KEY".to_owned(),
+            effort: None,
+        };
         assert!(trusted_openrouter_metadata(&settings));
 
         settings.base_url = "https://example.test/v1".to_owned();
