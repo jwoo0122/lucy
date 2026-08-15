@@ -246,7 +246,13 @@ mod tests {
         let projection = project_context(&messages, window_for_target(target)).expect("projection");
 
         assert!(suffix_is_tool_valid(&projection.messages));
-        assert_ne!(projection.messages.get(1).map(|message| message.role.as_str()), Some("tool"));
+        assert_ne!(
+            projection
+                .messages
+                .get(1)
+                .map(|message| message.role.as_str()),
+            Some("tool")
+        );
     }
 
     #[test]
