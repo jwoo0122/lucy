@@ -292,7 +292,10 @@ mod tests {
             .pop()
             .expect("reset event");
         let events = journal.read_all().expect("events");
-        assert_eq!(latest_attention_head(&events).map(|event| event.id.as_str()), Some(reset_event.id.as_str()));
+        assert_eq!(
+            latest_attention_head(&events).map(|event| event.id.as_str()),
+            Some(reset_event.id.as_str())
+        );
         assert!(causal_messages(&events, "old").is_ok());
         assert_eq!(events.len(), 2);
         std::fs::remove_dir_all(root).expect("cleanup");
