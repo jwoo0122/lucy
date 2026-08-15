@@ -99,7 +99,9 @@ impl Session {
         let cwd = std::fs::canonicalize(cwd)
             .map_err(|_| SessionError::new("unable to resolve working directory"))?;
         let journal = Journal::for_home(home);
-        journal.recover_incomplete_tail().map_err(SessionError::new)?;
+        journal
+            .recover_incomplete_tail()
+            .map_err(SessionError::new)?;
         let mut session = Self {
             id: GLOBAL_ID.to_owned(),
             path: journal.path(),
@@ -251,7 +253,8 @@ impl Session {
     ) -> Result<(), SessionError> {
         let payload = serde_json::json!({"model": model, "effort": effort});
         self.reject_secret(&payload)?;
-        let mut event = JournalEvent::new(PROVIDER_SETTINGS_KIND, payload).map_err(SessionError::new)?;
+        let mut event =
+            JournalEvent::new(PROVIDER_SETTINGS_KIND, payload).map_err(SessionError::new)?;
         self.decorate_event(&mut event);
         self.journal().append(&event).map_err(SessionError::new)?;
         self.updated_at = event.timestamp_ms / 1000;
@@ -376,7 +379,8 @@ impl Session {
             return Ok(());
         }
         let lease = AttentionLease::acquire(&self.home)?;
-        self.reload_from_journal().map_err(|error| error.to_string())?;
+        self.reload_from_journal()
+            .map_err(|error| error.to_string())?;
         self.attention_lease = Some(lease);
         Ok(())
     }
@@ -479,7 +483,9 @@ impl Session {
             for event in causal_events(&events, head).map_err(SessionError::new)? {
                 if event.kind == crate::attention::MESSAGE_EVENT_KIND {
                     let message = serde_json::from_value::<ChatMessage>(event.payload.clone())
-                        .map_err(|_| SessionError::new("journal message event has invalid payload"))?;
+                        .map_err(|_| {
+                            SessionError::new("journal message event has invalid payload")
+                        })?;
                     let timestamp = event.timestamp_ms / 1000;
                     self.messages.push(message.clone());
                     self.history
@@ -491,13 +497,15 @@ impl Session {
         for event in &events {
             match event.kind.as_str() {
                 turn::TURN_LIFECYCLE_KIND => {
-                    let lifecycle = serde_json::from_value::<TurnLifecycleRecord>(event.payload.clone())
-                        .map_err(|_| SessionError::new("journal turn lifecycle is invalid"))?;
+                    let lifecycle =
+                        serde_json::from_value::<TurnLifecycleRecord>(event.payload.clone())
+                            .map_err(|_| SessionError::new("journal turn lifecycle is invalid"))?;
                     self.turn_lifecycle.push(lifecycle);
                 }
                 INTERRUPTION_KIND => {
-                    let interruption = serde_json::from_value::<InterruptionRecord>(event.payload.clone())
-                        .map_err(|_| SessionError::new("journal interruption is invalid"))?;
+                    let interruption =
+                        serde_json::from_value::<InterruptionRecord>(event.payload.clone())
+                            .map_err(|_| SessionError::new("journal interruption is invalid"))?;
                     self.history.push(SessionHistoryRecord::Interruption {
                         timestamp: event.timestamp_ms / 1000,
                         reason: interruption.reason,
