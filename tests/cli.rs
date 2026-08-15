@@ -25,6 +25,17 @@ struct MockServer {
 
 impl MockServer {
     fn start(responses: Vec<String>) -> Self {
+        let mut responses = responses.into_iter().peekable();
+        Self::start_responder(move |_, _| {
+            let response = responses.next()?;
+            let done = responses.peek().is_none();
+            Some((response, done))
+        })
+    }
+
+    fn start_responder(
+        mut responder: impl FnMut(usize, &str) -> Option<(String, bool)> + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock listener");
         listener
             .set_nonblocking(true)
@@ -35,14 +46,17 @@ impl MockServer {
         let requests = thread::spawn(move || {
             let deadline = Instant::now() + MOCK_SERVER_TIMEOUT;
             let mut request_bodies = Vec::new();
-            for response in responses {
+            loop {
                 let Some(stream) = accept_with_deadline(&listener, deadline, &server_shutdown)
                 else {
                     break;
                 };
                 let (mut stream, body) = read_request(stream, deadline);
+                let Some((response, done)) = responder(request_bodies.len(), &body) else {
+                    break;
+                };
                 request_bodies.push(body);
-                if !write_response(&mut stream, &response, deadline) {
+                if !write_response(&mut stream, &response, deadline) || done {
                     break;
                 }
             }
@@ -1974,6 +1988,34 @@ fn missing_resume_is_a_stderr_failure_without_protocol_leak() {
 }
 
 #[test]
+fn skill_command_writes_the_embedded_skill_exactly() {
+    let (home, project) = temporary_tree("skill-output");
+
+    let output = run_lucy(&home, &project, &["skill"], "");
+
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, include_bytes!("../skills/lucy/SKILL.md"));
+    assert!(output.stderr.is_empty());
+    assert!(!home.join(".config/lucy").exists());
+    assert!(!home.join(".lucy").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn skill_command_rejects_extra_arguments() {
+    let (home, project) = temporary_tree("skill-arguments");
+
+    let output = run_lucy(&home, &project, &["skill", "extra"], "");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"!: usage: lucy skill\n");
+    assert!(!home.join(".config/lucy").exists());
+    assert!(!home.join(".lucy").exists());
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
 fn unknown_cli_argument_diagnostic_does_not_echo_value_before_bootstrap() {
     let (home, project) = temporary_tree("unknown-argument");
     let output = run_lucy(&home, &project, &["--unknown=provider-secret"], "");
@@ -2423,5 +2465,239 @@ fn resumed_session_falls_back_to_invocation_cwd_without_rewriting_saved_cwd() {
     assert_eq!(header["cwd"], project.display().to_string());
 
     assert_eq!(server.join().len(), 2);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_text_outputs_only_the_final_completed_assistant_message() {
+    let server = MockServer::start(vec![tool_response(), normal_response("final answer")]);
+    let (home, project) = temporary_tree("exec-text");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(&home, &project, &["exec", "run the tool"], "");
+
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, b"final answer\n");
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+    assert_eq!(server.join().len(), 2);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_json_outputs_one_complete_result_object() {
+    let server = MockServer::start(vec![normal_response("json answer")]);
+    let (home, project) = temporary_tree("exec-json");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(
+        &home,
+        &project,
+        &["exec", "--output", "json", "answer once"],
+        "",
+    );
+
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+    let lines = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "stdout: {:?}", output.stdout);
+    assert!(lines[1].is_empty());
+    let result: Value = serde_json::from_slice(lines[0]).expect("exec result JSON");
+    assert_eq!(result["status"], "completed");
+    assert!(result["session_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(result["cwd"], project.display().to_string());
+    assert_eq!(result["saved_cwd"], project.display().to_string());
+    assert_eq!(result["cwd_fallback"], false);
+    assert_eq!(result["text"], "json answer");
+    assert_eq!(result.as_object().expect("object").len(), 6);
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_dash_reads_the_entire_prompt_from_stdin() {
+    let server = MockServer::start(vec![normal_response("stdin answer")]);
+    let (home, project) = temporary_tree("exec-stdin");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+    let prompt = "first line\nsecond line\n";
+
+    let output = run_lucy(&home, &project, &["exec", "-"], prompt);
+
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, b"stdin answer\n");
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+    let requests = server.join();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("first line\\nsecond line\\n"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_resumes_the_named_session() {
+    let server = MockServer::start(vec![
+        normal_response("first answer"),
+        normal_response("resumed answer"),
+    ]);
+    let (home, project) = temporary_tree("exec-resume");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+    let first = run_lucy(
+        &home,
+        &project,
+        &["exec", "--output", "json", "first prompt"],
+        "",
+    );
+    assert!(first.status.success(), "stderr: {:?}", first.stderr);
+    let first_result: Value = serde_json::from_slice(&first.stdout).expect("first result JSON");
+    let session_id = first_result["session_id"].as_str().expect("session id");
+
+    let resumed = run_lucy(
+        &home,
+        &project,
+        &["exec", "--session", session_id, "second prompt"],
+        "",
+    );
+
+    assert!(resumed.status.success(), "stderr: {:?}", resumed.stderr);
+    assert_eq!(resumed.stdout, b"resumed answer\n");
+    assert!(resumed.stderr.is_empty(), "stderr: {:?}", resumed.stderr);
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].contains("first prompt"));
+    assert!(requests[1].contains("first answer"));
+    assert!(requests[1].contains("second prompt"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_provider_failure_is_nonzero_and_keeps_stdout_empty() {
+    let server = MockServer::start(vec!["data: not-json\n\n".to_owned()]);
+    let (home, project) = temporary_tree("exec-provider-error");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(&home, &project, &["exec", "fail"], "");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(!output.stderr.is_empty());
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_turn_failure_is_nonzero_and_keeps_stdout_empty() {
+    let server = MockServer::start(vec![unknown_tool_response()]);
+    let (home, project) = temporary_tree("exec-turn-error");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(&home, &project, &["exec", "use another tool"], "");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(!output.stderr.is_empty());
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_delivers_queued_immediate_background_completion_follow_up() {
+    let tool_response = tool_response_with_arguments(
+        json!({
+            "command": "printf background-finished",
+            "background": true
+        })
+        .to_string(),
+        "call-exec-immediate-background",
+    );
+    let server = MockServer::start_responder(move |request_index, body| {
+        if request_index == 0 {
+            return Some((tool_response.clone(), false));
+        }
+        if body.contains("Lucy background command completed") {
+            return Some((normal_response("automatic-follow-up"), true));
+        }
+        Some((normal_response("foreground-finished"), false))
+    });
+    let (home, project) = temporary_tree("exec-immediate-background");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(&home, &project, &["exec", "start background work"], "");
+
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, b"automatic-follow-up\n");
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+    let requests = server.join();
+    assert!(matches!(requests.len(), 2 | 3));
+    assert!(requests
+        .last()
+        .expect("completion request")
+        .contains("Lucy background command completed"));
+    assert!(requests
+        .last()
+        .expect("completion request")
+        .contains("background-finished"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_waits_for_background_completion_and_outputs_its_follow_up() {
+    let server = MockServer::start(vec![
+        tool_response_with_arguments(
+            json!({
+                "command": "sleep 0.1; printf background-finished",
+                "background": true
+            })
+            .to_string(),
+            "call-exec-background",
+        ),
+        normal_response("foreground-finished"),
+        normal_response("automatic-follow-up"),
+    ]);
+    let (home, project) = temporary_tree("exec-background");
+    write_config(&home, &server.base_url, "base prompt", "mock-model");
+
+    let output = run_lucy(&home, &project, &["exec", "start background work"], "");
+
+    assert!(output.status.success(), "stderr: {:?}", output.stderr);
+    assert_eq!(output.stdout, b"automatic-follow-up\n");
+    assert!(output.stderr.is_empty(), "stderr: {:?}", output.stderr);
+    let requests = server.join();
+    assert!(matches!(requests.len(), 2 | 3));
+    assert!(requests
+        .last()
+        .expect("completion request")
+        .contains("Lucy background command completed"));
+    assert!(requests
+        .last()
+        .expect("completion request")
+        .contains("background-finished"));
+    fs::remove_dir_all(home).expect("cleanup");
+}
+
+#[test]
+fn exec_rejects_invalid_arguments_before_boot() {
+    let (home, project) = temporary_tree("exec-arguments");
+    let cases: &[&[&str]] = &[
+        &["exec"],
+        &["exec", "--output", "yaml", "prompt"],
+        &["exec", "--output"],
+        &["exec", "--session", "prompt"],
+        &["exec", "one", "two"],
+        &["exec", "--unknown", "prompt"],
+    ];
+
+    for args in cases {
+        let output = run_lucy(&home, &project, args, "");
+        assert!(!output.status.success(), "args: {args:?}");
+        assert!(output.stdout.is_empty(), "args: {args:?}");
+        assert!(!output.stderr.is_empty(), "args: {args:?}");
+        if args.contains(&"--unknown") {
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("--unknown"));
+        }
+    }
+    assert!(!home.join(".lucy/config.toml").exists());
     fs::remove_dir_all(home).expect("cleanup");
 }

@@ -30,6 +30,18 @@ The `lucy-cli` crate is also published on crates.io for Rust users:
 cargo install lucy-cli
 ```
 
+## External-harness skill
+
+The Lucy binary embeds [`skills/lucy/SKILL.md`](./skills/lucy/SKILL.md), an Agent Skill that teaches another coding harness to use `lucy exec` as a bounded external sub-agent. Choose the caller harness's global skill path, then install the embedded copy:
+
+```sh
+LUCY_SKILL_PATH=/absolute/path/from/your-harness-documentation/lucy/SKILL.md
+mkdir -p "$(dirname "$LUCY_SKILL_PATH")"
+lucy skill > "$LUCY_SKILL_PATH"
+```
+
+Global skill locations are harness-specific. From a source checkout, `cp skills/lucy/SKILL.md "$LUCY_SKILL_PATH"` installs the same file.
+
 Prebuilt archives are available from the [GitHub Releases](https://github.com/jwoo0122/lucy/releases) page. After extracting the archive, place the `lucy` executable on your `PATH`.
 
 On first run, Lucy creates `$XDG_CONFIG_HOME/lucy/config.toml` (or `~/.config/lucy/config.toml` when `XDG_CONFIG_HOME` is unset or empty). Existing `~/.lucy/config.toml` files are migrated once; sessions remain under `~/.lucy/sessions`. Set `llm.model` and choose either OpenRouter API-key authentication or Codex subscription authentication. Existing configs without `[auth]` continue to use the legacy OpenRouter-compatible settings.
