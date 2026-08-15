@@ -1,5 +1,6 @@
 mod base;
 
+use std::io;
 use std::ops::Deref;
 use std::path::Path;
 
@@ -81,29 +82,85 @@ fn contains_context_overflow(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-/// Provider facade that keeps normal request behavior in the established
-/// implementation while routing compaction through a provider-neutral plan.
-pub struct Provider(base::Provider);
+/// Provider facade. Legacy semantic-compaction helpers remain temporarily for
+/// old session tests, while normal requests can opt into deterministic Lucy 2
+/// projection with an observed model context window.
+pub struct Provider {
+    inner: base::Provider,
+    projection_context_window: Option<usize>,
+}
 
 impl Deref for Provider {
     type Target = base::Provider;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
 impl Provider {
     pub fn new(settings: &LlmSettings) -> Result<Self, ProviderError> {
-        base::Provider::new(settings).map(Self)
+        base::Provider::new(settings).map(|inner| Self {
+            inner,
+            projection_context_window: None,
+        })
     }
 
     pub fn new_codex(home: &Path, settings: &LlmSettings) -> Result<Self, ProviderError> {
-        base::Provider::new_codex(home, settings).map(Self)
+        base::Provider::new_codex(home, settings).map(|inner| Self {
+            inner,
+            projection_context_window: None,
+        })
     }
 
     pub(crate) fn with_session_id(self, session_id: &str) -> Self {
-        Self(self.0.with_session_id(session_id))
+        Self {
+            inner: self.inner.with_session_id(session_id),
+            projection_context_window: self.projection_context_window,
+        }
+    }
+
+    pub(crate) fn with_projection_context(mut self, context_window: Option<usize>) -> Self {
+        self.projection_context_window = context_window.filter(|window| *window > 0);
+        self
+    }
+
+    pub(crate) fn uses_projection(&self) -> bool {
+        self.projection_context_window.is_some()
+    }
+
+    fn projected_messages(&self, messages: &[ChatMessage]) -> Result<Vec<ChatMessage>, ProviderError> {
+        let Some(context_window) = self.projection_context_window else {
+            return Ok(messages.to_vec());
+        };
+        crate::projection::project_context(messages, context_window)
+            .map(|projection| projection.messages)
+            .map_err(ProviderError::new)
+    }
+
+    pub fn stream_chat(
+        &self,
+        messages: &[ChatMessage],
+        on_delta: &mut dyn FnMut(&str) -> io::Result<()>,
+    ) -> Result<ProviderTurn, ProviderError> {
+        let messages = self.projected_messages(messages)?;
+        self.inner.stream_chat(&messages, on_delta)
+    }
+
+    pub(crate) fn stream_chat_cancellable_with_options_and_events(
+        &self,
+        messages: &[ChatMessage],
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> io::Result<()>,
+        cancellation: &CancellationToken,
+        include_tools: bool,
+    ) -> Result<ProviderTurn, ProviderError> {
+        let messages = self.projected_messages(messages)?;
+        self.inner.stream_chat_cancellable_with_options_and_events(
+            &messages,
+            on_event,
+            cancellation,
+            include_tools,
+        )
     }
 
     pub(crate) fn summarize_prepared(
@@ -116,7 +173,7 @@ impl Provider {
             .map_err(ProviderError::new)?;
         let mut attempts = attempts.into_iter().peekable();
         while let Some(attempt) = attempts.next() {
-            match self.0.summarize(&attempt, cancellation) {
+            match self.inner.summarize(&attempt, cancellation) {
                 Err(error)
                     if error.kind() == ProviderFailureKind::ContextOverflow
                         && attempts.peek().is_some() =>
