@@ -53,10 +53,7 @@ pub fn causal_events<'a>(
 /// Decode only exact message events from a causal chain. Non-message events
 /// remain part of the journal's provenance but do not become provider messages
 /// unless an explicit projection policy chooses to represent them.
-pub fn causal_messages(
-    events: &[JournalEvent],
-    head_id: &str,
-) -> Result<Vec<ChatMessage>, String> {
+pub fn causal_messages(events: &[JournalEvent], head_id: &str) -> Result<Vec<ChatMessage>, String> {
     causal_events(events, head_id)?
         .into_iter()
         .filter(|event| event.kind == MESSAGE_EVENT_KIND)
@@ -167,6 +164,9 @@ mod tests {
         let event = message_event(original.clone()).expect("event");
 
         assert_eq!(event.kind, MESSAGE_EVENT_KIND);
-        assert_eq!(causal_messages(&[event.clone()], &event.id).expect("decode"), vec![original]);
+        assert_eq!(
+            causal_messages(&[event.clone()], &event.id).expect("decode"),
+            vec![original]
+        );
     }
 }
