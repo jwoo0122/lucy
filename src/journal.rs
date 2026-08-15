@@ -32,6 +32,8 @@ pub struct JournalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub payload: Value,
 }
@@ -51,6 +53,7 @@ impl JournalEvent {
             parent_id: None,
             run_id: None,
             surface: None,
+            source_id: None,
             cwd: None,
             payload,
         })
@@ -345,6 +348,14 @@ mod tests {
         assert!(object.contains_key("timestamp_ms"));
         assert!(object.contains_key("kind"));
         assert!(object.contains_key("payload"));
+    }
+
+    #[test]
+    fn old_records_without_source_id_remain_readable() {
+        let encoded = br#"{"schema_version":1,"id":"evt-old","timestamp_ms":1,"kind":"message","surface":"tui","payload":{}}"#;
+        let event = serde_json::from_slice::<JournalEvent>(encoded).expect("legacy event");
+        assert_eq!(event.source_id, None);
+        assert_eq!(event.surface.as_deref(), Some("tui"));
     }
 
     #[test]
