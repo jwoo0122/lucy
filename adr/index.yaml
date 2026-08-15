@@ -223,8 +223,8 @@ decisions:
     scope: harness
     decision_type: lifecycle
     summary: Lucy persists named JSONL sessions with a fail-fast OS-backed single-writer
-      lease and preserves preview, cwd, interruption, compaction, and boot-context
-      state.
+      lease, while normal provider context pressure is handled by deterministic projection
+      and legacy compaction records remain readable compatibility state.
     applies_to:
       - src/**
       - tests/**
@@ -244,10 +244,10 @@ decisions:
       - invariant: fail-fast-single-writer-lease
         kind: executable
         check: rust-tests
-      - invariant: append-only-compaction-records
+      - invariant: deterministic-provider-projection
         kind: executable
         check: rust-tests
-      - invariant: latest-compaction-boundary
+      - invariant: legacy-compaction-read-compatibility
         kind: executable
         check: rust-tests
       - invariant: ordered-interruption-records
