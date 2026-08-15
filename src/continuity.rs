@@ -56,19 +56,10 @@ impl<'a> AttentionView<'a> {
 mod tests {
     use super::*;
 
-    fn append_next(
-        events: &mut Vec<JournalEvent>,
-        surface: &str,
-        source_id: &str,
-        text: &str,
-    ) {
+    fn append_next(events: &mut Vec<JournalEvent>, surface: &str, source_id: &str, text: &str) {
         let view = AttentionView::new(events);
         let event = view
-            .next_message(
-                ChatMessage::user(text.to_owned()),
-                surface,
-                source_id,
-            )
+            .next_message(ChatMessage::user(text.to_owned()), surface, source_id)
             .expect("next message");
         events.push(event);
     }
