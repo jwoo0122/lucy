@@ -9,6 +9,7 @@ pub mod context;
 pub(crate) mod context_budget;
 pub mod gateway;
 pub(crate) mod intra_turn;
+pub mod journal;
 pub mod model;
 pub mod protocol;
 pub mod provider;
