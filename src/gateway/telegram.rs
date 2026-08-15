@@ -84,6 +84,7 @@ pub fn run() -> Result<(), String> {
         let updates = get_updates(&client, &token, state.next_update_id)?;
         for update in updates {
             let next_update_id = update.update_id.saturating_add(1);
+            let mut reply = None;
             if let Some(message) = update.message {
                 if let Some(text) = message.text.filter(|text| !text.trim().is_empty()) {
                     let chat_key = message.chat.id.to_string();
@@ -91,21 +92,27 @@ pub fn run() -> Result<(), String> {
                     match run_lucy_turn(&home, &cwd, previous_session, &text) {
                         Ok(result) => {
                             state.chats.insert(chat_key, result.session_id);
-                            send_message(&client, &token, message.chat.id, &result.text)?;
+                            reply = Some((message.chat.id, result.text));
                         }
                         Err(_) => {
-                            send_message(
-                                &client,
-                                &token,
+                            reply = Some((
                                 message.chat.id,
-                                "Lucy could not complete that turn.",
-                            )?;
+                                "Lucy could not complete that turn.".to_owned(),
+                            ));
                         }
                     }
                 }
             }
+
+            // A completed model turn may have side effects. Advance the Telegram
+            // cursor before attempting delivery so a send failure cannot cause the
+            // same update to execute twice after restart.
             state.next_update_id = Some(next_update_id);
             save_state(&state_path, &state)?;
+
+            if let Some((chat_id, text)) = reply {
+                send_message(&client, &token, chat_id, &text)?;
+            }
         }
     }
 }
@@ -171,9 +178,8 @@ fn get_updates(
     token: &str,
     next_update_id: Option<i64>,
 ) -> Result<Vec<TelegramUpdate>, String> {
-    let url = telegram_method_url(token, "getUpdates");
     let response = client
-        .post(url)
+        .post(telegram_method_url(token, "getUpdates"))
         .json(&json!({
             "offset": next_update_id.unwrap_or(0),
             "timeout": LONG_POLL_SECONDS,
@@ -267,11 +273,14 @@ fn telegram_method_url(token: &str, method: &str) -> String {
 fn split_telegram_text(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_len = 0;
     for ch in text.chars() {
-        if current.chars().count() == TELEGRAM_TEXT_LIMIT {
+        if current_len == TELEGRAM_TEXT_LIMIT {
             chunks.push(std::mem::take(&mut current));
+            current_len = 0;
         }
         current.push(ch);
+        current_len += 1;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -302,10 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn telegram_urls_are_only_constructed_at_request_time() {
+    fn telegram_method_url_has_expected_shape() {
         assert_eq!(
-            telegram_method_url("123:secret", "getUpdates"),
-            "https://api.telegram.org/bot123:secret/getUpdates"
+            telegram_method_url("test-token", "getUpdates"),
+            "https://api.telegram.org/bottest-token/getUpdates"
         );
     }
 }
