@@ -2552,7 +2552,7 @@ fn draw(frame: &mut Frame<'_>, state: &UiState) {
 
     let effort = state.effort.as_deref().unwrap_or("default");
     frame.render_widget(
-        Paragraph::new(model_status_line(state, effort, status_area.width)),
+        Paragraph::new(model_status_line(state, effort)),
         status_area,
     );
 
@@ -3816,42 +3816,6 @@ fn info_style(palette: UiPalette) -> Style {
     Style::default().fg(palette.muted_text)
 }
 
-fn context_status_text(state: &UiState) -> String {
-    let used = format_context_tokens(state.context_tokens);
-    let Some(window) = state.context_window else {
-        return format!("Context: {used}/? (?%) ??????????");
-    };
-    let percentage = context_percentage(state.context_tokens, window);
-    format!(
-        "Context: {used}/{} ({percentage}%) {}",
-        format_context_tokens(window),
-        context_progress_bar(state.context_tokens, window)
-    )
-}
-
-fn context_progress_bar(used: usize, window: usize) -> String {
-    const WIDTH: usize = 10;
-    let filled = if window == 0 {
-        0
-    } else {
-        (used as u128 * WIDTH as u128)
-            .div_ceil(window as u128)
-            .min(WIDTH as u128) as usize
-    };
-    format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
-}
-
-fn context_status_style(_state: &UiState) -> Style {
-    Style::default().fg(CONSOLE_STATUS_COLOR)
-}
-
-fn context_percentage(used: usize, window: usize) -> usize {
-    if window == 0 {
-        return 0;
-    }
-    ((used as u128 * 100).div_ceil(window as u128)) as usize
-}
-
 fn format_context_tokens(tokens: usize) -> String {
     if tokens >= 1_000_000 {
         format!("{:.2}M", tokens as f64 / 1_000_000.0)
@@ -3862,31 +3826,23 @@ fn format_context_tokens(tokens: usize) -> String {
     }
 }
 
-fn model_status_line(state: &UiState, effort: &str, width: u16) -> Line<'static> {
+fn model_status_line(state: &UiState, effort: &str) -> Line<'static> {
     model_status_line_at(
         state,
         effort,
         state.console_animation_elapsed_at(Instant::now()),
-        width,
     )
 }
 
-fn model_status_line_at(
-    state: &UiState,
-    effort: &str,
-    elapsed: Duration,
-    width: u16,
-) -> Line<'static> {
+fn model_status_line_at(state: &UiState, effort: &str, elapsed: Duration) -> Line<'static> {
     let model = redact_secret(&state.model, Some(&state.secret));
     let effort = redact_secret(effort, Some(&state.secret));
-    let context = context_status_text(state);
-    let context_width = UnicodeWidthStr::width(context.as_str());
+    let status_style = Style::default().fg(CONSOLE_STATUS_COLOR);
     let model_style = if state.busy {
         Style::default().fg(console_accent_at(elapsed))
     } else {
-        context_status_style(state)
+        status_style
     };
-    let status_style = context_status_style(state);
     let mut spans = vec![
         Span::styled(model, model_style),
         Span::styled(format!(" · {effort}"), status_style),
@@ -3908,15 +3864,6 @@ fn model_status_line_at(
             ));
         }
     }
-    let left_width = spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum::<usize>();
-    let gap = usize::from(width).saturating_sub(left_width + context_width);
-    if gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-    }
-    spans.push(Span::styled(context, status_style));
     Line::from(spans)
 }
 
@@ -4437,68 +4384,6 @@ mod tests {
     }
 
     #[test]
-    fn context_status_shows_used_window_and_percentage_in_uniform_gray() {
-        let mut state =
-            UiState::from_history(&[], "current-session", "secret", "model", None, false)
-                .with_context(Some(100_000), 80_000);
-
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 80.0K/100.0K (80%) ████████░░"
-        );
-        assert_eq!(
-            context_status_style(&state).fg,
-            Some(Color::Rgb(144, 144, 148))
-        );
-
-        state.context_tokens = 80_001;
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 80.0K/100.0K (81%) █████████░"
-        );
-        assert_eq!(
-            context_status_style(&state).fg,
-            Some(Color::Rgb(144, 144, 148)),
-            "crossing the compaction threshold does not recolor the status line"
-        );
-    }
-
-    #[test]
-    fn context_status_keeps_percentage_consistent_at_capacity() {
-        let mut state =
-            UiState::from_history(&[], "current-session", "secret", "model", None, false)
-                .with_context(Some(100_000), 99_001);
-
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 99.0K/100.0K (100%) ██████████"
-        );
-
-        state.context_tokens = 100_000;
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 100.0K/100.0K (100%) ██████████"
-        );
-
-        state.context_tokens = 100_001;
-        assert_eq!(
-            context_status_text(&state),
-            "Context: 100.0K/100.0K (101%) ██████████"
-        );
-    }
-
-    #[test]
-    fn context_status_handles_unknown_window_without_highlighting() {
-        let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
-
-        assert_eq!(context_status_text(&state), "Context: 1/? (?%) ??????????");
-        assert_eq!(
-            context_status_style(&state).fg,
-            Some(Color::Rgb(144, 144, 148))
-        );
-    }
-
-    #[test]
     fn tui_viewport_reserves_one_column_on_each_side_when_possible() {
         assert_eq!(
             tui_viewport(Rect::new(0, 0, 80, 10)),
@@ -4577,7 +4462,7 @@ mod tests {
     }
 
     #[test]
-    fn context_status_is_right_aligned_in_uniform_gray() {
+    fn model_status_omits_context_usage() {
         let state = UiState::from_history(&[], "current-session", "secret", "model", None, false)
             .with_context(Some(100), 81);
         let mut terminal =
@@ -4589,22 +4474,11 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let status_area = ui_layout(&state, tui_viewport(Rect::new(0, 0, 80, 10))).5;
-        let expected_context = "Context: 81/100 (81%) █████████░";
         let rendered = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert!(rendered.ends_with(expected_context));
-        assert_eq!(
-            buffer[(status_area.x + status_area.width - 1, status_area.y)].symbol(),
-            "░",
-            "context is not pushed to the right edge"
-        );
-        assert!(rendered.starts_with("model · default"));
-        for x in status_area.x..status_area.x + status_area.width {
-            if buffer[(x, status_area.y)].symbol() != " " {
-                assert_eq!(buffer[(x, status_area.y)].fg, CONSOLE_STATUS_COLOR);
-            }
-        }
+        assert_eq!(rendered.trim_end(), "model · default");
+        assert!(!rendered.contains("Context:"));
     }
 
     #[test]
@@ -4612,8 +4486,8 @@ mod tests {
         let mut state =
             UiState::from_history(&[], "current-session", "secret", "model", None, false);
         state.busy = true;
-        let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
-        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
+        let start = model_status_line_at(&state, "default", Duration::ZERO);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2);
         let start_accent = console_accent_at(Duration::ZERO);
         let middle_accent = console_accent_at(console_accent_cycle() / 2);
 
@@ -4624,17 +4498,13 @@ mod tests {
         assert_eq!(start.spans[2].content, " ");
         assert_eq!(start.spans[3].content, BUSY_INDICATOR_BLOCK.to_string());
         assert_eq!(start.spans[3].style.fg, Some(start_accent));
-        assert_eq!(
-            start.spans.last().unwrap().style.fg,
-            Some(CONSOLE_STATUS_COLOR)
-        );
     }
 
     #[test]
     fn idle_model_status_has_no_busy_indicator() {
         let state = UiState::from_history(&[], "current-session", "secret", "model", None, false);
-        let start = model_status_line_at(&state, "default", Duration::ZERO, 80);
-        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2, 80);
+        let start = model_status_line_at(&state, "default", Duration::ZERO);
+        let middle = model_status_line_at(&state, "default", console_accent_cycle() / 2);
 
         assert_eq!(start.spans[0].content, "model");
         assert_eq!(middle.spans[0].content, "model");
@@ -6153,13 +6023,12 @@ mod tests {
             .expect("draw ready status");
         let viewport = tui_viewport(area);
         let status_area = ui_layout(&state, viewport).5;
-        let expected_context = "Context: 81/100 (81%) █████████░";
         let buffer = terminal.backend().buffer();
         let idle_row = (status_area.x..status_area.x + status_area.width)
             .map(|x| buffer[(x, status_area.y)].symbol())
             .collect::<String>();
-        assert!(idle_row.starts_with("model · default"));
-        assert!(idle_row.ends_with(expected_context));
+        assert_eq!(idle_row.trim_end(), "model · default");
+        assert!(!idle_row.contains("Context:"));
         for x in status_area.x..status_area.x + status_area.width {
             if buffer[(x, status_area.y)].symbol() != " " {
                 assert_eq!(buffer[(x, status_area.y)].fg, Color::Rgb(144, 144, 148));
@@ -6180,7 +6049,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.starts_with("model · default "));
         assert!(rendered.contains(BUSY_INDICATOR_BLOCK));
-        assert!(rendered.ends_with(expected_context));
+        assert!(!rendered.contains("Context:"));
     }
 
     #[test]

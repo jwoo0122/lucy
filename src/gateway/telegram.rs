@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ const TOKEN_ENV: &str = "TELEGRAM_BOT_TOKEN";
 const API_BASE: &str = "https://api.telegram.org";
 const LONG_POLL_SECONDS: u64 = 30;
 const REQUEST_TIMEOUT_SECONDS: u64 = 45;
+const TYPING_REFRESH_SECONDS: u64 = 4;
+const CHAT_ACTION_TIMEOUT_SECONDS: u64 = 2;
 const TELEGRAM_TEXT_LIMIT: usize = 4096;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -89,7 +92,10 @@ pub fn run() -> Result<(), String> {
                 if let Some(text) = message.text.filter(|text| !text.trim().is_empty()) {
                     let chat_key = message.chat.id.to_string();
                     let previous_session = state.chats.get(&chat_key).map(String::as_str);
-                    match run_lucy_turn(&home, &cwd, previous_session, &text) {
+                    let result = run_with_typing(&client, &token, message.chat.id, || {
+                        run_lucy_turn(&home, &cwd, previous_session, &text)
+                    });
+                    match result {
                         Ok(result) => {
                             state.chats.insert(chat_key, result.session_id);
                             reply = Some((message.chat.id, result.text));
@@ -205,6 +211,72 @@ fn get_updates(
     Ok(payload.result)
 }
 
+fn send_chat_action(client: &Client, token: &str, chat_id: i64) -> Result<(), String> {
+    let response = client
+        .post(telegram_method_url(token, "sendChatAction"))
+        .json(&json!({
+            "chat_id": chat_id,
+            "action": "typing",
+        }))
+        .timeout(Duration::from_secs(CHAT_ACTION_TIMEOUT_SECONDS))
+        .send()
+        .map_err(|_| "Telegram sendChatAction request failed".to_owned())?;
+    if !response.status().is_success() {
+        return Err("Telegram sendChatAction request failed".to_owned());
+    }
+    let payload = response
+        .json::<BasicResponse>()
+        .map_err(|_| "invalid Telegram sendChatAction response".to_owned())?;
+    if !payload.ok {
+        return Err("Telegram sendChatAction request failed".to_owned());
+    }
+    Ok(())
+}
+
+fn run_with_typing<T, F>(client: &Client, token: &str, chat_id: i64, turn: F) -> Result<T, String>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, String> + Send,
+{
+    std::thread::scope(|scope| {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let handle = scope.spawn(move || {
+            let _ = result_tx.send(turn());
+        });
+        let result = wait_with_periodic_action(
+            &result_rx,
+            Duration::from_secs(TYPING_REFRESH_SECONDS),
+            || send_chat_action(client, token, chat_id),
+        );
+        handle.join().map_err(|_| "Lucy turn failed".to_owned())?;
+        result
+    })
+}
+
+fn wait_with_periodic_action<T, F>(
+    result_rx: &mpsc::Receiver<Result<T, String>>,
+    interval: Duration,
+    mut action: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    loop {
+        // Chat actions are ephemeral transport hints. Failure must not change the
+        // model turn result or suppress the eventual reply.
+        let refresh_started = Instant::now();
+        let _ = action();
+        let wait = interval.saturating_sub(refresh_started.elapsed());
+        match result_rx.recv_timeout(wait) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Lucy turn failed".to_owned());
+            }
+        }
+    }
+}
+
 fn send_message(client: &Client, token: &str, chat_id: i64, text: &str) -> Result<(), String> {
     let text = if text.is_empty() {
         "(empty response)"
@@ -317,5 +389,29 @@ mod tests {
             telegram_method_url("test-token", "getUpdates"),
             "https://api.telegram.org/bottest-token/getUpdates"
         );
+    }
+
+    #[test]
+    fn periodic_action_runs_immediately_and_refreshes_until_result() {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let mut calls = 0;
+
+        let result = wait_with_periodic_action(
+            &result_rx,
+            Duration::from_millis(1),
+            || -> Result<(), String> {
+                calls += 1;
+                if calls == 2 {
+                    result_tx
+                        .send(Ok("completed"))
+                        .expect("result receiver remains open");
+                }
+                Err("typing is best effort".to_owned())
+            },
+        )
+        .expect("typing failure must not fail the turn");
+
+        assert_eq!(result, "completed");
+        assert_eq!(calls, 2);
     }
 }
