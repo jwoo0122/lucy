@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::config_dir;
 
-const BUILT_IN_SYSTEM_PROMPT: &str = "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, use cmd to read a relevant skill's SKILL.md.";
+const BUILT_IN_SYSTEM_PROMPT: &str =
+    "When needed, look for relevant skills in appropriate directories.";
 
 #[derive(Debug)]
 pub struct ContextError(String);
@@ -112,7 +113,7 @@ pub(crate) fn resolve_boot_context_with_api_key_env(
         discover_skills(&directory.join(".agents").join("skills"), &mut skills)?;
     }
     let skills = skills.into_values().collect::<Vec<_>>();
-    let system_prompt = build_system_prompt(&cwd, &instruction_files, &readme_files, &skills);
+    let system_prompt = build_system_prompt(&cwd, &instruction_files, &readme_files);
 
     Ok(BootContext {
         system_prompt,
@@ -294,21 +295,19 @@ fn preferred_instruction(directory: &Path) -> Result<Option<InstructionSource>, 
         return Ok(None);
     };
 
-    for name in [OsStr::new("AGENTS.md"), OsStr::new("CLAUDE.md")] {
-        let Some(file) = directory_fd
-            .open_instruction_file(name)
-            .map_err(|_error| ContextError::new("unable to inspect instruction context"))?
-        else {
-            continue;
-        };
-        let contents = read_open_file(file)
-            .map_err(|_error| ContextError::new("unable to read instruction context"))?;
-        return Ok(Some(InstructionSource {
-            path: directory.join(name),
-            contents,
-        }));
-    }
-    Ok(None)
+    let name = OsStr::new("AGENTS.md");
+    let Some(file) = directory_fd
+        .open_instruction_file(name)
+        .map_err(|_error| ContextError::new("unable to inspect instruction context"))?
+    else {
+        return Ok(None);
+    };
+    let contents = read_open_file(file)
+        .map_err(|_error| ContextError::new("unable to read instruction context"))?;
+    Ok(Some(InstructionSource {
+        path: directory.join(name),
+        contents,
+    }))
 }
 
 const README_CHAR_LIMIT: usize = 1000;
@@ -497,26 +496,18 @@ fn parse_scalar(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
-/// Keep metadata in the XML-shaped progressive-disclosure catalog from
-/// changing its structure. Full skill contents are intentionally not escaped:
-/// they are loaded only when a skill is selected as instructions.
-fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('\"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn build_system_prompt(
     cwd: &Path,
     instruction_files: &[InstructionSource],
     readme_files: &[InstructionSource],
-    skills: &[SkillEntry],
 ) -> String {
     let mut sections = vec![BUILT_IN_SYSTEM_PROMPT.to_owned()];
     sections.push(format!("## Working directory\n{}", cwd.display()));
-    for instruction in instruction_files {
+    sections.push(format!("## Operating system\n{}", std::env::consts::OS));
+    for instruction in instruction_files
+        .iter()
+        .filter(|instruction| instruction.path.file_name() == Some(OsStr::new("AGENTS.md")))
+    {
         sections.push(format!(
             "## Instructions from {}\n{}",
             instruction.path.display(),
@@ -529,23 +520,6 @@ fn build_system_prompt(
             readme.path.display(),
             readme.contents.trim_end()
         ));
-    }
-    let invocable_skills = skills
-        .iter()
-        .filter(|skill| skill.model_invocable)
-        .collect::<Vec<_>>();
-    if !invocable_skills.is_empty() {
-        let mut catalog = String::from("<available_skills>\n");
-        for skill in invocable_skills {
-            catalog.push_str(&format!(
-                "<skill>\n<name>{}</name>\n<description>{}</description>\n<location>{}</location>\n</skill>\n",
-                escape_xml(&skill.name),
-                escape_xml(&skill.description),
-                escape_xml(&skill.path.display().to_string())
-            ));
-        }
-        catalog.push_str("</available_skills>");
-        sections.push(catalog);
     }
     sections.join("\n\n")
 }
@@ -623,7 +597,7 @@ mod tests {
         .expect("nested skill");
 
         let context = resolve_boot_context(&home, &cwd).expect("context");
-        assert_eq!(context.instruction_files.len(), 3);
+        assert_eq!(context.instruction_files.len(), 2);
         assert_eq!(
             context.instruction_files[0].path,
             config_dir(&home).join("AGENTS.md")
@@ -634,18 +608,20 @@ mod tests {
         assert!(context.instruction_files[1]
             .contents
             .contains("root agents"));
-        assert!(context.instruction_files[2]
-            .contents
-            .contains("nested claude"));
+        assert!(context.system_prompt.contains("global agents"));
+        assert!(context.system_prompt.contains("root agents"));
         assert!(!context.system_prompt.contains("root claude"));
-        assert!(context.system_prompt.contains("root description"));
+        assert!(!context.system_prompt.contains("nested claude"));
+        assert!(!context.system_prompt.contains("root description"));
         assert!(!context.system_prompt.contains("global description"));
-        assert!(context.system_prompt.contains("nested description"));
-        assert!(context
+        assert!(!context.system_prompt.contains("nested description"));
+        assert!(!context
             .system_prompt
             .contains(&nested_skill.display().to_string()));
         assert!(!context.system_prompt.contains("# nested"));
         assert!(context.system_prompt.contains("## Working directory"));
+        assert!(context.system_prompt.contains("## Operating system"));
+        assert!(context.system_prompt.contains(std::env::consts::OS));
         assert!(context
             .system_prompt
             .contains(&context.cwd.display().to_string()));
@@ -794,9 +770,9 @@ mod tests {
             .system_prompt
             .contains("symlinked project instructions"));
         assert!(!context.system_prompt.contains("real global instructions"));
-        assert!(context.system_prompt.contains("linked-directory"));
-        assert!(context.system_prompt.contains("linked-file"));
-        assert!(context.system_prompt.contains("project-only"));
+        assert!(!context.system_prompt.contains("linked-directory"));
+        assert!(!context.system_prompt.contains("linked-file"));
+        assert!(!context.system_prompt.contains("project-only"));
 
         fs::remove_dir_all(home).expect("remove tree");
     }
@@ -842,16 +818,6 @@ mod tests {
             parse_skill_frontmatter("---\nname: Invalid_Skill\ndescription: invalid\n---\n")
                 .is_none()
         );
-        let hidden = SkillEntry {
-            name: "private-skill".to_owned(),
-            description: "hidden from automatic selection".to_owned(),
-            path: PathBuf::from("/skills/private/SKILL.md"),
-            contents: "instructions".to_owned(),
-            model_invocable: false,
-        };
-        let prompt = build_system_prompt(Path::new("/"), &[], &[], &[hidden]);
-        assert!(!prompt.contains("private-skill"));
-        assert_eq!(escape_xml("a<&>\"'"), "a&lt;&amp;&gt;&quot;&apos;");
     }
 
     #[test]
