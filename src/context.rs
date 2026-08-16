@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::config_dir;
 
 const BUILT_IN_SYSTEM_PROMPT: &str =
-    "When needed, look for relevant skills in appropriate directories.";
+    "You can access computer resources. Use the provided tools to achieve the user's requirements. When needed, look for relevant skills in appropriate directories.";
 
 #[derive(Debug)]
 pub struct ContextError(String);
