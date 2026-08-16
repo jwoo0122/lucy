@@ -236,7 +236,7 @@ decisions:
       - harness.configuration-and-provider
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-08-15'
+    last_reviewed: '2026-08-20'
     enforcement:
       - invariant: complete-session-records
         kind: executable
@@ -262,7 +262,7 @@ decisions:
       - invariant: historical-prompt-on-resume
         kind: executable
         check: rust-tests
-      - invariant: metadata-only-skill-catalog
+      - invariant: minimal-new-session-context
         kind: executable
         check: rust-tests
       - invariant: bounded-symlinked-skill-discovery

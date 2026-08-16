@@ -58,7 +58,7 @@ const MAX_DISPLAY_INPUT_CHARS: usize = 16 * 1024;
 /// Maximum number of wrapped input rows the input box grows to before it
 /// stops expanding and scrolls its contents internally.
 const MAX_INPUT_ROWS: u16 = 12;
-const TUI_MAX_WIDTH: u16 = 100;
+const TUI_MAX_WIDTH: u16 = 150;
 const WELCOME_MESSAGE: &str = "Coding Agent Harness LUCY";
 const WELCOME_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const WELCOME_TAGLINE: &str = "An ultra-thin harness for tomorrow's most powerful models";
@@ -4512,13 +4512,13 @@ mod tests {
     }
 
     #[test]
-    fn tui_viewport_caps_at_one_hundred_columns_and_centers_it() {
+    fn tui_viewport_caps_at_one_hundred_fifty_columns_and_centers_it() {
         assert_eq!(
-            tui_viewport(Rect::new(0, 0, 140, 10)),
-            Rect::new(20, 0, TUI_MAX_WIDTH, 10)
+            tui_viewport(Rect::new(0, 0, 200, 10)),
+            Rect::new(25, 0, TUI_MAX_WIDTH, 10)
         );
         assert_eq!(
-            tui_viewport(Rect::new(0, 0, 103, 10)),
+            tui_viewport(Rect::new(0, 0, 153, 10)),
             Rect::new(1, 0, TUI_MAX_WIDTH, 10),
             "an odd remaining column stays on the right"
         );

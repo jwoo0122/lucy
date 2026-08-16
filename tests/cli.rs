@@ -724,7 +724,9 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
     let session_bytes = fs::read_to_string(session_file).expect("session contents");
     assert!(!session_bytes.contains("provider-secret"));
     assert!(!session_bytes.contains("base prompt"));
-    assert!(session_bytes.contains("You can access computer resources"));
+    assert!(
+        session_bytes.contains("When needed, look for relevant skills in appropriate directories")
+    );
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -938,7 +940,9 @@ fn legacy_configured_prompt_is_absent_from_new_request_and_session() {
     let requests = server.join();
     assert_eq!(requests.len(), 1);
     assert!(!requests[0].contains(legacy_sentinel));
-    assert!(requests[0].contains("You can access computer resources"));
+    assert!(
+        requests[0].contains("When needed, look for relevant skills in appropriate directories")
+    );
 
     let session_file = fs::read_dir(home.join(".lucy/sessions"))
         .expect("sessions")
@@ -948,7 +952,7 @@ fn legacy_configured_prompt_is_absent_from_new_request_and_session() {
         .path();
     let session = fs::read_to_string(session_file).expect("session contents");
     assert!(!session.contains(legacy_sentinel));
-    assert!(session.contains("You can access computer resources"));
+    assert!(session.contains("When needed, look for relevant skills in appropriate directories"));
 
     fs::remove_dir_all(home).expect("cleanup");
 }
@@ -2067,10 +2071,10 @@ fn skill_commands_discover_recursively_and_inject_a_snapshot_with_arguments() {
     assert_eq!(requests.len(), 1);
     let request: Value = serde_json::from_str(&requests[0]).expect("provider request");
     let messages = request["messages"].as_array().expect("messages");
-    assert!(messages[0]["content"]
-        .as_str()
-        .expect("system prompt")
-        .contains("<name>release-notes</name>"));
+    let system_prompt = messages[0]["content"].as_str().expect("system prompt");
+    assert!(!system_prompt.contains("release-notes"));
+    assert!(!system_prompt.contains("Write concise release notes."));
+    assert!(!system_prompt.contains(&skill.display().to_string()));
     let skill_message = messages.last().expect("skill message")["content"]
         .as_str()
         .expect("skill contents");
@@ -2233,7 +2237,9 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     assert!(requests[1].contains("first request"));
     assert!(requests[1].contains("second request"));
     assert!(requests[1].contains(historical_prompt));
-    assert!(!requests[1].contains("You can access computer resources"));
+    assert!(
+        !requests[1].contains("When needed, look for relevant skills in appropriate directories")
+    );
     let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
     let tools = resumed_request["tools"].as_array().expect("model tools");
     assert_eq!(tools.len(), 1);
