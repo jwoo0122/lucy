@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.15.3](https://github.com/jwoo0122/lucy/compare/v1.15.2...v1.15.3) - 2026-08-16
+
+### Fixed
+
+- Reduce boot context and widen TUI ([#112](https://github.com/jwoo0122/lucy/pull/112))
+
 ## [1.15.2](https://github.com/jwoo0122/lucy/compare/v1.15.1...v1.15.2) - 2026-08-15
 
 ### Fixed
