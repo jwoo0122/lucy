@@ -14,7 +14,7 @@ constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
-last_reviewed: '2026-08-15'
+last_reviewed: '2026-10-31'
 enforcement:
 - invariant: jsonl-record-framing
   kind: executable
