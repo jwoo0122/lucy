@@ -240,7 +240,7 @@ fn chat_request(
         "stream": true,
     });
     if include_tools {
-        let tools = vec![json!({
+        let mut tools = vec![json!({
             "type": "function",
             "function": {
                 "name": "cmd",
@@ -248,6 +248,7 @@ fn chat_request(
                 "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "background": {"type": "boolean", "default": false}}, "required": ["command"], "additionalProperties": false}
             }
         })];
+        tools.push(json!({"type":"function","function":{"name":"desktop","description":crate::desktop::DESCRIPTION,"parameters":crate::desktop::parameters()}}));
         request["tools"] = Value::Array(tools);
     } else {
         request["max_tokens"] = json!(COMPACTION_MAX_SUMMARY_TOKENS);
@@ -1308,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_requests_expose_only_cmd() {
+    fn normal_requests_expose_cmd_and_desktop() {
         let request = chat_request(
             "model",
             &[ChatMessage::user("hello".to_owned())],
@@ -1318,7 +1319,12 @@ mod tests {
             None,
         );
         let tools = request["tools"].as_array().expect("model tools");
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["function"]["name"], "desktop");
+        assert_eq!(
+            tools[1]["function"]["parameters"],
+            crate::desktop::parameters()
+        );
         assert_eq!(tools[0]["function"]["name"], "cmd");
         let background = &tools[0]["function"]["parameters"]["properties"]["background"];
         assert_eq!(background["type"], "boolean");

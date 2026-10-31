@@ -14,7 +14,7 @@
 
 ## Project purpose
 
-Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects an OpenAI-compatible Chat Completions provider or a Codex subscription provider and exposes a model-facing `cmd` tool, with both an interactive TUI and a JSONL session interface for automation powered by the same turn engine.
+Lucy is a lightweight local coding-agent harness for macOS and Linux. It connects an OpenAI-compatible Chat Completions provider or a Codex subscription provider and exposes model-facing `cmd` and `desktop` tools, with both an interactive TUI and a JSONL session interface for automation powered by the same turn engine.
 
 ## Installation
 
@@ -29,6 +29,44 @@ The `lucy-cli` crate is also published on crates.io for Rust users:
 ```sh
 cargo install lucy-cli
 ```
+
+## Desktop tool
+
+Lucy embeds Vercel Labs' [agent-desktop](https://github.com/vercel-labs/agent-desktop)
+v1.0.2 and its platform helpers. Both providers expose `desktop` alongside `cmd`;
+no separate agent-desktop installation or runtime download is needed.
+
+The model supplies an argument array, not a shell command:
+
+```json
+{"args":["skills","get","desktop"]}
+{"args":["skills","get","platform"]}
+{"args":["snapshot","--app","Safari"]}
+```
+
+Read the bundled skills before using desktop actions. Arguments are passed directly
+to the executable. Results use the existing tool-result events and contain bounded
+stdout/stderr, exit status, timeout and cancellation information. Invalid arguments
+and installation failures return an error. Desktop calls run in the foreground with
+the same process-group cancellation and provider-credential filtering as `cmd`.
+Screenshot commands can save files, but their images are **not automatically attached
+to model requests**; accessibility snapshots are returned as text.
+
+The executable and helpers are extracted to a private, versioned directory under
+`~/.lucy/desktop/`. macOS requires Accessibility permission and, for screenshots,
+Screen Recording permission. Linux requires a running graphical session and the
+platform dependencies described by `skills get platform`. Lucy does not bypass
+permissions or add a sandbox or approval prompt. Desktop content returned by the
+tool is sent to the configured model provider and retained in the session. Use it
+only on desktops and applications you authorize the agent to control.
+
+Source builds download a target-specific release archive and verify its pinned
+SHA-256 before embedding it. Supported targets are `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, and `x86_64-unknown-linux-gnu`. For offline source builds,
+set `LUCY_AGENT_DESKTOP_ARCHIVE` to the matching v1.0.2 `.tar.gz` archive (the same
+checksum verification applies). The upstream Apache-2.0 license is included in
+[`third-party/agent-desktop/LICENSE`](third-party/agent-desktop/LICENSE) and is
+extracted with the bundled executable.
 
 ## External-harness skill
 

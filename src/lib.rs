@@ -17,3 +17,5 @@ pub(crate) mod tool_pruning;
 pub mod tui;
 
 pub use app::{run_cli, run_cli_at_home};
+
+mod desktop;

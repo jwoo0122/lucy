@@ -494,11 +494,16 @@ fn codex_request(
         request["prompt_cache_key"] = json!(session_id);
     }
     if include_tools {
-        let tools = vec![tool_schema(
+        let mut tools = vec![tool_schema(
             "cmd",
             "Execute a shell command in the session starting directory. Set background to return immediately and receive the completed result automatically.",
             json!({"type":"object","properties":{"command":{"type":"string"},"background":{"type":"boolean","default":false}},"required":["command"],"additionalProperties":false}),
         )];
+        tools.push(tool_schema(
+            "desktop",
+            crate::desktop::DESCRIPTION,
+            crate::desktop::parameters(),
+        ));
         request["tools"] = Value::Array(tools);
     }
     request
@@ -823,6 +828,12 @@ mod tests {
         assert_eq!(request["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["tools"][0]["name"], "cmd");
+        assert_eq!(request["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(request["tools"][1]["name"], "desktop");
+        assert_eq!(
+            request["tools"][1]["parameters"],
+            crate::desktop::parameters()
+        );
         assert_eq!(request["prompt_cache_key"], "lucy-session");
         let background = &request["tools"][0]["parameters"]["properties"]["background"];
         assert_eq!(background["type"], "boolean");
