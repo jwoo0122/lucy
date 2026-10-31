@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.16.0](https://github.com/jwoo0122/lucy/compare/v1.15.3...v1.16.0) - 2026-10-31
+
+### Added
+
+- embed agent-desktop as a model-facing desktop tool
+
 ## [1.15.3](https://github.com/jwoo0122/lucy/compare/v1.15.2...v1.15.3) - 2026-08-16
 
 ### Fixed
