@@ -1143,7 +1143,7 @@ impl Harness {
             if turn
                 .tool_calls
                 .iter()
-                .any(|call| !matches!(call.name.as_str(), "cmd"))
+                .any(|call| !matches!(call.name.as_str(), "cmd" | "desktop"))
             {
                 if canceled_after_stream {
                     return self.interrupt(sink, PROVIDER_PHASE, &turn.content, &[], Vec::new());
@@ -1213,6 +1213,15 @@ impl Harness {
                         &secret,
                     ))
                     .map_err(|error| format!("unable to encode cmd result: {error}"))?
+                } else if raw_call.name == "desktop" {
+                    crate::desktop::execute(
+                        &raw_call.arguments,
+                        &self.home,
+                        &self.session.cwd,
+                        self.provider.api_key_env(),
+                        Some(&secret),
+                        cancellation,
+                    )
                 } else {
                     crate::command::execute_managed(
                         &raw_call.arguments,
@@ -1315,7 +1324,7 @@ impl Harness {
         let secret = self.provider.api_key();
         let safe_tool_calls = tool_calls
             .iter()
-            .filter(|call| call.name == "cmd")
+            .filter(|call| matches!(call.name.as_str(), "cmd" | "desktop"))
             .map(|call| safe_partial_tool_call(call, &secret))
             .collect::<Vec<_>>();
         let safe_tool_results = tool_results.clone();
@@ -1579,6 +1588,16 @@ fn safe_tool_call(call: &ChatToolCall, secret: &str) -> ChatToolCall {
                     && object
                         .keys()
                         .all(|key| matches!(key.as_str(), "command" | "background"))
+            }),
+        "desktop" => serde_json::from_str::<Value>(&call.arguments)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|object| {
+                object.len() == 1
+                    && object
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .is_some_and(|args| !args.is_empty() && args.iter().all(Value::is_string))
             }),
         _ => false,
     };

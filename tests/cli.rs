@@ -732,6 +732,61 @@ fn streams_normalized_events_runs_cmd_loop_and_keeps_stdout_pure() {
 }
 
 #[test]
+fn desktop_executes_returns_to_provider_and_survives_resume() {
+    let desktop =
+        tool_response_with_arguments(json!({"args":["version"]}).to_string(), "desktop-call")
+            .replace("\"name\":\"cmd\"", "\"name\":\"desktop\"");
+    let server = MockServer::start(vec![
+        desktop,
+        normal_response("finished"),
+        normal_response("resumed"),
+    ]);
+    let (home, project) = temporary_tree("desktop-loop");
+    write_config(&home, &server.base_url, "", "mock-model");
+    let output = run_lucy(
+        &home,
+        &project,
+        &[],
+        "{\"type\":\"message\",\"text\":\"desktop version\"}\n",
+    );
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let records = parse_lines(&output.stdout);
+    let call = records
+        .iter()
+        .find(|record| record["type"] == "tool_call")
+        .unwrap();
+    assert_eq!(call["name"], "desktop");
+    assert_eq!(
+        serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+        json!({"args":["version"]})
+    );
+    let result = records
+        .iter()
+        .find(|record| record["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(result["name"], "desktop");
+    assert_eq!(result["result"]["exit_code"], 0);
+    let stdout: Value = serde_json::from_str(result["result"]["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(stdout["data"]["version"], "1.0.2");
+    assert!(records.iter().any(|record| record["type"] == "turn_end"));
+    let session = records[0]["session_id"].as_str().unwrap();
+    let resumed = run_lucy(
+        &home,
+        &project,
+        &["--session", session],
+        "{\"type\":\"message\",\"text\":\"continue\"}\n",
+    );
+    assert!(resumed.status.success(), "{:?}", resumed.stderr);
+    let requests = server.join();
+    for request in &requests[1..] {
+        assert!(request.contains("desktop-call"));
+        assert!(request.contains("desktop"));
+        assert!(request.contains("1.0.2"));
+    }
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn reasoning_details_survive_tool_follow_up_and_session_resume_without_public_output() {
     let server = MockServer::start(vec![
         tool_response_with_reasoning_details(
@@ -2242,7 +2297,8 @@ fn separate_lucy_processes_resume_the_same_named_session() {
     );
     let resumed_request: Value = serde_json::from_str(&requests[1]).expect("resumed request JSON");
     let tools = resumed_request["tools"].as_array().expect("model tools");
-    assert_eq!(tools.len(), 1);
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[1]["function"]["name"], "desktop");
     assert_eq!(tools[0]["function"]["name"], "cmd");
 
     fs::remove_dir_all(home).expect("cleanup");

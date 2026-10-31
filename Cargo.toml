@@ -18,7 +18,14 @@ path = "src/lib.rs"
 [package.metadata.dist]
 formula = "lucy"
 
+[build-dependencies]
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+
 [dependencies]
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
 base64 = "0.22"
 getrandom = "0.3"
 sha2 = "0.10"

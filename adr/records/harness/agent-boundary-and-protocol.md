@@ -9,12 +9,12 @@ applies_to:
 - tests/**
 - README.md
 - skills/**
-summary: Lucy is a local harness with TUI, raw JSONL, and finite one-shot exec frontends over one turn engine while cmd remains its only model-facing tool.
+summary: Lucy is a local harness with TUI, raw JSONL, and finite one-shot exec frontends over one turn engine with cmd and bundled desktop tools.
 constrains: []
 depends_on: []
 supersedes: []
 superseded_by: []
-last_reviewed: '2026-08-15'
+last_reviewed: '2026-10-31'
 enforcement:
 - invariant: jsonl-record-framing
   kind: executable
@@ -37,7 +37,7 @@ enforcement:
 - invariant: unbounded-tool-round-count
   kind: executable
   check: rust-tests
-- invariant: sole-model-tool
+- invariant: bounded-model-tools
   kind: executable
   check: rust-tests
 - invariant: caller-owned-session-orchestration
@@ -72,7 +72,7 @@ invariants:
 - id: jsonl-record-framing
   statement: Machine input messages and output events are LF-delimited JSON records.
 - id: successful-turn-events
-  statement: A successful raw JSONL turn exposes assistant deltas, normalized cmd calls and results, and an explicit turn completion event.
+  statement: A successful raw JSONL turn exposes assistant deltas, normalized tool calls and results, and an explicit turn completion event.
 - id: finite-one-shot-exec
   statement: lucy exec accepts exactly one task, runs it through the existing turn engine, and emits either final assistant text or one aggregate JSON value before exiting.
 - id: truthful-exec-status
@@ -80,11 +80,11 @@ invariants:
 - id: interruption-ordering
   statement: An interrupted turn exposes all safe events emitted before cancellation and one interruption event without claiming normal completion.
 - id: command-before-provider-continuation
-  statement: A model cmd call is executed by the harness before the next provider turn.
+  statement: A model cmd or desktop call is executed by the harness before the next provider turn.
 - id: unbounded-tool-round-count
   statement: Model tool loops have no fixed provider-round limit and stop only on completion or an existing cancellation or resource boundary.
-- id: sole-model-tool
-  statement: cmd is the only model-facing tool.
+- id: bounded-model-tools
+  statement: cmd and desktop are the only model-facing tools; desktop runs bundled agent-desktop with literal argv and the shared foreground process controls.
 - id: caller-owned-session-orchestration
   statement: Lucy never creates, links, resumes, or delivers internal subagent sessions; callers own named session IDs and process orchestration.
 - id: observable-session-cwd
@@ -111,9 +111,13 @@ What public boundary and capability surface does the Lucy harness expose to inte
 
 Lucy MUST run as a local macOS/Linux process and MUST retain its newline-delimited JSON machine protocol. When both standard input and standard output are terminals, an invocation without a mode flag MUST start the TUI. When either stream is not a terminal, the invocation MUST use JSONL automatically. `--jsonl` MUST force JSONL and `--tui` MUST force the interactive frontend; the latter requires a usable terminal. The TUI is a frontend over the same normalized event and turn engine, not a new provider or tool boundary. Its slash picker MUST combine discovered skill names with Lucy-owned `/settings` and `/exit` commands without persisting or expanding those commands as skills. `/settings` MUST ignore trailing arguments and open the idle-only settings menu; `/exit` MUST terminate an idle TUI session.
 
-Lucy MUST expose only `cmd` as a model-facing tool and MUST NOT provide built-in `read`, `write`, `edit`, delegation, lifecycle, or other file-operation tools. Lucy MUST NOT be a daemon or network service in v1. The LLM integration MUST support the configurable OpenAI-compatible Chat Completions API and MAY use the explicit authenticated Codex subscription adapter. Provider-specific authentication MUST remain outside the model-facing protocol.
+Lucy MUST expose exactly `cmd` and `desktop` as model-facing tools and MUST NOT provide built-in `read`, `write`, `edit`, delegation, lifecycle, or other file-operation tools. Lucy MUST NOT be a daemon or network service in v1. The LLM integration MUST support the configurable OpenAI-compatible Chat Completions API and MAY use the explicit authenticated Codex subscription adapter. Provider-specific authentication MUST remain outside the model-facing protocol.
 
-The raw JSONL interface MUST accept newline-delimited `{"type":"message","text":"..."}` records and MUST emit only newline-delimited normalized events on stdout, with diagnostics on stderr. A normal client interaction MUST expose a `session` event, streamed assistant deltas, normalized `cmd` calls/results, and one `turn_end` event. The `session` event MUST report the effective cwd, saved cwd, and whether cwd fallback occurred so a machine caller can detect execution outside the session's original workspace. A client MAY close stdin after one message; Lucy MUST finish that turn and exit after EOF. A client MAY resume a named session with `--session <id>` and send another message.
+`desktop` MUST execute the bundled agent-desktop release and platform helpers, not resolve an executable from PATH or install dependencies at runtime. Its `args` array MUST be passed as literal argv without shell interpretation. Release archives MUST be version-pinned and checksum-verified before embedding. Desktop execution MUST use the existing foreground timeout, output bounds, credential filtering, redaction, process-group cancellation, tool-result persistence, and provider continuation path. OS permissions remain user-owned; Lucy MUST NOT bypass them. Desktop output is session content disclosed to the configured provider, not a new image-attachment protocol.
+
+This revises the former cmd-only boundary following the explicit decision to expose desktop automation as an independent model tool. Keeping a single tool execution and session pipeline preserves caller-owned orchestration while permitting desktop-specific discoverability without shell command construction.
+
+The raw JSONL interface MUST accept newline-delimited `{"type":"message","text":"..."}` records and MUST emit only newline-delimited normalized events on stdout, with diagnostics on stderr. A normal client interaction MUST expose a `session` event, streamed assistant deltas, normalized `cmd` and `desktop` calls/results, and one `turn_end` event. The `session` event MUST report the effective cwd, saved cwd, and whether cwd fallback occurred so a machine caller can detect execution outside the session's original workspace. A client MAY close stdin after one message; Lucy MUST finish that turn and exit after EOF. A client MAY resume a named session with `--session <id>` and send another message.
 
 `lucy exec` MUST be a finite one-shot frontend over that same turn engine, not a second execution engine. It MUST accept exactly one task, wait for that turn to reach a terminal outcome, and then exit. Its selected output MUST be either the final assistant text or exactly one aggregate JSON value. The aggregate JSON value MUST be one complete result object reporting final status, session ID, effective cwd, saved cwd, cwd-fallback status, and assistant text. Failed exec turns MUST keep stdout empty and report diagnostics on stderr. Text mode MUST keep stdout to final assistant text and send diagnostics to stderr. An exec process MUST exit zero only for a successfully completed turn and MUST exit nonzero for interruption, provider failure, persistence failure, invalid invocation, or any other unsuccessful submitted turn.
 
@@ -131,13 +135,13 @@ The goal is a thin, embeddable harness rather than a full coding-agent product. 
 ## Invariants
 
 - Machine input messages and output events are LF-delimited JSON records.
-- A successful raw JSONL turn exposes assistant deltas, normalized cmd calls and results, and an explicit turn completion event.
+- A successful raw JSONL turn exposes assistant deltas, normalized tool calls and results, and an explicit turn completion event.
 - `lucy exec` accepts exactly one task, uses the existing turn engine, and emits either final assistant text or one aggregate JSON value before exiting.
 - `lucy exec` exits successfully only for a successfully completed submitted turn; interruption and other turn failures exit nonzero.
 - An interrupted turn exposes all safe events emitted before cancellation and one interruption event without claiming normal completion.
-- A model cmd call is executed by the harness before the next provider turn.
+- A model cmd or desktop call is executed by the harness before the next provider turn.
 - Model tool loops have no fixed provider-round limit and stop only on completion or an existing cancellation or resource boundary.
-- cmd is the only model-facing tool.
+- cmd and desktop are the only model-facing tools; desktop runs bundled agent-desktop with literal argv and the shared foreground process controls.
 - Lucy never creates, links, resumes, or delivers internal subagent sessions; callers own named session IDs and process orchestration.
 - The session event exposes saved and effective working directories and whether cwd fallback occurred.
 - A resumed session reconstructs the same immutable boot context and append-only conversation state as the original process.
@@ -156,7 +160,7 @@ Interactive users receive a terminal chat experience, streaming clients retain t
 
 ## Enforcement
 
-Integration tests MUST exercise TTY and non-TTY mode selection, raw JSONL input/output, exec final-text and single-value JSON output, successful and unsuccessful exec process status, normalized text streaming, the `cmd` tool loop, explicit skill invocation and snapshot persistence, stdout purity, session creation/resume across separate processes, observable cwd fallback, and interruption ordering. Provider tests MUST verify that `cmd` remains the only model-facing tool. Tests MUST also verify that provider-specific streams are not forwarded as public events, no subagent/background-result protocol or session records are emitted, and a `cmd` child inherits ordinary environment variables while the configured provider key is removed and credentials remain absent from protocol, diagnostics, and persisted records. Compaction tests MUST verify that summary requests expose no tools and occur only at complete provider/cmd boundaries.
+Integration tests MUST exercise TTY and non-TTY mode selection, raw JSONL input/output, exec final-text and single-value JSON output, successful and unsuccessful exec process status, normalized text streaming, the `cmd` and `desktop` tool loops, explicit skill invocation and snapshot persistence, stdout purity, session creation/resume across separate processes, observable cwd fallback, and interruption ordering. Provider tests MUST verify that exactly `cmd` and `desktop` are exposed on normal requests and neither is exposed on compaction requests. Desktop tests MUST execute the bundled binary without a separate installation, reject malformed arguments, verify literal argv, and exercise tool-result delivery and session resume. Tests MUST also verify that provider-specific streams are not forwarded as public events, no subagent/background-result protocol or session records are emitted, and a `cmd` child inherits ordinary environment variables while the configured provider key is removed and credentials remain absent from protocol, diagnostics, and persisted records. Compaction tests MUST verify that summary requests expose no tools and occur only at complete provider/cmd boundaries.
 
 ## Revisit when
 

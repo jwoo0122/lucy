@@ -6,7 +6,7 @@ decisions:
     scope: harness
     decision_type: boundary
     summary: Lucy is a local harness with TUI, raw JSONL, and finite one-shot exec
-      frontends over one turn engine while cmd remains its only model-facing tool.
+      frontends over one turn engine with cmd and bundled desktop tools.
     applies_to:
       - Cargo.toml
       - src/**
@@ -18,7 +18,7 @@ decisions:
     depends_on: []
     supersedes: []
     superseded_by: []
-    last_reviewed: '2026-08-15'
+    last_reviewed: '2026-10-31'
     enforcement:
       - invariant: jsonl-record-framing
         kind: executable
@@ -41,7 +41,7 @@ decisions:
       - invariant: unbounded-tool-round-count
         kind: executable
         check: rust-tests
-      - invariant: sole-model-tool
+      - invariant: bounded-model-tools
         kind: executable
         check: rust-tests
       - invariant: caller-owned-session-orchestration

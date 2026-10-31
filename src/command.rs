@@ -326,20 +326,64 @@ pub(crate) fn execute_command_with_cancellation(
     output_cap: usize,
     cancellation: Option<&CancellationToken>,
 ) -> CmdResult {
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    let mut process = Command::new(shell);
+    process.arg("-lc").arg(command);
+    execute_process(
+        process,
+        command,
+        cwd,
+        api_key_env,
+        secret,
+        timeout,
+        output_cap,
+        cancellation,
+    )
+}
+
+pub(crate) fn execute_program(
+    program: &Path,
+    args: &[String],
+    label: &str,
+    cwd: &Path,
+    api_key_env: &str,
+    secret: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+) -> CmdResult {
+    let mut process = Command::new(program);
+    process.args(args);
+    execute_process(
+        process,
+        label,
+        cwd,
+        api_key_env,
+        secret,
+        COMMAND_TIMEOUT,
+        COMMAND_OUTPUT_CAP,
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_process(
+    mut process: Command,
+    command: &str,
+    cwd: &Path,
+    api_key_env: &str,
+    secret: Option<&str>,
+    timeout: Duration,
+    output_cap: usize,
+    cancellation: Option<&CancellationToken>,
+) -> CmdResult {
     if cancellation.is_some_and(|token| token.is_cancelled()) {
         return CmdResult::canceled(
             redact_secret(command, secret),
             "command canceled before execution",
         );
     }
-
-    let shell = std::env::var_os("SHELL")
-        .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| "/bin/sh".into());
-    let mut process = Command::new(shell);
     process
-        .arg("-lc")
-        .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -687,6 +731,68 @@ mod tests {
         assert!(result.stdout_truncated);
         assert!(result.stderr_truncated);
         fs::remove_dir_all(cwd).expect("remove temp directory");
+    }
+
+    #[test]
+    fn direct_program_preserves_argv_cwd_and_filters_credentials() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut process = Command::new("/bin/sh");
+        process.env("DESKTOP_TEST_KEY", "private-value");
+        process.args([
+            "-c",
+            "printf '%s|%s|' \"$DESKTOP_TEST_KEY\" \"$1\"; pwd; printf private-value >&2",
+            "sh",
+            "$(touch injected); literal",
+        ]);
+        let result = execute_process(
+            process,
+            "desktop private-value",
+            cwd.path(),
+            "DESKTOP_TEST_KEY",
+            Some("private-value"),
+            Duration::from_secs(2),
+            COMMAND_OUTPUT_CAP,
+            None,
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.starts_with("|$(touch injected); literal|"));
+        assert!(result
+            .stdout
+            .contains(cwd.path().canonicalize().unwrap().to_str().unwrap()));
+        assert!(!result.stderr.contains("private-value"));
+        assert!(!result.command.contains("private-value"));
+        assert!(!cwd.path().join("injected").exists());
+    }
+
+    #[test]
+    fn direct_program_cancellation_terminates_execution() {
+        let cwd = tempfile::tempdir().unwrap();
+        let token = CancellationToken::default();
+        let cancellation = token.clone();
+        let path = cwd.path().to_owned();
+        let worker = thread::spawn(move || {
+            execute_program(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".into(),
+                    "touch started; sleep 10; touch finished".into(),
+                ],
+                "desktop",
+                &path,
+                "KEY",
+                None,
+                Some(&cancellation),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !cwd.path().join("started").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        token.cancel();
+        let result = worker.join().unwrap();
+        assert!(cwd.path().join("started").exists());
+        assert!(result.canceled);
+        assert!(!cwd.path().join("finished").exists());
     }
 
     #[test]
